@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# CASA gate on every commit: deterministic checks, then Claude review of the staged diff.
+set -euo pipefail
+[[ -n "${CASA_IN_REVIEW:-}" ]] && exit 0
+ROOT="$(git rev-parse --show-toplevel)"
+"$ROOT/scripts/verify.sh" quick
+"$ROOT/scripts/claude-review.sh"

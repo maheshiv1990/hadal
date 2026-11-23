@@ -1,0 +1,375 @@
+{
+  "spec": "App Defense Alliance CASA Specification",
+  "spec_version": "2.1.1",
+  "spec_date": "2026-06-03",
+  "spec_url": "https://github.com/appdefensealliance/ASA-WG/blob/main/CASA/CASA%20Specification.md",
+  "test_guide_url": "https://github.com/appdefensealliance/ASA-WG/blob/main/CASA/CASA%20Test%20Guide.md",
+  "_how_to_edit": "Every CASA audit item must appear exactly once. status = verified | not_applicable | pending. verified needs evidence (test:<fn>, lint:<rule>, tool:<name>, file:<path>) or an attestation {by,date,artifact}. not_applicable needs reason + reopen_if regexes that fail the gate if matching code appears. pending needs a blocker and fails release builds (CASA_STRICT=1). After editing run: python3 scripts/casa_check.py render",
+  "requirements": [
+    {
+      "id": "1.1.1",
+      "title": "Authentication is resistant to brute force attacks",
+      "status": "pending",
+      "blocker": "No authentication yet (Google OAuth sign-in not built). Per-client rate limiting already protects every endpoint; re-verify on the OAuth callback once it exists.",
+      "evidence": ["test:rate_limit_returns_429_after_burst", "test:spoofed_real_ip_is_ignored_unless_proxy_trusted", "test:trusted_proxy_keys_on_real_ip"]
+    },
+    {
+      "id": "1.1.2",
+      "title": "System generated initial passwords or activation codes are securely random and expire quickly",
+      "status": "not_applicable",
+      "reason": "The app issues no passwords or activation codes; sign-in is delegated to Google.",
+      "reopen_if": ["(?i)\\b(activation_code|initial_password|temp(orary)?_password|invite_code)\\b"]
+    },
+    {
+      "id": "1.1.3",
+      "title": "Passwords are stored in a form resistant to offline attacks",
+      "status": "not_applicable",
+      "reason": "The app never receives or stores user passwords; sign-in is delegated to Google.",
+      "reopen_if": ["(?i)\\b(argon2|bcrypt|scrypt|pbkdf2|password_hash|hash_password|verify_password)\\b", "(?i)\\bpassword\\w*\\s+(text|varchar|bytea)"]
+    },
+    {
+      "id": "1.2.1",
+      "title": "Default credentials are not present on publicly exposed interfaces",
+      "status": "verified",
+      "evidence": ["lint:default-accounts", "lint:hardcoded-secret", "tool:gitleaks"],
+      "notes": "Migrations seed no accounts. docker-compose refuses to start without POSTGRES_PASSWORD, and Postgres binds to 127.0.0.1 only."
+    },
+    {
+      "id": "1.3.1",
+      "title": "Out of band verifier expires in a reasonable timeframe",
+      "status": "not_applicable",
+      "reason": "No SMS, email or other out-of-band verification codes are issued.",
+      "reopen_if": ["(?i)\\b(otp|totp|one_time_code|magic_link|verification_code|verify_email|twilio|lettre|sendgrid|mailgun|smtp)\\b"]
+    },
+    {
+      "id": "1.3.2",
+      "title": "Out of band verifier is only used once",
+      "status": "not_applicable",
+      "reason": "No out-of-band verifiers are issued.",
+      "reopen_if": ["(?i)\\b(otp|totp|one_time_code|magic_link|verification_code|verify_email|twilio|lettre|sendgrid|mailgun|smtp)\\b"]
+    },
+    {
+      "id": "1.3.3",
+      "title": "Out of band verifier is securely random",
+      "status": "not_applicable",
+      "reason": "No out-of-band verifiers are issued.",
+      "reopen_if": ["(?i)\\b(otp|totp|one_time_code|magic_link|verification_code|verify_email|twilio|lettre|sendgrid|mailgun|smtp)\\b"]
+    },
+    {
+      "id": "1.3.4",
+      "title": "Out of band verifier is resistant to brute force attacks",
+      "status": "not_applicable",
+      "reason": "No out-of-band verifiers are issued.",
+      "reopen_if": ["(?i)\\b(otp|totp|one_time_code|magic_link|verification_code|verify_email|twilio|lettre|sendgrid|mailgun|smtp)\\b"]
+    },
+    {
+      "id": "2.1.1",
+      "title": "Passwords, session tokens and API keys are not exposed in URL parameters",
+      "status": "verified",
+      "evidence": ["lint:secret-in-url", "lint:oauth-implicit-flow"]
+    },
+    {
+      "id": "2.2.1",
+      "title": "Users can log out; logout or expiry invalidates all stateful session tokens, including refresh tokens",
+      "status": "pending",
+      "blocker": "Sessions do not exist yet. Build them with the OAuth login: server-side session table, a logout endpoint that deletes the row, and idle/absolute expiry."
+    },
+    {
+      "id": "2.2.2",
+      "title": "Other sessions can be terminated after a password change or reset",
+      "status": "not_applicable",
+      "reason": "The app has no passwords; credential changes happen at Google. Revisit if local accounts are added.",
+      "reopen_if": ["(?i)\\b(argon2|bcrypt|scrypt|pbkdf2|password_hash|hash_password|verify_password|change_password|reset_password)\\b"]
+    },
+    {
+      "id": "2.2.3",
+      "title": "Non-revocable stateless authentication tokens expire within 24 hours",
+      "status": "pending",
+      "blocker": "Session design pending. Prefer opaque, revocable server-side sessions; any JWT must have exp <= 24h."
+    },
+    {
+      "id": "2.3.1",
+      "title": "Cookie-based session tokens have the Secure attribute",
+      "status": "pending",
+      "blocker": "No session cookie yet. lint:cookie-flags already rejects any cookie built without secure(true), http_only(true) and same_site.",
+      "evidence": ["lint:cookie-flags"]
+    },
+    {
+      "id": "2.3.2",
+      "title": "Cookie-based session tokens have the HttpOnly attribute",
+      "status": "pending",
+      "blocker": "No session cookie yet. lint:cookie-flags already enforces http_only(true).",
+      "evidence": ["lint:cookie-flags"]
+    },
+    {
+      "id": "2.3.3",
+      "title": "Session tokens are used rather than static API secrets and keys",
+      "status": "pending",
+      "blocker": "Authentication not built. Use per-user session tokens; do not add static shared API keys for clients."
+    },
+    {
+      "id": "2.3.4",
+      "title": "Stateless session tokens are protected against tampering, replay, null cipher and key substitution",
+      "status": "pending",
+      "blocker": "Session design pending. If stateless tokens are chosen, pin the algorithm, reject alg=none and validate iss/aud/exp."
+    },
+    {
+      "id": "2.4.1",
+      "title": "A full valid session or re-authentication is required before sensitive transactions or account changes",
+      "status": "pending",
+      "blocker": "Authentication not built. All state-changing endpoints must require a valid session."
+    },
+    {
+      "id": "3.1.1",
+      "title": "Least-privilege access control rules are enforced on a trusted service layer",
+      "status": "pending",
+      "blocker": "BLOCKER: /api/notes is unauthenticated. Any client can list, read and delete every note. Add OAuth sessions, a notes.owner_id column, and scope every query to the session user."
+    },
+    {
+      "id": "3.1.2",
+      "title": "User and data attributes used by access controls cannot be manipulated by end users",
+      "status": "verified",
+      "evidence": ["lint:permissive-deserialize", "test:unknown_fields_are_rejected"],
+      "notes": "Every request body struct uses deny_unknown_fields, so server-controlled fields such as id, created_at and (later) owner_id cannot be mass-assigned."
+    },
+    {
+      "id": "3.1.3",
+      "title": "Access controls fail securely, including when an exception occurs",
+      "status": "pending",
+      "blocker": "No access control layer yet. Existing controls fail closed (missing limiter returns 500; internal errors are masked). Extend this to the auth middleware.",
+      "evidence": ["test:missing_limiter_fails_closed", "test:internal_errors_do_not_leak_details"]
+    },
+    {
+      "id": "3.1.4",
+      "title": "Sensitive resources are protected against IDOR on create, read, update and delete",
+      "status": "pending",
+      "blocker": "BLOCKER: GET/DELETE /api/notes/{id} perform no ownership check. Fix together with 3.1.1."
+    },
+    {
+      "id": "3.1.5",
+      "title": "Strong anti-CSRF protects authenticated functionality; anti-automation or anti-CSRF protects unauthenticated functionality",
+      "status": "verified",
+      "evidence": ["test:cross_site_form_post_is_rejected", "test:rate_limit_returns_429_after_burst", "lint:cors-wildcard"],
+      "notes": "State-changing endpoints accept only application/json, which a cross-site form cannot send without a CORS preflight, and no CORS is granted. Re-check when session cookies are added (SameSite is enforced by lint:cookie-flags)."
+    },
+    {
+      "id": "3.1.6",
+      "title": "Directory browsing is disabled",
+      "status": "verified",
+      "evidence": ["lint:directory-listing", "test:unknown_route_is_json_404"]
+    },
+    {
+      "id": "3.2.1",
+      "title": "Only secure OAuth 2.0 flows (Authorization Code, with PKCE) are used; implicit and password grants are not",
+      "status": "pending",
+      "blocker": "Google OAuth not built yet. lint:oauth-implicit-flow already rejects response_type=token and grant_type=password.",
+      "evidence": ["lint:oauth-implicit-flow"]
+    },
+    {
+      "id": "3.2.2",
+      "title": "redirect_uri and state are validated during OAuth authorization",
+      "status": "pending",
+      "blocker": "Google OAuth not built yet. Use a fixed, registered redirect_uri; generate a random state, bind it to the pre-auth session and compare it on callback."
+    },
+    {
+      "id": "3.3.1",
+      "title": "Application administrative interfaces use multi-factor authentication",
+      "status": "not_applicable",
+      "reason": "The application exposes no administrative interface.",
+      "reopen_if": ["(?i)\\b(admin|superuser|is_admin|is_staff|backoffice)\\b"]
+    },
+    {
+      "id": "4.1.1",
+      "title": "TLS is enforced for all connections (TLS 1.2+, secure cipher suites)",
+      "status": "pending",
+      "blocker": "nginx listens on plain HTTP :80. Terminate TLS 1.2+ at nginx or the load balancer, redirect HTTP to HTTPS, enable HSTS in nginx/security-headers.conf, then record an SSL Labs report as an attestation.",
+      "evidence": ["lint:insecure-transport", "test:every_response_carries_security_headers"]
+    },
+    {
+      "id": "4.1.2",
+      "title": "Connections to and from the server use trusted TLS certificates",
+      "status": "pending",
+      "blocker": "Depends on 4.1.1. The backend-to-Postgres link is plaintext on the private compose network; use sslmode=verify-full for any managed or remote database.",
+      "evidence": ["lint:tls-verification-disabled"]
+    },
+    {
+      "id": "4.1.3",
+      "title": "No weak cryptography affecting confidential data",
+      "status": "verified",
+      "evidence": ["lint:weak-crypto", "lint:insecure-randomness", "tool:semgrep"]
+    },
+    {
+      "id": "4.1.4",
+      "title": "Cryptographic modules fail securely; no padding oracles",
+      "status": "not_applicable",
+      "reason": "The application performs no encryption or decryption of its own (TLS is handled by rustls and nginx).",
+      "reopen_if": ["(?i)\\b(aes|aes-gcm|aes_gcm|chacha20\\w*|cbc|block-modes|openssl|aead|decrypt|encrypt)\\b"]
+    },
+    {
+      "id": "5.1.1",
+      "title": "Protect against HTTP parameter pollution",
+      "status": "verified",
+      "evidence": ["test:duplicate_json_keys_are_rejected", "lint:raw-query-string"]
+    },
+    {
+      "id": "5.1.2",
+      "title": "URL redirects and forwards are limited to allowlisted URLs",
+      "status": "verified",
+      "evidence": ["lint:open-redirect"],
+      "notes": "The application performs no redirects. The OAuth login will add one; it must target a constant URL and carry a suppression with a justification."
+    },
+    {
+      "id": "5.1.3",
+      "title": "No eval() or other dynamic code execution",
+      "status": "verified",
+      "evidence": ["lint:dynamic-code", "tool:semgrep"]
+    },
+    {
+      "id": "5.1.4",
+      "title": "Protect against template injection",
+      "status": "not_applicable",
+      "reason": "No server-side templating. The UI is compiled SolidJS JSX, which escapes text by default.",
+      "reopen_if": ["(?i)\\b(tera|askama|handlebars|minijinja|liquid|sailfish|ejs|pug|mustache|nunjucks)\\b"]
+    },
+    {
+      "id": "5.1.5",
+      "title": "Prevent server-side request forgery",
+      "status": "not_applicable",
+      "reason": "The backend makes no outbound HTTP requests.",
+      "reopen_if": ["(?i)\\b(reqwest|awc|ureq|isahc|surf|hyper-util|oauth2)\\b"]
+    },
+    {
+      "id": "5.1.6",
+      "title": "Protect against XPath or XML injection",
+      "status": "not_applicable",
+      "reason": "No XML is parsed or produced.",
+      "reopen_if": ["(?i)\\b(quick-xml|quick_xml|xml-rs|roxmltree|sxd\\w*|xpath|DOMParser|serde-xml-rs|xmltree)\\b"]
+    },
+    {
+      "id": "5.1.7",
+      "title": "Context-aware output escaping protects against reflected, stored and DOM XSS",
+      "status": "verified",
+      "evidence": ["lint:raw-html-sink", "lint:tabnabbing", "test:every_response_carries_security_headers", "file:nginx/security-headers.conf", "tool:semgrep"],
+      "notes": "API: JSON only, nosniff, CSP default-src 'none'. UI: Solid escapes interpolations, raw HTML sinks are banned, strict CSP from nginx."
+    },
+    {
+      "id": "5.1.8",
+      "title": "Protect against database injection",
+      "status": "verified",
+      "evidence": ["lint:sql-string-building", "tool:semgrep"],
+      "notes": "All SQL is static text with sqlx bind parameters."
+    },
+    {
+      "id": "5.1.9",
+      "title": "Protect against OS command injection",
+      "status": "verified",
+      "evidence": ["lint:os-command"]
+    },
+    {
+      "id": "5.1.10",
+      "title": "Protect against local and remote file inclusion",
+      "status": "verified",
+      "evidence": ["lint:filesystem-access", "lint:directory-listing"]
+    },
+    {
+      "id": "5.2.1",
+      "title": "Uploads are limited to expected types and never executed",
+      "status": "not_applicable",
+      "reason": "No file upload functionality.",
+      "reopen_if": ["(?i)\\b(actix-multipart|actix_multipart|FormData|upload)\\b", "(?i)type=[\"']file[\"']"]
+    },
+    {
+      "id": "6.1.1",
+      "title": "Only components without known exploitable vulnerabilities are used",
+      "status": "verified",
+      "evidence": ["tool:cargo-audit", "tool:cargo-deny", "tool:npm-audit"]
+    },
+    {
+      "id": "6.2.1",
+      "title": "Debug modes are disabled in production",
+      "status": "verified",
+      "evidence": ["test:internal_errors_do_not_leak_details", "test:malformed_json_does_not_leak_parser_details", "lint:debug-artifacts", "tool:clippy"]
+    },
+    {
+      "id": "6.3.1",
+      "title": "The Origin header is not used for authentication or access control decisions",
+      "status": "verified",
+      "evidence": ["lint:origin-header-auth"]
+    },
+    {
+      "id": "6.4.1",
+      "title": "The application is not susceptible to subdomain takeover",
+      "status": "pending",
+      "blocker": "Deployment and DNS are not defined yet. Before assessment, audit DNS for dangling CNAMEs and record it as an attestation."
+    },
+    {
+      "id": "6.5.1",
+      "title": "Credentials and payment details are not logged; session tokens appear in logs only hashed",
+      "status": "verified",
+      "evidence": ["lint:sensitive-logging", "test:debug_output_redacts_database_url"]
+    },
+    {
+      "id": "6.6.1",
+      "title": "Browser storage is securely cleared during logout",
+      "status": "verified",
+      "evidence": ["lint:browser-storage"],
+      "notes": "Nothing is written to localStorage, sessionStorage, IndexedDB or document.cookie from JS, and the lint keeps it that way."
+    },
+    {
+      "id": "6.7.1",
+      "title": "Access tokens, API keys and other server-side secrets are stored securely",
+      "status": "pending",
+      "blocker": "In code, secrets come only from the environment, .env is git-ignored, and gitleaks runs on every commit. Production still needs a secrets manager (encrypted, access-controlled, audited); record it as an attestation.",
+      "evidence": ["lint:env-file-tracked", "lint:hardcoded-secret", "tool:gitleaks"]
+    },
+    {
+      "id": "7.1.1",
+      "title": "Webhook communications use HTTPS with TLS 1.2+ only",
+      "status": "not_applicable",
+      "reason": "The application neither sends nor receives webhooks.",
+      "reopen_if": ["(?i)\\b(webhooks?|svix|callback_url)\\b"]
+    },
+    {
+      "id": "7.1.2",
+      "title": "Webhook providers verify endpoint ownership before delivering events",
+      "status": "not_applicable",
+      "reason": "The application neither sends nor receives webhooks.",
+      "reopen_if": ["(?i)\\b(webhooks?|svix|callback_url)\\b"]
+    },
+    {
+      "id": "7.2.1",
+      "title": "Webhook payloads are authenticated with HMAC-SHA256 or stronger",
+      "status": "not_applicable",
+      "reason": "The application neither sends nor receives webhooks.",
+      "reopen_if": ["(?i)\\b(webhooks?|svix|callback_url|hmac)\\b"]
+    },
+    {
+      "id": "7.2.2",
+      "title": "Webhook signature verification uses timing-safe comparison",
+      "status": "not_applicable",
+      "reason": "The application neither sends nor receives webhooks.",
+      "reopen_if": ["(?i)\\b(webhooks?|svix|callback_url|hmac)\\b"]
+    },
+    {
+      "id": "7.2.3",
+      "title": "Webhook payloads include replay protection via signed timestamps",
+      "status": "not_applicable",
+      "reason": "The application neither sends nor receives webhooks.",
+      "reopen_if": ["(?i)\\b(webhooks?|svix|callback_url|hmac)\\b"]
+    },
+    {
+      "id": "7.3.1",
+      "title": "Webhook providers mitigate SSRF for user-supplied callback URLs",
+      "status": "not_applicable",
+      "reason": "The application neither sends nor receives webhooks.",
+      "reopen_if": ["(?i)\\b(webhooks?|svix|callback_url)\\b"]
+    },
+    {
+      "id": "7.3.2",
+      "title": "Webhook signing secrets are not hardcoded or stored in version control",
+      "status": "not_applicable",
+      "reason": "The application neither sends nor receives webhooks.",
+      "reopen_if": ["(?i)\\b(webhooks?|svix|callback_url|hmac)\\b"]
+    }
+  ]
+}

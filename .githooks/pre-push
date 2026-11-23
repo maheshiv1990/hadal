@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Full CASA gate (dependency audits, build, SAST, secret history) before code leaves the machine.
+set -euo pipefail
+[[ -n "${CASA_IN_REVIEW:-}" ]] && exit 0
+exec "$(git rev-parse --show-toplevel)/scripts/verify.sh" full
