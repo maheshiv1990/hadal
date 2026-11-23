@@ -32,7 +32,7 @@
       "title": "Default credentials are not present on publicly exposed interfaces",
       "status": "verified",
       "evidence": ["lint:default-accounts", "lint:hardcoded-secret", "tool:gitleaks"],
-      "notes": "Migrations seed no accounts. docker-compose refuses to start without POSTGRES_PASSWORD, and Postgres binds to 127.0.0.1 only."
+      "notes": "Migrations seed no accounts. .env.example ships an empty POSTGRES_PASSWORD, and docker-compose refuses to start until it is set. Postgres binds to 127.0.0.1 only."
     },
     {
       "id": "1.3.1",
@@ -250,7 +250,7 @@
       "title": "Context-aware output escaping protects against reflected, stored and DOM XSS",
       "status": "verified",
       "evidence": ["lint:raw-html-sink", "lint:tabnabbing", "test:every_response_carries_security_headers", "file:nginx/security-headers.conf", "tool:semgrep"],
-      "notes": "API: JSON only, nosniff, CSP default-src 'none'. UI: Solid escapes interpolations, raw HTML sinks are banned, strict CSP from nginx."
+      "notes": "API: JSON only, nosniff, CSP default-src 'none', set by the backend alone (nginx adds no headers to proxied /api/ responses). UI: Solid escapes interpolations, raw HTML sinks are banned, strict CSP from nginx."
     },
     {
       "id": "5.1.8",

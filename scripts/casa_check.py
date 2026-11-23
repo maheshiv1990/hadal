@@ -187,13 +187,82 @@ def in_scope(rel: str) -> bool:
     return any(fnmatch.fnmatch(rel, g) for g in SCAN_GLOBS) and (ROOT / rel).is_file()
 
 
+CFG_TEST_MOD_RE = re.compile(
+    r"(?m)^[ \t]*#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{"
+)
+RUST_RAW_STR_RE = re.compile(r'b?r(#*)"')
+RUST_CHAR_RE = re.compile(r"b?'(?:\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f]{1,6}\}|.)|[^\\'\n])'")
+
+
+def _rust_block_end(text: str, open_idx: int) -> int | None:
+    """Index just past the `}` matching the `{` at `open_idx`, skipping braces inside
+    comments, string/char literals and raw strings. None if it can't be matched."""
+    depth, i, n = 0, open_idx, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            nl = text.find("\n", i)
+            i = n if nl == -1 else nl
+            continue
+        if text.startswith("/*", i):
+            nest, i = 1, i + 2
+            while i < n and nest:
+                if text.startswith("/*", i):
+                    nest, i = nest + 1, i + 2
+                elif text.startswith("*/", i):
+                    nest, i = nest - 1, i + 2
+                else:
+                    i += 1
+            if nest:
+                return None
+            continue
+        prev_ident = i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_")
+        raw = None if prev_ident else RUST_RAW_STR_RE.match(text, i)
+        if raw:
+            close = text.find('"' + raw.group(1), raw.end())
+            if close == -1:
+                return None
+            i = close + 1 + len(raw.group(1))
+            continue
+        if c == '"' or (c == "b" and not prev_ident and text.startswith('b"', i)):
+            i = text.index('"', i) + 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            if i >= n:
+                return None
+            i += 1
+            continue
+        if c in "'b" and not prev_ident:
+            ch = RUST_CHAR_RE.match(text, i)
+            if ch:
+                i = ch.end()
+                continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
 def strip_rust_tests(text: str) -> str:
-    """Drop `#[cfg(test)]` modules (kept at file end by convention), keeping line count."""
-    m = re.search(r"(?m)^\s*#\[cfg\(test\)\]", text)
-    if not m:
-        return text
-    head, tail = text[: m.start()], text[m.start():]
-    return head + "\n" * tail.count("\n")
+    """Blank out `#[cfg(test)] mod name { ... }` blocks, keeping line numbers.
+
+    Only whole test modules are removed, up to their matching brace. Any other
+    `#[cfg(test)]` item, and anything after a test module, is still scanned. If a
+    block's end can't be found, nothing more is stripped (fail towards scanning)."""
+    out, pos = [], 0
+    while (m := CFG_TEST_MOD_RE.search(text, pos)) is not None:
+        end = _rust_block_end(text, m.end() - 1)
+        if end is None:
+            break
+        out.append(text[pos:m.start()])
+        out.append("\n" * text.count("\n", m.start(), end))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def read(rel: str) -> str:

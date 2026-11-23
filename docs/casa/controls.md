@@ -17,7 +17,7 @@ Every audit item is checked on every commit by `scripts/verify.sh`:
 | 1.1.1 | Authentication is resistant to brute force attacks | ⏳ pending | `test:rate_limit_returns_429_after_burst`<br>`test:spoofed_real_ip_is_ignored_unless_proxy_trusted`<br>`test:trusted_proxy_keys_on_real_ip`<br>No authentication yet (Google OAuth sign-in not built). Per-client rate limiting already protects every endpoint; re-verify on the OAuth callback once it exists. |
 | 1.1.2 | System generated initial passwords or activation codes are securely random and expire quickly | ➖ n/a | The app issues no passwords or activation codes; sign-in is delegated to Google. |
 | 1.1.3 | Passwords are stored in a form resistant to offline attacks | ➖ n/a | The app never receives or stores user passwords; sign-in is delegated to Google. |
-| 1.2.1 | Default credentials are not present on publicly exposed interfaces | ✅ verified | `lint:default-accounts`<br>`lint:hardcoded-secret`<br>`tool:gitleaks`<br>Migrations seed no accounts. docker-compose refuses to start without POSTGRES_PASSWORD, and Postgres binds to 127.0.0.1 only. |
+| 1.2.1 | Default credentials are not present on publicly exposed interfaces | ✅ verified | `lint:default-accounts`<br>`lint:hardcoded-secret`<br>`tool:gitleaks`<br>Migrations seed no accounts. .env.example ships an empty POSTGRES_PASSWORD, and docker-compose refuses to start until it is set. Postgres binds to 127.0.0.1 only. |
 | 1.3.1 | Out of band verifier expires in a reasonable timeframe | ➖ n/a | No SMS, email or other out-of-band verification codes are issued. |
 | 1.3.2 | Out of band verifier is only used once | ➖ n/a | No out-of-band verifiers are issued. |
 | 1.3.3 | Out of band verifier is securely random | ➖ n/a | No out-of-band verifiers are issued. |
@@ -70,7 +70,7 @@ Every audit item is checked on every commit by `scripts/verify.sh`:
 | 5.1.4 | Protect against template injection | ➖ n/a | No server-side templating. The UI is compiled SolidJS JSX, which escapes text by default. |
 | 5.1.5 | Prevent server-side request forgery | ➖ n/a | The backend makes no outbound HTTP requests. |
 | 5.1.6 | Protect against XPath or XML injection | ➖ n/a | No XML is parsed or produced. |
-| 5.1.7 | Context-aware output escaping protects against reflected, stored and DOM XSS | ✅ verified | `lint:raw-html-sink`<br>`lint:tabnabbing`<br>`test:every_response_carries_security_headers`<br>`file:nginx/security-headers.conf`<br>`tool:semgrep`<br>API: JSON only, nosniff, CSP default-src 'none'. UI: Solid escapes interpolations, raw HTML sinks are banned, strict CSP from nginx. |
+| 5.1.7 | Context-aware output escaping protects against reflected, stored and DOM XSS | ✅ verified | `lint:raw-html-sink`<br>`lint:tabnabbing`<br>`test:every_response_carries_security_headers`<br>`file:nginx/security-headers.conf`<br>`tool:semgrep`<br>API: JSON only, nosniff, CSP default-src 'none', set by the backend alone (nginx adds no headers to proxied /api/ responses). UI: Solid escapes interpolations, raw HTML sinks are banned, strict CSP from nginx. |
 | 5.1.8 | Protect against database injection | ✅ verified | `lint:sql-string-building`<br>`tool:semgrep`<br>All SQL is static text with sqlx bind parameters. |
 | 5.1.9 | Protect against OS command injection | ✅ verified | `lint:os-command` |
 | 5.1.10 | Protect against local and remote file inclusion | ✅ verified | `lint:filesystem-access`<br>`lint:directory-listing` |

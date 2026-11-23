@@ -82,6 +82,31 @@ class RuleSelfTest(unittest.TestCase):
         src = 'fn a() {}\n#[cfg(test)]\nmod tests { fn t() { std::fs::read("x"); } }'
         self.assertNotIn("filesystem-access", rules_hit("x.rs", src))
 
+    def test_cfg_test_item_does_not_hide_rest_of_file(self):
+        # A non-module `#[cfg(test)]` item must not blank everything after it.
+        src = '#[cfg(test)]\nuse std::fs;\nfn prod() { std::fs::read("x"); }'
+        self.assertIn("filesystem-access", rules_hit("x.rs", src))
+
+    def test_code_after_test_module_is_still_scanned(self):
+        src = ('#[cfg(test)]\nmod tests { fn t() { let s = "}"; let c = \'{\'; } }\n'
+               'fn prod() { std::fs::read("x"); }')
+        self.assertIn("filesystem-access", rules_hit("x.rs", src))
+
+    def test_braces_in_literals_and_comments_do_not_end_module(self):
+        src = ('#[cfg(test)]\nmod tests {\n    // }\n    /* } */\n'
+               '    fn t() { let a = r#"}"#; let b = "\\"}"; std::fs::read("x"); }\n}\n')
+        self.assertNotIn("filesystem-access", rules_hit("x.rs", src))
+
+    def test_unterminated_test_module_is_scanned(self):
+        src = '#[cfg(test)]\nmod tests {\n fn t() { std::fs::read("x"); }\n'
+        self.assertIn("filesystem-access", rules_hit("x.rs", src))
+
+    def test_stripping_preserves_line_numbers(self):
+        src = 'fn a() {}\n#[cfg(test)]\nmod tests {\n  fn t() {}\n}\nfn b() {}\n'
+        out = cc.strip_rust_tests(src)
+        self.assertEqual(out.count("\n"), src.count("\n"))
+        self.assertEqual(out.splitlines()[5], "fn b() {}")
+
     def test_spec_ids_complete(self):
         self.assertEqual(len(cc.SPEC_IDS), 55)
         self.assertEqual(len(set(cc.SPEC_IDS)), 55)

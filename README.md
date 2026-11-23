@@ -19,7 +19,7 @@ browser ──► nginx :8000 ─┬─ /        → SolidJS static build (SPA f
 ## Run everything with Docker
 
 ```sh
-cp .env.example .env      # then set a real POSTGRES_PASSWORD
+cp .env.example .env      # then set POSTGRES_PASSWORD (openssl rand -hex 24)
 docker compose up -d --build
 open http://localhost:8000
 ```

@@ -6,7 +6,13 @@ The pre-commit Claude review rejects suppressions that aren't justified here.
 
 ## Active suppressions
 
-_None._
+`casa-allow`: _none._
+
+Scanner ignores:
+
+| Location | Scanner | Reason |
+| --- | --- | --- |
+| `scripts/test_casa_check.py` (`hardcoded-secret` self-test case) | gitleaks (`# gitleaks:allow`) | The value `GOCSPX-abcdefgh123` is a fake sample that proves the `hardcoded-secret` rule fires. It is not a real credential and is never used at runtime. |
 
 ## Dependency policy (`backend/deny.toml`)
 
@@ -32,6 +38,17 @@ _None._
 - The pre-commit gate checks the working tree, not only the staged snapshot. It can
   pass a commit whose staged content differs from the tree. CI re-checks the
   committed tree.
+- **Local bypass variables.** Two environment variables skip local checks with
+  the same effect as `git commit --no-verify`. CI still runs the full gate on
+  every push, and that remains the authoritative check.
+  - `CASA_IN_REVIEW=1` makes `.githooks/pre-commit`, `.githooks/pre-push`,
+    `scripts/claude-review.sh`, `scripts/claude-stop-gate.sh` and the
+    `casa_check.py` lint hook exit at once. It exists so the Claude review
+    (which runs with it set) doesn't trigger the hooks again. Never set it by hand.
+  - `CASA_SKIP_CLAUDE_REVIEW=1` skips only the pre-commit Claude review, for
+    when the `claude` CLI is unavailable. It prints `SKIPPED`, but the commit
+    leaves no trace. Re-run `scripts/claude-review.sh` on that change before
+    pushing.
 - Semgrep runs in CI only unless installed locally (`pipx install semgrep`).
 - DAST (OWASP ZAP baseline) runs in CI against the docker-compose stack.
   Warnings are reported as an artifact. Only FAIL-level alerts break the build.
