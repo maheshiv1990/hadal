@@ -45,6 +45,21 @@ fi
 body="$(curl -s "http://$HOST:$HTTP_PORT/api/health")"
 [[ "$body" != *'"status"'* ]] && pass "API not served over plain HTTP" || fail "API served over plain HTTP"
 
+echo "Unknown host names (no open redirect, no app)"
+evil=attacker.example
+out="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -H "Host: $evil" "http://$HOST:$HTTP_PORT/x")"
+[[ "$out" != *"$evil"* ]] && pass "plain HTTP for $evil isn't redirected there ($out)" \
+  || fail "plain HTTP for $evil answered '$out'"
+if openssl s_client -connect "$HOST:$HTTPS_PORT" -servername "$evil" </dev/null 2>/dev/null \
+    | grep -q 'Cipher is [A-Z0-9]'; then
+  fail "TLS handshake accepted for $evil"
+else
+  pass "TLS handshake refused for $evil"
+fi
+# Right SNI, foreign Host header: the app must not answer for that name.
+out="$(curl -sk -o /dev/null -w '%{http_code}' -H "Host: $evil" "https://$HOST:$HTTPS_PORT/api/health")"
+[[ "$out" != 200 ]] && pass "HTTPS with Host $evil refused ($out)" || fail "HTTPS served the app for Host $evil"
+
 echo "HSTS"
 for path in / /api/health /assets/missing.js; do
   n="$(curl -sk -D - -o /dev/null "https://$HOST:$HTTPS_PORT$path" | grep -ci '^strict-transport-security: max-age=[1-9]')"

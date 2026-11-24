@@ -36,6 +36,8 @@ services:
       - "443:443"
     environment:
       SERVER_NAME: ${DOMAIN:-hadalspace.com} www.${DOMAIN:-hadalspace.com}
+      # Every redirect goes here, whatever Host the request carried.
+      CANONICAL_HOST: ${DOMAIN:-hadalspace.com}
       SSL_CERTIFICATE: /etc/letsencrypt/live/${CERT_NAME:-fluxze.com}/fullchain.pem
       SSL_CERTIFICATE_KEY: /etc/letsencrypt/live/${CERT_NAME:-fluxze.com}/privkey.pem
       HTTPS_REDIRECT_PORT_SUFFIX: ""

@@ -2,8 +2,11 @@
 # Only environment variables are substituted (defaults in nginx/Dockerfile);
 # nginx's own $variables are left alone.
 #
-#   SERVER_NAME                  production: hadalspace.com www.hadalspace.com
-#                                local: "_" (any host)
+#   SERVER_NAME                  host names Hadal answers for
+#                                production: hadalspace.com www.hadalspace.com
+#                                local: localhost 127.0.0.1
+#   CANONICAL_HOST               the one host every redirect points at
+#                                production: hadalspace.com; local: localhost
 #   SSL_CERTIFICATE / SSL_CERTIFICATE_KEY
 #                                production: Let's Encrypt (docker-compose.prod.yml)
 #                                local: mkcert files in /etc/nginx/certs
@@ -20,6 +23,28 @@ map $host $hsts_header {
     default "max-age=${HSTS_MAX_AGE}; includeSubDomains";
 }
 
+# Any other host name gets nothing: no redirect (so this can't become an
+# open redirect to an attacker's host), no app, no certificate. Without these
+# default servers nginx would answer unknown names with the first server
+# below, and redirects built from the request's Host would point anywhere.
+server {
+    listen 80 default_server;
+    server_name _;
+    server_tokens off;
+    return 444;   # close the connection without a response
+}
+
+server {
+    listen 443 ssl default_server;
+    server_name _;
+    server_tokens off;
+    # Refuse TLS for an unknown (or missing) SNI name before any certificate
+    # is sent. A request that does reach this server, such as one whose Host
+    # header differs from its SNI name, is refused too.
+    ssl_reject_handshake on;
+    return 421;
+}
+
 # Plain HTTP serves only Let's Encrypt's HTTP-01 challenge files (certbot
 # writes them to /var/www/certbot); everything else redirects to HTTPS.
 server {
@@ -33,8 +58,9 @@ server {
         try_files $uri =404;
     }
 
+    # A fixed target, never the request's Host header (CASA 5.1.2).
     location / {
-        return 301 https://$host${HTTPS_REDIRECT_PORT_SUFFIX}$request_uri;
+        return 301 https://${CANONICAL_HOST}${HTTPS_REDIRECT_PORT_SUFFIX}$request_uri;
     }
 }
 
@@ -57,7 +83,7 @@ server {
 
     # Plain HTTP sent to this TLS port (e.g. http://localhost:8000 locally)
     # gets a redirect to HTTPS instead of nginx's "400 plain HTTP" page.
-    error_page 497 =301 https://$host${HTTPS_REDIRECT_PORT_SUFFIX}$request_uri;
+    error_page 497 =301 https://${CANONICAL_HOST}${HTTPS_REDIRECT_PORT_SUFFIX}$request_uri;
 
     root /usr/share/nginx/html;
     index index.html;
