@@ -24,10 +24,10 @@ use argon2::{
 };
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use serde::Deserialize;
-use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use super::AuthUser;
 use super::token::random_token;
 use crate::config::SessionConfig;
 use crate::error::AppError;
@@ -213,7 +213,7 @@ pub async fn register(
     let token = super::start_session(&req, &pool, &sessions, user_id).await?;
     let mut resp = HttpResponse::build(StatusCode::CREATED);
     super::session_cookie(&token, &sessions).apply(&mut resp);
-    Ok(resp.json(json!({ "email": email })))
+    Ok(resp.json(super::profile(&pool, user_id).await?))
 }
 
 /// `POST /api/auth/password-login`.
@@ -276,7 +276,92 @@ pub async fn login(
     let token = super::start_session(&req, &pool, &sessions, user_id).await?;
     let mut resp = HttpResponse::Ok();
     super::session_cookie(&token, &sessions).apply(&mut resp);
-    Ok(resp.json(json!({ "email": email })))
+    Ok(resp.json(super::profile(&pool, user_id).await?))
+}
+
+/// `POST /api/auth/password`, signed in.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+/// Changes the password of the signed-in password account (CASA 2.2.2).
+///
+/// Needs the current password, so a hijacked session alone can't lock the
+/// owner out. On success every session of the user is deleted, including
+/// this one, and a fresh session is issued to this browser only. Anyone else
+/// signed in as the user is signed out.
+pub async fn change(
+    user: AuthUser,
+    pool: web::Data<PgPool>,
+    sessions: web::Data<SessionConfig>,
+    accounts: Option<web::Data<AccountLimiter>>,
+    body: web::Json<ChangePasswordRequest>,
+) -> Result<HttpResponse, AppError> {
+    let accounts = accounts
+        .ok_or_else(|| AppError::Internal(anyhow::anyhow!("account limiter not configured")))?;
+    let body = body.into_inner();
+    if body.current_password.chars().count() > MAX_PASSWORD_CHARS {
+        return Err(AppError::BadRequest("current password is incorrect".into()));
+    }
+    // Throttles guessing the current password through a stolen session.
+    if !accounts.allow(&format!("user:{}", user.user_id)) {
+        tracing::warn!(user_id = %user.user_id, "credential change attempts throttled");
+        return Err(AppError::TooManyRequests);
+    }
+
+    let (email, stored): (String, Option<String>) =
+        sqlx::query_as("SELECT email, password_hash FROM users WHERE id = $1")
+            .bind(user.user_id)
+            .fetch_one(pool.get_ref())
+            .await?;
+    let Some(stored) = stored else {
+        return Err(AppError::BadRequest(
+            "this account signs in with Google and has no password".into(),
+        ));
+    };
+    check_password_policy(&body.new_password, &email)?;
+
+    let (current, new) = (body.current_password, body.new_password);
+    let new_hash = web::block(move || -> Result<Option<String>, AppError> {
+        if !verify_password(&current, &stored) {
+            return Ok(None);
+        }
+        if verify_password(&new, &stored) {
+            return Err(AppError::BadRequest(
+                "choose a password different from the current one".into(),
+            ));
+        }
+        hash_password(&new).map(Some)
+    })
+    .await
+    .map_err(blocking_failed)??;
+    let Some(new_hash) = new_hash else {
+        tracing::info!(user_id = %user.user_id, "credential change refused: current credential wrong");
+        return Err(AppError::BadRequest("current password is incorrect".into()));
+    };
+
+    // Hash update and sign-out of every session commit together.
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+        .bind(&new_hash)
+        .bind(user.user_id)
+        .execute(&mut *tx)
+        .await?;
+    let ended = sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(user.user_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    tracing::info!(user_id = %user.user_id, sessions_ended = ended, "credential changed, all sessions ended");
+
+    let token = super::session::create(&pool, user.user_id, sessions.absolute_secs).await?;
+    let mut resp = HttpResponse::Ok();
+    super::session_cookie(&token, &sessions).apply(&mut resp);
+    Ok(resp.json(super::profile(&pool, user.user_id).await?))
 }
 
 #[cfg(test)]

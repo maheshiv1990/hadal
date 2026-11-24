@@ -1,0 +1,118 @@
+# Rendered by the nginx image at start-up (envsubst on /etc/nginx/templates).
+# Only environment variables are substituted (defaults in nginx/Dockerfile);
+# nginx's own $variables are left alone.
+#
+#   SERVER_NAME                  production: hadalspace.com www.hadalspace.com
+#                                local: "_" (any host)
+#   SSL_CERTIFICATE / SSL_CERTIFICATE_KEY
+#                                production: Let's Encrypt (docker-compose.prod.yml)
+#                                local: mkcert files in /etc/nginx/certs
+#   HTTPS_REDIRECT_PORT_SUFFIX   "" in production, ":8443" locally
+#   HSTS_MAX_AGE                 seconds
+
+upstream backend {
+    server backend:8080;
+}
+
+# HSTS for every HTTPS response (CASA 4.1.1). One value, set here, so the
+# SPA, the assets and the proxied API all send the same header.
+map $host $hsts_header {
+    default "max-age=${HSTS_MAX_AGE}; includeSubDomains";
+}
+
+# Plain HTTP serves only Let's Encrypt's HTTP-01 challenge files (certbot
+# writes them to /var/www/certbot); everything else redirects to HTTPS.
+server {
+    listen 80;
+    server_name ${SERVER_NAME};
+    server_tokens off;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        default_type "text/plain";
+        try_files $uri =404;
+    }
+
+    location / {
+        return 301 https://$host${HTTPS_REDIRECT_PORT_SUFFIX}$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name ${SERVER_NAME};
+    server_tokens off;
+
+    # CASA 4.1.1: TLS 1.2 and 1.3 only, forward-secret AEAD suites only
+    # (Mozilla "intermediate" profile). TLS 1.3 suites are always strong.
+    ssl_certificate     ${SSL_CERTIFICATE};
+    ssl_certificate_key ${SSL_CERTIFICATE_KEY};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:TLS:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    client_max_body_size 1m;
+
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript image/svg+xml;
+
+    # Security headers are included per location, not at server level, so that
+    # /api/ responses carry only the backend's stricter API headers
+    # (backend/src/security.rs) instead of two conflicting copies.
+
+    # API -> actix backend
+    location /api/ {
+        # The backend sends its own HSTS; replace it so there's exactly one,
+        # with the max-age configured here.
+        proxy_hide_header Strict-Transport-Security;
+        add_header Strict-Transport-Security $hsts_header always;
+
+        proxy_pass http://backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 30s;
+
+        # nginx-generated errors (backend down) still need hardening headers.
+        proxy_intercept_errors off;
+        error_page 413 = @api_too_large;
+        error_page 502 503 504 = @api_unavailable;
+    }
+
+    location @api_too_large {
+        include /etc/nginx/snippets/security-headers.conf;
+        add_header Cache-Control "no-store" always;
+        default_type application/json;
+        return 413 '{"error":"request body too large"}';
+    }
+
+    location @api_unavailable {
+        include /etc/nginx/snippets/security-headers.conf;
+        add_header Cache-Control "no-store" always;
+        default_type application/json;
+        return 503 '{"error":"service unavailable"}';
+    }
+
+    # Hashed build assets can be cached forever.
+    location /assets/ {
+        include /etc/nginx/snippets/security-headers.conf;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        try_files $uri =404;
+    }
+
+    # SPA fallback: unknown paths serve index.html for client-side routing.
+    location / {
+        include /etc/nginx/snippets/security-headers.conf;
+        add_header Cache-Control "no-cache" always;
+        try_files $uri $uri/ /index.html;
+    }
+}

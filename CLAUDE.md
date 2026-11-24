@@ -58,6 +58,11 @@ Auth (Google OAuth Authorization Code + PKCE, opaque server-side sessions) lives
   `verify_password` only, one "invalid email or password" error, no `Debug` on
   request types holding passwords. They stay separate from Google accounts. Any
   password change or reset must revoke the user's other sessions (2.2.2).
+- Transport: the app is HTTPS-only behind nginx (`nginx/default.conf.template`),
+  and the database is `sslmode=verify-full` (config refuses anything else off
+  localhost). `scripts/check-tls.sh` checks a running stack; CI runs it.
+  Production is `docker-compose.prod.yml` (hadalspace.com, Let's Encrypt via
+  certbot); keep port 80 limited to the ACME challenge and the redirect.
 - Secrets in config use `config::Secret`. Don't store Google tokens without encryption.
 - DB-backed tests use `test_support::{test_db, signed_in_user, test_app!}`; `verify.sh`
   starts the throwaway DB (`scripts/test-db.sh`).

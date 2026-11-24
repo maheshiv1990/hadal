@@ -130,6 +130,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                     .route(web::post().to(password::login)),
             )
             .service(
+                web::resource("/password")
+                    .wrap(from_fn(require_session))
+                    .wrap(from_fn(security::auth_rate_limit))
+                    .route(web::post().to(password::change)),
+            )
+            .service(
                 web::resource("/me")
                     .wrap(from_fn(require_session))
                     .route(web::get().to(me)),
@@ -257,13 +263,21 @@ async fn complete_login(
     let identity = google.exchange_code(&code, &verifier, &nonce).await?;
 
     let user_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO users (id, google_sub, email) VALUES ($1, $2, $3)
-         ON CONFLICT (google_sub) DO UPDATE SET email = EXCLUDED.email, last_login_at = now()
+        "INSERT INTO users (id, google_sub, email, first_name, last_name)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (google_sub) DO UPDATE SET
+             email = EXCLUDED.email,
+             -- Google is the source of truth, but a name it stops sending is kept.
+             first_name = COALESCE(EXCLUDED.first_name, users.first_name),
+             last_name = COALESCE(EXCLUDED.last_name, users.last_name),
+             last_login_at = now()
          RETURNING id",
     )
     .bind(Uuid::new_v4())
     .bind(&identity.sub)
     .bind(&identity.email)
+    .bind(&identity.first_name)
+    .bind(&identity.last_name)
     .fetch_one(pool)
     .await?;
 
@@ -293,12 +307,31 @@ fn session_cookie(token: &str, sessions: &SessionConfig) -> SetCookie {
     )
 }
 
+/// What the frontend shows for the signed-in user. Same shape for Google and
+/// password accounts; names may be null for Google accounts without them.
+async fn profile(pool: &PgPool, user_id: Uuid) -> Result<serde_json::Value, AppError> {
+    let (email, first_name, last_name, has_password): (
+        String,
+        Option<String>,
+        Option<String>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT email, first_name, last_name, password_hash IS NOT NULL
+             FROM users WHERE id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(json!({
+        "email": email,
+        "first_name": first_name,
+        "last_name": last_name,
+        "has_password": has_password,
+    }))
+}
+
 async fn me(user: AuthUser, pool: web::Data<PgPool>) -> Result<HttpResponse, AppError> {
-    let email: String = sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
-        .bind(user.user_id)
-        .fetch_one(pool.get_ref())
-        .await?;
-    Ok(HttpResponse::Ok().json(json!({ "email": email })))
+    Ok(HttpResponse::Ok().json(profile(&pool, user.user_id).await?))
 }
 
 /// Logout takes a JSON body so a cross-site form can't trigger it (CASA 3.1.5).

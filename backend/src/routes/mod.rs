@@ -448,7 +448,7 @@ mod tests {
         HttpResponse::Ok().json(json!({
             "access_token": "not-a-real-access-token",
             "expires_in": 3599,
-            "scope": "openid email",
+            "scope": "openid email profile",
             "token_type": "Bearer",
             "id_token": fake_id_token(&good_claims(&nonce, &sub, now)),
         }))
@@ -552,7 +552,15 @@ mod tests {
         let (status, body) = json_body(test::call_service(&app, me(&session)).await).await;
         assert_eq!(
             (status, body),
-            (200, json!({ "email": format!("{sub}@example.com") }))
+            (
+                200,
+                json!({
+                    "email": format!("{sub}@example.com"),
+                    "first_name": "Ada",
+                    "last_name": "Lovelace",
+                    "has_password": false,
+                })
+            )
         );
         // The session the browser had before signing in is gone (fixation).
         assert_eq!(
@@ -686,6 +694,10 @@ mod tests {
             (201, Some(email.to_lowercase().as_str()))
         );
         assert!(!body.to_string().contains(PASSPHRASE));
+        assert_eq!(
+            (body["first_name"].as_str(), body["last_name"].as_str()),
+            (Some("Ada"), Some("Lovelace"))
+        );
 
         let (_, me) =
             json_body(test::call_service(&app, me_with(&cookie).to_request()).await).await;
@@ -961,5 +973,175 @@ mod tests {
         )
         .to_request();
         assert_eq!(test::call_service(&app, req).await.status(), 500);
+    }
+
+    fn change_password(cookie: &str, current: &str, new: &str) -> actix_web::test::TestRequest {
+        post_json(
+            "/api/auth/password",
+            json!({ "current_password": current, "new_password": new }),
+        )
+        .insert_header(("cookie", cookie))
+    }
+
+    const NEW_PASSPHRASE: &str = "a brand new passphrase";
+
+    #[actix_web::test]
+    async fn password_change_signs_out_every_other_session() {
+        // CASA 2.2.2: after a password change, sessions elsewhere are dead.
+        let pool = test_db().await;
+        let app = test_app!(pool);
+        let email = fresh_email();
+        let resp = test::call_service(
+            &app,
+            post_json("/api/auth/register", registration(&email)).to_request(),
+        )
+        .await;
+        let here = cookie_pair(&resp, SESSION_COOKIE).unwrap();
+        let login = json!({ "email": email, "password": PASSPHRASE });
+        let resp = test::call_service(
+            &app,
+            post_json("/api/auth/password-login", login).to_request(),
+        )
+        .await;
+        let elsewhere = cookie_pair(&resp, SESSION_COOKIE).unwrap();
+        assert_eq!(
+            test::call_service(&app, me_with(&elsewhere).to_request())
+                .await
+                .status(),
+            200
+        );
+
+        let resp = test::call_service(
+            &app,
+            change_password(&here, PASSPHRASE, NEW_PASSPHRASE).to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let fresh = cookie_pair(&resp, SESSION_COOKIE).unwrap();
+        let (_, body) = json_body(resp).await;
+        assert_eq!(body["has_password"], json!(true));
+
+        // The other browser and the old token here are both signed out; only
+        // the session issued by the change is live.
+        assert_eq!(
+            test::call_service(&app, me_with(&elsewhere).to_request())
+                .await
+                .status(),
+            401
+        );
+        assert_eq!(
+            test::call_service(&app, me_with(&here).to_request())
+                .await
+                .status(),
+            401
+        );
+        assert_eq!(
+            test::call_service(&app, me_with(&fresh).to_request())
+                .await
+                .status(),
+            200
+        );
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sessions s JOIN users u ON u.id = s.user_id WHERE u.email = $1",
+        )
+        .bind(email.to_lowercase())
+        .fetch_one(pool.get_ref())
+        .await
+        .unwrap();
+        assert_eq!(live, 1);
+
+        // Old password is gone, new one works.
+        let old = json!({ "email": email, "password": PASSPHRASE });
+        assert_eq!(
+            test::call_service(
+                &app,
+                post_json("/api/auth/password-login", old).to_request()
+            )
+            .await
+            .status(),
+            401
+        );
+        let new = json!({ "email": email, "password": NEW_PASSPHRASE });
+        assert_eq!(
+            test::call_service(
+                &app,
+                post_json("/api/auth/password-login", new).to_request()
+            )
+            .await
+            .status(),
+            200
+        );
+    }
+
+    #[actix_web::test]
+    async fn password_change_needs_a_session_and_the_current_password() {
+        let pool = test_db().await;
+        let app = test_app!(pool);
+        let email = fresh_email();
+        let resp = test::call_service(
+            &app,
+            post_json("/api/auth/register", registration(&email)).to_request(),
+        )
+        .await;
+        let cookie = cookie_pair(&resp, SESSION_COOKIE).unwrap();
+
+        // No session: refused before anything else.
+        let anon = post_json(
+            "/api/auth/password",
+            json!({ "current_password": PASSPHRASE, "new_password": NEW_PASSPHRASE }),
+        );
+        assert_eq!(
+            test::call_service(&app, anon.to_request()).await.status(),
+            401
+        );
+
+        // Wrong current password, a weak or unchanged new one: 400, and the
+        // session survives (a 401 would make the app sign the user out).
+        for (current, new) in [
+            ("wrong passphrase entirely", NEW_PASSPHRASE),
+            (PASSPHRASE, "short"),
+            (PASSPHRASE, PASSPHRASE),
+        ] {
+            let resp =
+                test::call_service(&app, change_password(&cookie, current, new).to_request()).await;
+            assert_eq!(resp.status(), 400, "{current} -> {new}");
+        }
+        assert_eq!(
+            test::call_service(&app, me_with(&cookie).to_request())
+                .await
+                .status(),
+            200
+        );
+        let still = json!({ "email": email, "password": PASSPHRASE });
+        assert_eq!(
+            test::call_service(
+                &app,
+                post_json("/api/auth/password-login", still).to_request()
+            )
+            .await
+            .status(),
+            200
+        );
+
+        // Extra fields are refused (no setting someone else's password).
+        let mut body = json!({ "current_password": PASSPHRASE, "new_password": NEW_PASSPHRASE });
+        body["user_id"] = json!(uuid::Uuid::new_v4().to_string());
+        let resp = test::call_service(
+            &app,
+            post_json("/api/auth/password", body)
+                .insert_header(("cookie", cookie.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+
+        // Google accounts have no password to change.
+        let (_, google_cookie) = signed_in_user(&pool).await;
+        let resp = test::call_service(
+            &app,
+            change_password(&google_cookie, PASSPHRASE, NEW_PASSPHRASE).to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
     }
 }

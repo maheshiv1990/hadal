@@ -11,3 +11,6 @@ frontend/dist/
 # Python
 __pycache__/
 *.pyc
+
+# TLS material from scripts/dev-certs.sh
+certs/

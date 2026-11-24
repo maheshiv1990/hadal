@@ -200,6 +200,83 @@ function Register(props: { onSignedIn: (me: Me) => void; onCancel: () => void })
   )
 }
 
+function ChangePassword(props: { onDone: (me: Me) => void; onCancel: () => void }) {
+  const [current, setCurrent] = createSignal('')
+  const [next, setNext] = createSignal('')
+  const [confirm, setConfirm] = createSignal('')
+  const [error, setError] = createSignal<string | null>(null)
+  const [busy, setBusy] = createSignal(false)
+
+  const submit = async (e: SubmitEvent) => {
+    e.preventDefault()
+    if (next().length < MIN_PASSWORD_LENGTH)
+      return setError(`New password must be at least ${MIN_PASSWORD_LENGTH} characters.`)
+    if (next() !== confirm()) return setError('New passwords do not match.')
+    setError(null)
+    setBusy(true)
+    try {
+      props.onDone(await api.changePassword(current(), next()))
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section class="signin panel">
+      <h2>Change password</h2>
+      <form onSubmit={submit} class="auth-form">
+        <label>
+          Current password
+          <input
+            type="password"
+            autocomplete="current-password"
+            value={current()}
+            onInput={(e) => setCurrent(e.currentTarget.value)}
+            maxLength={MAX_PASSWORD_LENGTH}
+            required
+          />
+        </label>
+        <label>
+          New password
+          <input
+            type="password"
+            autocomplete="new-password"
+            value={next()}
+            onInput={(e) => setNext(e.currentTarget.value)}
+            minLength={MIN_PASSWORD_LENGTH}
+            maxLength={MAX_PASSWORD_LENGTH}
+            required
+          />
+        </label>
+        <label>
+          Confirm new password
+          <input
+            type="password"
+            autocomplete="new-password"
+            value={confirm()}
+            onInput={(e) => setConfirm(e.currentTarget.value)}
+            maxLength={MAX_PASSWORD_LENGTH}
+            required
+          />
+        </label>
+        <Show when={error()}>
+          <p class="error" role="alert">{error()}</p>
+        </Show>
+        <div class="row">
+          <button type="submit" disabled={busy()}>
+            {busy() ? 'Saving…' : 'Change password'}
+          </button>
+          <button type="button" class="secondary plain" onClick={props.onCancel}>
+            Cancel
+          </button>
+        </div>
+      </form>
+    </section>
+  )
+}
+
 function Notes(props: { onSignedOut: () => void }) {
   const [notes, { refetch }] = createResource(api.listNotes)
   const [title, setTitle] = createSignal('')
@@ -300,6 +377,8 @@ function Notes(props: { onSignedOut: () => void }) {
 function App() {
   const [me, { mutate }] = createResource<Me | null>(api.me)
   const [view, setView] = createSignal<AuthView>('signin')
+  const [changing, setChanging] = createSignal(false)
+  const [notice, setNotice] = createSignal<string | null>(null)
   const loginFailed = new URLSearchParams(window.location.search).get('login') === 'failed'
   if (loginFailed) {
     // Drop the flag so a reload doesn't show the error again.
@@ -312,6 +391,8 @@ function App() {
     } finally {
       mutate(null)
       setView('signin')
+      setChanging(false)
+      setNotice(null)
     }
   }
 
@@ -322,7 +403,17 @@ function App() {
         <Show when={me()}>
           {(user) => (
             <div class="user">
-              <span class="muted">{user().email}</span>
+              <span>
+                <Show when={[user().first_name, user().last_name].filter(Boolean).join(' ')}>
+                  {(name) => <strong>{name()} </strong>}
+                </Show>
+                <span class="muted">{user().email}</span>
+              </span>
+              <Show when={user().has_password}>
+                <button class="secondary plain" onClick={() => setChanging(!changing())}>
+                  Change password
+                </button>
+              </Show>
               <button class="secondary" onClick={signOut}>
                 Sign out
               </button>
@@ -346,6 +437,19 @@ function App() {
               </Show>
             }
           >
+            <Show when={notice()}>
+              <p class="notice" role="status">{notice()}</p>
+            </Show>
+            <Show when={changing()}>
+              <ChangePassword
+                onCancel={() => setChanging(false)}
+                onDone={(m) => {
+                  mutate(m)
+                  setChanging(false)
+                  setNotice('Password changed. You were signed out everywhere else.')
+                }}
+              />
+            </Show>
             <Notes onSignedOut={() => mutate(null)} />
           </Show>
         </Show>

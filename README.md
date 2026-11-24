@@ -21,22 +21,50 @@ browser ──► nginx :8000 ─┬─ /        → SolidJS static build (SPA f
 ```sh
 cp .env.example .env      # then set POSTGRES_PASSWORD (openssl rand -hex 24)
                           # and the Google OAuth client (below)
+scripts/dev-certs.sh      # TLS certificates for nginx and Postgres (certs/, git-ignored)
 docker compose up -d --build
-open http://localhost:8000
+open https://localhost:8443
 ```
+
+HTTPS only: `http://localhost:8000` just redirects to `https://localhost:8443`,
+and Postgres refuses connections without TLS. `scripts/dev-certs.sh` uses
+[mkcert](https://github.com/FiloSottile/mkcert) when it is installed (run
+`mkcert -install` once so the browser trusts it); otherwise the certificate is
+self-signed and the browser warns. `scripts/check-tls.sh` checks the running
+stack: TLS versions and suites, the redirect, HSTS, and TLS to Postgres.
 
 ### Google sign-in setup
 
 1. In Google Cloud Console → APIs & Services → Credentials, create an
    **OAuth client ID** of type **Web application**.
-2. Add the authorized redirect URI `http://localhost:8000/api/auth/callback`
+2. Add the authorized redirect URI `https://localhost:8443/api/auth/callback`
    (for Vite dev on :5173, also add `http://localhost:5173/api/auth/callback` and set
    `OAUTH_REDIRECT_URI` to it). Outside localhost it must be `https://`.
 3. Put the client ID and secret in `.env` as `GOOGLE_CLIENT_ID` and
    `GOOGLE_CLIENT_SECRET`. The backend refuses to start without them.
 
-Session cookies are `Secure` and `__Host-` prefixed. Browsers accept that on
-`http://localhost` because it counts as a secure context. Everywhere else you need HTTPS.
+Session cookies are `Secure` and `__Host-` prefixed. For Vite dev on
+`http://localhost:5173` browsers still accept them, because localhost counts
+as a secure context. Everywhere else you need HTTPS.
+
+## Production (hadalspace.com, Let's Encrypt)
+
+`docker-compose.prod.yml` serves `https://hadalspace.com` (and `www.`) on ports
+80/443 with a Let's Encrypt certificate, renewed by a `certbot` service; nginx
+reloads every 6 hours to pick renewals up. Postgres isn't published.
+
+```sh
+# On the server, with DNS for hadalspace.com and www.hadalspace.com pointing at it
+cp production.env.example .env     # fill in; production secrets come from a secrets manager
+scripts/dev-certs.sh                # Postgres TLS (private CA for backend -> db)
+scripts/letsencrypt-init.sh you@example.com --staging   # dry run against LE staging
+scripts/letsencrypt-init.sh you@example.com             # real certificate, starts the stack
+scripts/check-tls.sh hadalspace.com 443 80
+```
+
+Register `https://hadalspace.com/api/auth/callback` as a redirect URI on the
+Google OAuth client. Then run an [SSL Labs](https://www.ssllabs.com/ssltest/)
+test for the CASA 4.1.1 evidence.
 
 ## Local development (hot reload)
 
@@ -56,6 +84,7 @@ cd frontend && npm install && npm run dev   # Vite on :5173, proxies /api → :8
 | GET | `/api/auth/login` | start Google sign-in (public, redirects) |
 | GET | `/api/auth/callback` | Google redirect target (public) |
 | POST | `/api/auth/register` | `{first_name, last_name, email, password}`; creates an email account and signs in (public) |
+| POST | `/api/auth/password` | signed in: `{current_password, new_password}`; signs out every other session |
 | POST | `/api/auth/password-login` | `{email, password}`; signs in (public) |
 | GET | `/api/auth/me` | `{ "email": "..." }` of the signed-in user |
 | POST | `/api/auth/logout` | body `{}`; ends the session |
