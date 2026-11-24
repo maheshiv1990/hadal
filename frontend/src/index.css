@@ -105,7 +105,19 @@ button.secondary { background: transparent; color: var(--danger); border-color: 
 .welcome h1 { margin: 0.75rem 0 0; font-size: 1.75rem; }
 .welcome p { margin: 0 0 1rem; font-size: 1rem; }
 .auth-nav { display: flex; align-items: center; gap: 0.5rem; }
-.auth-nav button.secondary.plain.active { border-color: var(--accent); color: var(--accent); }
+.auth-nav a {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: inherit;
+  text-decoration: none;
+}
+.auth-nav a.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.auth-nav a[aria-current='page'] { border-color: var(--accent); color: var(--accent); }
+.auth-nav a.primary[aria-current='page'] {
+  color: #fff;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
+}
 .user { display: flex; align-items: center; gap: 0.75rem; }
 .user button.secondary { color: inherit; }
 .signin { display: flex; flex-direction: column; align-items: flex-start; gap: 0.75rem; }

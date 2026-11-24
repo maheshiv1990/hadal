@@ -1,4 +1,4 @@
-import { createEffect, createResource, createSignal, For, Match, Show, Switch } from 'solid-js'
+import { createEffect, createResource, createSignal, For, Match, onCleanup, Show, Switch } from 'solid-js'
 import {
   api,
   GMAIL_CONNECT_PATH,
@@ -12,6 +12,16 @@ import {
 
 /** What a signed-out visitor sees: the welcome page until they pick an action in the header. */
 type AuthView = 'home' | 'signin' | 'register'
+
+/** Each signed-out view has its own URL; nginx serves index.html for all of them. */
+const VIEW_PATHS: Record<AuthView, string> = {
+  home: '/',
+  signin: '/auth/signin',
+  register: '/auth/register',
+}
+
+const viewFromPath = (path: string): AuthView =>
+  path === VIEW_PATHS.signin ? 'signin' : path === VIEW_PATHS.register ? 'register' : 'home'
 
 function Welcome() {
   return (
@@ -576,16 +586,42 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
 function App() {
   const [me, { mutate }] = createResource<Me | null>(api.me)
   const query = new URLSearchParams(window.location.search)
+  // A failed Google sign-in comes back to /?login=failed; show the sign-in page with the error.
   const loginFailed = query.get('login') === 'failed'
-  // A failed Google sign-in comes back here; show the sign-in options with the error.
-  const [view, setView] = createSignal<AuthView>(loginFailed ? 'signin' : 'home')
+  const [view, setView] = createSignal<AuthView>(loginFailed ? 'signin' : viewFromPath(window.location.pathname))
   const [changing, setChanging] = createSignal(false)
   const [notice, setNotice] = createSignal<string | null>(null)
   const mailFlag = query.get('mail')
   const linkResult: LinkResult = mailFlag === 'linked' || mailFlag === 'failed' ? mailFlag : null
   if (loginFailed || mailFlag !== null) {
     // Drop the flag so a reload doesn't show the message again.
-    window.history.replaceState(null, '', window.location.pathname)
+    window.history.replaceState(null, '', VIEW_PATHS[view()])
+  }
+
+  /** Show a view and put its URL in the address bar (a new history entry unless `replace`). */
+  const navigate = (next: AuthView, replace = false) => {
+    if (window.location.pathname !== VIEW_PATHS[next]) {
+      if (replace) window.history.replaceState(null, '', VIEW_PATHS[next])
+      else window.history.pushState(null, '', VIEW_PATHS[next])
+    }
+    setView(next)
+  }
+
+  // Back/forward buttons.
+  const onPopState = () => setView(viewFromPath(window.location.pathname))
+  window.addEventListener('popstate', onPopState)
+  onCleanup(() => window.removeEventListener('popstate', onPopState))
+
+  // Signed in on /auth/signin or /auth/register: those pages don't apply, go home.
+  createEffect(() => {
+    if (me() && view() !== 'home') navigate('home', true)
+  })
+
+  /** Click handler for in-app links; leaves new-tab/modified clicks to the browser. */
+  const linkTo = (next: AuthView) => (e: MouseEvent) => {
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+    e.preventDefault()
+    navigate(next)
   }
 
   const signOut = async () => {
@@ -593,7 +629,7 @@ function App() {
       await api.logout()
     } finally {
       mutate(null)
-      setView('home')
+      navigate('home')
       setChanging(false)
       setNotice(null)
     }
@@ -603,7 +639,7 @@ function App() {
     <>
       <header class="site-header">
         <div class="site-header-inner">
-        <a class="brand" href="/" aria-label="Hadal home">
+        <a class="brand" href={VIEW_PATHS.home} onClick={linkTo('home')} aria-label="Hadal home">
           <img class="brand-mark" src="/hadal-icon.png" alt="" width="32" height="32" />
           Hadal
         </a>
@@ -612,21 +648,21 @@ function App() {
           fallback={
             <Show when={!me.loading && !me.error}>
               <nav class="auth-nav" aria-label="Account">
-                <button
-                  class="secondary plain"
-                  classList={{ active: view() === 'signin' }}
-                  aria-pressed={view() === 'signin'}
-                  onClick={() => setView('signin')}
+                <a
+                  href={VIEW_PATHS.signin}
+                  aria-current={view() === 'signin' ? 'page' : undefined}
+                  onClick={linkTo('signin')}
                 >
                   Sign in
-                </button>
-                <button
-                  classList={{ active: view() === 'register' }}
-                  aria-pressed={view() === 'register'}
-                  onClick={() => setView('register')}
+                </a>
+                <a
+                  class="primary"
+                  href={VIEW_PATHS.register}
+                  aria-current={view() === 'register' ? 'page' : undefined}
+                  onClick={linkTo('register')}
                 >
                   Register
-                </button>
+                </a>
               </nav>
             </Show>
           }
@@ -661,10 +697,10 @@ function App() {
             fallback={
               <Switch>
                 <Match when={view() === 'signin'}>
-                  <SignIn failed={loginFailed} onSignedIn={mutate} onRegister={() => setView('register')} />
+                  <SignIn failed={loginFailed} onSignedIn={mutate} onRegister={() => navigate('register')} />
                 </Match>
                 <Match when={view() === 'register'}>
-                  <Register onSignedIn={mutate} onCancel={() => setView('signin')} />
+                  <Register onSignedIn={mutate} onCancel={() => navigate('signin')} />
                 </Match>
                 <Match when={view() === 'home'}>
                   <Welcome />
