@@ -446,7 +446,7 @@ mod tests {
         let sub = st.sub.lock().unwrap().clone();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         HttpResponse::Ok().json(json!({
-            "access_token": "ya29.fake",
+            "access_token": "not-a-real-access-token",
             "expires_in": 3599,
             "scope": "openid email",
             "token_type": "Bearer",
