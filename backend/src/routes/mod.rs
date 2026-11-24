@@ -5,7 +5,6 @@ use crate::error::AppError;
 
 mod health;
 mod mail;
-mod notes;
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.app_data(
@@ -32,14 +31,6 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .service(health::health)
             .configure(auth::configure)
             // Everything else needs a session (deny by default, CASA 3.1.1).
-            .service(
-                web::scope("/notes")
-                    .wrap(from_fn(auth::require_session))
-                    .service(notes::list)
-                    .service(notes::create)
-                    .service(notes::get)
-                    .service(notes::delete),
-            )
             .service(
                 web::scope("/mail")
                     .wrap(from_fn(auth::require_session))
@@ -113,15 +104,11 @@ mod tests {
     // ---- deny by default (no database needed) ---------------------------
 
     #[actix_web::test]
-    async fn notes_require_a_session() {
-        // CASA 3.1.1 / 2.4.1: every notes route, every method.
+    async fn api_routes_require_a_session() {
+        // CASA 3.1.1 / 2.4.1: every signed-in route, every method.
         let app = test_app!(unreachable_pool());
         let id = "00000000-0000-0000-0000-000000000000";
         for (method, uri) in [
-            ("GET", "/api/notes".to_owned()),
-            ("POST", "/api/notes".to_owned()),
-            ("GET", format!("/api/notes/{id}")),
-            ("DELETE", format!("/api/notes/{id}")),
             ("GET", "/api/auth/me".to_owned()),
             ("GET", "/api/auth/gmail/connect".to_owned()),
             ("GET", "/api/mail/accounts".to_owned()),
@@ -135,7 +122,7 @@ mod tests {
                     .method(method.parse().unwrap())
                     .uri(&uri)
                     .insert_header(("content-type", "application/json"))
-                    .set_payload(r#"{"title":"x"}"#);
+                    .set_payload("{}");
                 if let Some(c) = &cookie {
                     req = req.insert_header(("cookie", c.as_str()));
                 }
@@ -152,7 +139,7 @@ mod tests {
         // CASA 3.1.3: an error while checking the session must deny, not allow.
         let app = test_app!(unreachable_pool());
         let req = test::TestRequest::get()
-            .uri("/api/notes")
+            .uri("/api/mail/accounts")
             .insert_header(("cookie", format!("{SESSION_COOKIE}={}", "a".repeat(43))))
             .to_request();
         let (status, body) = json_body(test::call_service(&app, req).await).await;
@@ -227,12 +214,13 @@ mod tests {
 
     // ---- input handling (signed in) -------------------------------------
 
-    async fn post_notes(body: impl Into<String>) -> (u16, Value) {
+    /// POST a raw body to /api/mail/import, the signed-in JSON endpoint.
+    async fn post_import(body: impl Into<String>) -> (u16, Value) {
         let pool = test_db().await;
         let (_, cookie) = signed_in_user(&pool).await;
         let app = test_app!(pool);
         let req = test::TestRequest::post()
-            .uri("/api/notes")
+            .uri("/api/mail/import")
             .insert_header(("content-type", "application/json"))
             .insert_header(("cookie", cookie))
             .set_payload(body.into())
@@ -242,7 +230,7 @@ mod tests {
 
     #[actix_web::test]
     async fn malformed_json_does_not_leak_parser_details() {
-        let (status, body) = post_notes(r#"{"title": "#).await;
+        let (status, body) = post_import(r#"{"x": "#).await;
         assert_eq!(status, 400);
         assert_eq!(body, json!({ "error": "invalid request body" }));
     }
@@ -250,26 +238,34 @@ mod tests {
     #[actix_web::test]
     async fn unknown_fields_are_rejected() {
         // CASA 3.1.2: a client can't set owner_id (or anything else) itself.
+        // The empty body is accepted, so a 400 below is the extra field's doing.
+        let (status, _) = post_import("{}").await;
+        assert_eq!(status, 200);
         for extra in [
             r#""created_at":"2000-01-01T00:00:00Z""#,
             r#""owner_id":"00000000-0000-0000-0000-000000000000""#,
         ] {
-            let (status, _) = post_notes(format!(r#"{{"title":"a",{extra}}}"#)).await;
+            let (status, _) = post_import(format!("{{{extra}}}")).await;
             assert_eq!(status, 400, "accepted {extra}");
         }
     }
 
     #[actix_web::test]
-    async fn oversized_title_is_rejected() {
-        let (status, _) = post_notes(format!(r#"{{"title":"{}"}}"#, "x".repeat(201))).await;
-        assert_eq!(status, 400);
-    }
-
-    #[actix_web::test]
     async fn duplicate_json_keys_are_rejected() {
         // CASA 5.1.1: parameter pollution must not let a second value win silently.
-        let (status, _) = post_notes(r#"{"title":"safe","title":"evil"}"#).await;
-        assert_eq!(status, 400);
+        let app = test_app!(test_db().await);
+        let req = test::TestRequest::post()
+            .uri("/api/auth/password-login")
+            .insert_header(("content-type", "application/json"))
+            .set_payload(
+                r#"{"email":"safe@example.com","email":"evil@example.com","password":"x"}"#,
+            )
+            .to_request();
+        let (status, body) = json_body(test::call_service(&app, req).await).await;
+        assert_eq!(
+            (status, body),
+            (400, json!({ "error": "invalid request body" }))
+        );
     }
 
     #[actix_web::test]
@@ -285,10 +281,10 @@ mod tests {
             "text/plain",
         ] {
             let req = test::TestRequest::post()
-                .uri("/api/notes")
+                .uri("/api/mail/import")
                 .insert_header(("content-type", ct))
                 .insert_header(("cookie", cookie.as_str()))
-                .set_payload(r#"{"title":"csrf"}"#)
+                .set_payload("{}")
                 .to_request();
             assert_eq!(
                 test::call_service(&app, req).await.status(),
@@ -304,7 +300,7 @@ mod tests {
         let (_, cookie) = signed_in_user(&pool).await;
         let app = test_app!(pool);
         let req = test::TestRequest::get()
-            .uri("/api/notes/not-a-uuid")
+            .uri("/api/mail/messages/not-a-uuid")
             .insert_header(("cookie", cookie))
             .to_request();
         assert_eq!(test::call_service(&app, req).await.status(), 404);
@@ -313,59 +309,11 @@ mod tests {
     // ---- sessions and ownership -----------------------------------------
 
     #[actix_web::test]
-    async fn users_cannot_reach_each_others_notes() {
-        // CASA 3.1.4 (IDOR): B can't list, read or delete A's note, and gets
-        // the same 404 as for a note that doesn't exist.
-        let pool = test_db().await;
-        let (_, alice) = signed_in_user(&pool).await;
-        let (_, bob) = signed_in_user(&pool).await;
-        let app = test_app!(pool);
-
-        let req = test::TestRequest::post()
-            .uri("/api/notes")
-            .insert_header(("content-type", "application/json"))
-            .insert_header(("cookie", alice.as_str()))
-            .set_payload(r#"{"title":"alice's secret"}"#)
-            .to_request();
-        let (status, note) = json_body(test::call_service(&app, req).await).await;
-        assert_eq!(status, 201);
-        let id = note["id"].as_str().unwrap().to_owned();
-        let uri = format!("/api/notes/{id}");
-
-        let as_bob =
-            |req: test::TestRequest| req.insert_header(("cookie", bob.as_str())).to_request();
-        let (status, list) = json_body(
-            test::call_service(&app, as_bob(test::TestRequest::get().uri("/api/notes"))).await,
-        )
-        .await;
-        assert_eq!((status, list), (200, json!([])));
-        let (status, body) =
-            json_body(test::call_service(&app, as_bob(test::TestRequest::get().uri(&uri))).await)
-                .await;
-        assert_eq!((status, body), (404, json!({ "error": "not found" })));
-        let resp = test::call_service(&app, as_bob(test::TestRequest::delete().uri(&uri))).await;
-        assert_eq!(resp.status(), 404);
-
-        // Alice still has it.
-        let req = test::TestRequest::get()
-            .uri(&uri)
-            .insert_header(("cookie", alice.as_str()))
-            .to_request();
-        let (status, body) = json_body(test::call_service(&app, req).await).await;
-        assert_eq!(status, 200);
-        assert_eq!(body["title"], "alice's secret");
-        assert!(
-            body.get("owner_id").is_none(),
-            "owner id must not be exposed"
-        );
-    }
-
-    #[actix_web::test]
     async fn unknown_session_token_is_rejected() {
         let pool = test_db().await;
         let app = test_app!(pool);
         let req = test::TestRequest::get()
-            .uri("/api/notes")
+            .uri("/api/mail/accounts")
             .insert_header(("cookie", format!("{SESSION_COOKIE}={}", "a".repeat(43))))
             .to_request();
         assert_eq!(test::call_service(&app, req).await.status(), 401);
@@ -1338,15 +1286,8 @@ mod tests {
         .await;
         assert_eq!(resp.status(), 401);
 
-        // Registering the same address makes a different user, who can't see
-        // the Google user's notes.
-        let note = test::TestRequest::post()
-            .uri("/api/notes")
-            .insert_header(("content-type", "application/json"))
-            .insert_header(("cookie", google_cookie.as_str()))
-            .set_payload(r#"{"title":"google only","body":""}"#)
-            .to_request();
-        assert_eq!(test::call_service(&app, note).await.status(), 201);
+        // Registering the same address makes a different user; the Google
+        // user's session stays on the Google account.
         let resp = test::call_service(
             &app,
             post_json("/api/auth/register", registration(&google_email)).to_request(),
@@ -1354,12 +1295,22 @@ mod tests {
         .await;
         assert_eq!(resp.status(), 201);
         let cookie = cookie_pair(&resp, SESSION_COOKIE).unwrap();
-        let list = test::TestRequest::get()
-            .uri("/api/notes")
-            .insert_header(("cookie", cookie.as_str()))
-            .to_request();
-        let (_, notes) = json_body(test::call_service(&app, list).await).await;
-        assert_eq!(notes, json!([]));
+        let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE email = $1")
+            .bind(&google_email)
+            .fetch_one(pool.get_ref())
+            .await
+            .unwrap();
+        assert_eq!(users, 2);
+        let me = |cookie: &str| {
+            test::TestRequest::get()
+                .uri("/api/auth/me")
+                .insert_header(("cookie", cookie.to_owned()))
+                .to_request()
+        };
+        let (_, google_me) = json_body(test::call_service(&app, me(&google_cookie)).await).await;
+        let (_, password_me) = json_body(test::call_service(&app, me(&cookie)).await).await;
+        assert_eq!(google_me["has_password"], false);
+        assert_eq!(password_me["has_password"], true);
     }
 
     #[actix_web::test]

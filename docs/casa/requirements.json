@@ -107,7 +107,7 @@
       "id": "2.3.3",
       "title": "Session tokens are used rather than static API secrets and keys",
       "status": "verified",
-      "evidence": ["test:google_sign_in_creates_a_fresh_session", "test:notes_require_a_session", "test:tokens_are_256_bit_and_unique"],
+      "evidence": ["test:google_sign_in_creates_a_fresh_session", "test:api_routes_require_a_session", "test:tokens_are_256_bit_and_unique"],
       "notes": "Each sign-in gets its own random 256-bit session token (only its SHA-256 is stored). There are no static API keys for clients."
     },
     {
@@ -121,15 +121,15 @@
       "id": "2.4.1",
       "title": "A full valid session or re-authentication is required before sensitive transactions or account changes",
       "status": "verified",
-      "evidence": ["test:notes_require_a_session", "test:users_cannot_reach_each_others_notes", "test:logout_rejects_cross_site_forms"],
+      "evidence": ["test:api_routes_require_a_session", "test:users_cannot_reach_each_others_mail", "test:logout_rejects_cross_site_forms"],
       "notes": "Every state-changing endpoint sits behind require_session. There are no account-change functions; the Google account is managed at Google."
     },
     {
       "id": "3.1.1",
       "title": "Least-privilege access control rules are enforced on a trusted service layer",
       "status": "verified",
-      "evidence": ["test:notes_require_a_session", "test:users_cannot_reach_each_others_notes", "test:auth_user_extractor_rejects_unguarded_routes", "lint:notes-owner-scope", "test:linking_gmail_stores_an_encrypted_grant_and_keeps_the_session"],
-      "notes": "Deny by default: the /api/notes and /api/mail scopes and /api/auth/gmail/connect are wrapped in require_session, and handlers take AuthUser, which refuses if the middleware didn't run. Only /api/health and the sign-in endpoints are public. Linking a mailbox never creates a sign-in account for it."
+      "evidence": ["test:api_routes_require_a_session", "test:users_cannot_reach_each_others_mail", "test:auth_user_extractor_rejects_unguarded_routes", "lint:notes-owner-scope", "test:linking_gmail_stores_an_encrypted_grant_and_keeps_the_session"],
+      "notes": "Deny by default: the /api/mail scope and /api/auth/gmail/connect are wrapped in require_session, and handlers take AuthUser, which refuses if the middleware didn't run. Only /api/health and the sign-in endpoints are public. Linking a mailbox never creates a sign-in account for it."
     },
     {
       "id": "3.1.2",
@@ -148,14 +148,14 @@
       "id": "3.1.4",
       "title": "Sensitive resources are protected against IDOR on create, read, update and delete",
       "status": "verified",
-      "evidence": ["test:users_cannot_reach_each_others_notes", "test:unknown_fields_are_rejected", "lint:notes-owner-scope", "test:users_cannot_reach_each_others_mail"],
-      "notes": "Every notes, mail_accounts and mail_messages query is scoped by owner_id from the session, never from the request (lint:notes-owner-scope covers all three tables). mail_messages has a composite foreign key to (mailbox id, owner_id), so a message can't belong to someone else's mailbox. Another user's note, mailbox or message returns the same 404 as a missing one. The Gmail link callback takes the user from the single-use pending row, not the request."
+      "evidence": ["test:users_cannot_reach_each_others_mail", "test:unknown_fields_are_rejected", "lint:notes-owner-scope"],
+      "notes": "Every mail_accounts and mail_messages query is scoped by owner_id from the session, never from the request (lint:notes-owner-scope covers both tables, and still flags the removed notes table if it comes back). mail_messages has a composite foreign key to (mailbox id, owner_id), so a message can't belong to someone else's mailbox. Another user's mailbox or message returns the same 404 as a missing one. The Gmail link callback takes the user from the single-use pending row, not the request."
     },
     {
       "id": "3.1.5",
       "title": "Strong anti-CSRF protects authenticated functionality; anti-automation or anti-CSRF protects unauthenticated functionality",
       "status": "verified",
-      "evidence": ["test:cross_site_form_post_is_rejected", "test:logout_rejects_cross_site_forms", "test:session_cookie_has_secure_attributes", "test:rate_limit_returns_429_after_burst", "lint:cors-wildcard", "test:notes_require_a_session"],
+      "evidence": ["test:cross_site_form_post_is_rejected", "test:logout_rejects_cross_site_forms", "test:session_cookie_has_secure_attributes", "test:rate_limit_returns_429_after_burst", "lint:cors-wildcard", "test:api_routes_require_a_session"],
       "notes": "Session cookie is SameSite=Strict. State-changing endpoints (including logout) accept only application/json, which a cross-site form cannot send without a CORS preflight, and no CORS is granted. Sign-in CSRF is blocked by the state check (3.2.2)."
     },
     {

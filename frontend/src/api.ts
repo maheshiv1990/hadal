@@ -1,10 +1,3 @@
-export interface Note {
-  id: string
-  title: string
-  body: string
-  created_at: string
-}
-
 export interface Me {
   email: string
   /** Null for Google accounts that don't share a name. */
@@ -124,10 +117,6 @@ export const api = {
     }),
   // JSON body so a cross-site form can't log the user out (CASA 3.1.5).
   logout: () => request<void>('/auth/logout', { method: 'POST', body: '{}' }),
-  listNotes: () => request<Note[]>('/notes'),
-  createNote: (title: string, body: string) =>
-    request<Note>('/notes', { method: 'POST', body: JSON.stringify({ title, body }) }),
-  deleteNote: (id: string) => request<void>(`/notes/${id}`, { method: 'DELETE' }),
   listMailAccounts: () => request<MailAccount[]>('/mail/accounts'),
   /** Unlinks a mailbox, deletes its imported mail and revokes Google access. */
   disconnectMailAccount: (id: string) =>

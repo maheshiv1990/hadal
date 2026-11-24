@@ -70,12 +70,14 @@ Scanner ignores:
 - **The auth migration deleted existing notes.** Notes created before sign-in
   existed had no owner and were readable by everyone, so
   `20261124000000_auth.sql` removes them instead of assigning them to a user.
+  The notes feature was later removed entirely, and
+  `20261127000000_drop_notes.sql` drops the table.
 - **Sign-in state lives in the database.** `/api/auth/login` writes one
   `oauth_logins` row per attempt (10-minute expiry, purged every 5 minutes) and
   is limited to 10 per minute per IP.
 - **Email + password accounts are separate from Google accounts.** Registration
   emails are not verified, so linking accounts by address would let anyone
-  take over a Google user's notes by registering their address first. A
+  take over a Google user's mail by registering their address first. A
   password account and a Google account with the same email are different
   users (`password_and_google_accounts_stay_separate`).
 - **Registration says when an email is taken.** `POST /api/auth/register`

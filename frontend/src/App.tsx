@@ -58,7 +58,7 @@ function SignIn(props: { failed: boolean; onSignedIn: (me: Me) => void; onRegist
 
   return (
     <section class="signin">
-      <p>Sign in to see your notes.</p>
+      <p>Sign in to see your email.</p>
       <Show when={props.failed}>
         <p class="error" role="alert">Sign-in failed. Please try again.</p>
       </Show>
@@ -307,103 +307,6 @@ function ChangePassword(props: { onDone: (me: Me) => void; onCancel: () => void 
         </div>
       </form>
     </section>
-  )
-}
-
-function Notes(props: { onSignedOut: () => void }) {
-  const [notes, { refetch }] = createResource(api.listNotes)
-  const [title, setTitle] = createSignal('')
-  const [body, setBody] = createSignal('')
-  const [error, setError] = createSignal<string | null>(null)
-  const [saving, setSaving] = createSignal(false)
-
-  // Any 401 means the session ended (expired, or logged out elsewhere).
-  const handle = (err: unknown) => {
-    if (err instanceof UnauthorizedError) props.onSignedOut()
-    else setError((err as Error).message)
-  }
-
-  const submit = async (e: SubmitEvent) => {
-    e.preventDefault()
-    setError(null)
-    setSaving(true)
-    try {
-      await api.createNote(title(), body())
-      setTitle('')
-      setBody('')
-      await refetch()
-    } catch (err) {
-      handle(err)
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  const remove = async (id: string) => {
-    setError(null)
-    try {
-      await api.deleteNote(id)
-      await refetch()
-    } catch (err) {
-      handle(err)
-    }
-  }
-
-  createEffect(() => {
-    if (notes.error instanceof UnauthorizedError) props.onSignedOut()
-  })
-
-  return (
-    <>
-      <form onSubmit={submit}>
-        <input
-          placeholder="Title"
-          value={title()}
-          onInput={(e) => setTitle(e.currentTarget.value)}
-          maxLength={200}
-          required
-        />
-        <textarea
-          placeholder="Write something…"
-          value={body()}
-          onInput={(e) => setBody(e.currentTarget.value)}
-          maxLength={10000}
-          rows={4}
-        />
-        <button type="submit" disabled={saving()}>
-          {saving() ? 'Saving…' : 'Add note'}
-        </button>
-      </form>
-
-      <Show when={error()}>
-        <p class="error" role="alert">{error()}</p>
-      </Show>
-
-      <Show when={!notes.error} fallback={<p class="error">Could not load notes: {notes.error?.message}</p>}>
-        <Show when={!notes.loading} fallback={<p class="muted">Loading…</p>}>
-          <Show when={notes()?.length} fallback={<p class="muted">No notes yet.</p>}>
-            <ul class="notes">
-              <For each={notes()}>
-                {(note) => (
-                  <li>
-                    <div>
-                      <strong>{note.title}</strong>
-                      <Show when={note.body}>
-                        <p>{note.body}</p>
-                      </Show>
-                      <time class="muted">{new Date(note.created_at).toLocaleString()}</time>
-                    </div>
-                    <button class="secondary" onClick={() => remove(note.id)} aria-label={`Delete ${note.title}`}>
-                      Delete
-                    </button>
-                  </li>
-                )}
-              </For>
-            </ul>
-          </Show>
-        </Show>
-      </Show>
-    </>
   )
 }
 
@@ -722,7 +625,6 @@ function App() {
               />
             </Show>
             <Mail onSignedOut={() => mutate(null)} linkResult={linkResult} />
-            <Notes onSignedOut={() => mutate(null)} />
           </Show>
         </Show>
       </Show>
