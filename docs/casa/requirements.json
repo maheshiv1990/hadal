@@ -10,8 +10,8 @@
       "id": "1.1.1",
       "title": "Authentication is resistant to brute force attacks",
       "status": "verified",
-      "evidence": ["test:auth_endpoints_have_their_own_stricter_limit", "test:rate_limit_returns_429_after_burst", "test:spoofed_real_ip_is_ignored_unless_proxy_trusted", "test:trusted_proxy_keys_on_real_ip", "test:missing_auth_limiter_fails_closed", "test:password_login_is_throttled_per_account", "test:account_limiter_is_per_account", "test:password_login_fails_closed_without_account_limiter"],
-      "notes": "Google sign-in: credentials are entered at Google. Email + password sign-in: /api/auth/register and /api/auth/password-login share the per-IP auth limit (default 10/min, burst 5) with the Google endpoints, and password-login is also limited per account (10 attempts, then 1 per 3 min, keyed by email whether or not it exists), so guessing one account from many IPs is slowed too. Both limiters fail closed."
+      "evidence": ["test:password_accounts_are_off_unless_enabled", "test:auth_endpoints_have_their_own_stricter_limit", "test:rate_limit_returns_429_after_burst", "test:spoofed_real_ip_is_ignored_unless_proxy_trusted", "test:trusted_proxy_keys_on_real_ip", "test:missing_auth_limiter_fails_closed", "test:password_login_is_throttled_per_account", "test:account_limiter_is_per_account", "test:password_login_fails_closed_without_account_limiter"],
+      "notes": "Google sign-in: credentials are entered at Google, the only sign-in Hadal offers by default. Email + password accounts are off unless PASSWORD_AUTH_ENABLED=true (the default and the production setting are off); while off, /api/auth/register, /api/auth/password-login and /api/auth/password don't exist and return 404 before any handler runs (test:password_accounts_are_off_unless_enabled). The controls below still apply, and are tested, if they are switched on. Email + password sign-in: /api/auth/register and /api/auth/password-login share the per-IP auth limit (default 10/min, burst 5) with the Google endpoints, and password-login is also limited per account (10 attempts, then 1 per 3 min, keyed by email whether or not it exists), so guessing one account from many IPs is slowed too. Both limiters fail closed."
     },
     {
       "id": "1.1.2",
@@ -25,7 +25,7 @@
       "title": "Passwords are stored in a form resistant to offline attacks",
       "status": "verified",
       "evidence": ["test:hashes_are_salted_argon2id_and_verify", "test:registration_signs_in_and_stores_only_an_argon2id_hash", "test:password_policy_is_length_based", "test:password_login_does_not_reveal_which_emails_exist"],
-      "notes": "Passwords are hashed with Argon2id (m=19 MiB, t=2, p=1, OWASP's minimum, pinned in auth/password.rs) with a 128-bit random salt per password, as a PHC string. The users table only accepts '$argon2id$' values. Hashing runs on a blocking thread. Policy: 12-128 characters, no composition rules (ASVS 2.1). Unknown emails still cost one verification, so timing doesn't reveal accounts. Not yet: breached-password check (ASVS 2.1.7)."
+      "notes": "Email + password accounts are off unless PASSWORD_AUTH_ENABLED=true (the default and the production setting are off); while off, /api/auth/register, /api/auth/password-login and /api/auth/password don't exist and return 404 before any handler runs (test:password_accounts_are_off_unless_enabled). The controls below still apply, and are tested, if they are switched on. Passwords are hashed with Argon2id (m=19 MiB, t=2, p=1, OWASP's minimum, pinned in auth/password.rs) with a 128-bit random salt per password, as a PHC string. The users table only accepts '$argon2id$' values. Hashing runs on a blocking thread. Policy: 12-128 characters, no composition rules (ASVS 2.1). Unknown emails still cost one verification, so timing doesn't reveal accounts. Not yet: breached-password check (ASVS 2.1.7)."
     },
     {
       "id": "1.2.1",
@@ -80,7 +80,7 @@
       "title": "Other sessions can be terminated after a password change or reset",
       "status": "verified",
       "evidence": ["test:password_change_signs_out_every_other_session", "test:password_change_needs_a_session_and_the_current_password"],
-      "notes": "POST /api/auth/password (signed in, current password required, throttled per IP and per account) updates the Argon2id hash and deletes every session of the user in one transaction, then issues a fresh session to this browser only. Google accounts have no password here; their credential changes happen at Google. A future password reset must do the same (CLAUDE.md)."
+      "notes": "Email + password accounts are off unless PASSWORD_AUTH_ENABLED=true (the default and the production setting are off); while off, /api/auth/register, /api/auth/password-login and /api/auth/password don't exist and return 404 before any handler runs (test:password_accounts_are_off_unless_enabled). The controls below still apply, and are tested, if they are switched on. POST /api/auth/password (signed in, current password required, throttled per IP and per account) updates the Argon2id hash and deletes every session of the user in one transaction, then issues a fresh session to this browser only. Google accounts have no password here; their credential changes happen at Google. A future password reset must do the same (CLAUDE.md)."
     },
     {
       "id": "2.2.3",
@@ -122,7 +122,7 @@
       "title": "A full valid session or re-authentication is required before sensitive transactions or account changes",
       "status": "verified",
       "evidence": ["test:api_routes_require_a_session", "test:users_cannot_reach_each_others_mail", "test:logout_rejects_cross_site_forms", "test:users_can_rename_themselves_and_google_sign_in_keeps_it", "test:password_change_needs_a_session_and_the_current_password"],
-      "notes": "Every state-changing endpoint sits behind require_session. The account changes Hadal offers are both signed-in, JSON-only POSTs: renaming (POST /api/auth/profile, only first and last name) and changing the password (POST /api/auth/password, which also requires the current password and signs out other sessions). The Google account itself is managed at Google."
+      "notes": "Every state-changing endpoint sits behind require_session. The account changes Hadal offers are signed-in, JSON-only POSTs: renaming (POST /api/auth/profile, only first and last name) and, only if email + password accounts are switched on (off by default), changing the password (POST /api/auth/password, which also requires the current password and signs out other sessions). The Google account itself is managed at Google."
     },
     {
       "id": "3.1.1",

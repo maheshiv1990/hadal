@@ -60,6 +60,10 @@ pub struct Config {
     /// Base64 AES-256 key for Google refresh tokens and imported mail
     /// (`crypto::DataCipher`).
     pub data_encryption_key: Secret,
+    /// Email + password accounts (`PASSWORD_AUTH_ENABLED`, off by default).
+    /// Off, Hadal is Google-only: registration, password sign-in and
+    /// password change don't exist.
+    pub password_auth_enabled: bool,
 }
 
 // Hand-written so the connection string (which carries the DB password) can
@@ -82,6 +86,7 @@ impl std::fmt::Debug for Config {
             .field("oauth", &self.oauth)
             .field("session", &self.session)
             .field("data_encryption_key", &self.data_encryption_key)
+            .field("password_auth_enabled", &self.password_auth_enabled)
             .finish()
     }
 }
@@ -130,6 +135,7 @@ impl Config {
             oauth,
             session,
             data_encryption_key: Secret::new(required("DATA_ENCRYPTION_KEY")?),
+            password_auth_enabled: env_or("PASSWORD_AUTH_ENABLED", "false")?,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -217,6 +223,7 @@ pub(crate) mod tests {
                 absolute_secs: 43200,
             },
             data_encryption_key: Secret::new(crate::crypto::tests::test_key()),
+            password_auth_enabled: false,
         }
     }
 

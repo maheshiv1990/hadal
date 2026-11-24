@@ -98,6 +98,8 @@ macro_rules! test_app {
                 .app_data(actix_web::web::Data::new(
                     $crate::auth::password::AccountLimiter::new(),
                 ))
+                // The password tests need the routes; production has them off.
+                .app_data(actix_web::web::Data::new($crate::auth::PasswordAuth(true)))
                 .app_data(actix_web::web::Data::new($google))
                 .app_data(actix_web::web::Data::new(
                     $crate::crypto::tests::test_cipher(),

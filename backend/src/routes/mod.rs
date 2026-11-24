@@ -142,6 +142,39 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn password_accounts_are_off_unless_enabled() {
+        // Off by default (and when not configured at all), the password
+        // routes don't exist: a JSON 404 before any handler or limiter runs.
+        for setting in [Some(false), None] {
+            let mut app = App::new()
+                .app_data(unreachable_pool())
+                .wrap(crate::security::security_headers());
+            if let Some(on) = setting {
+                app = app.app_data(web::Data::new(auth::PasswordAuth(on)));
+            }
+            let app = test::init_service(app.configure(configure)).await;
+            for uri in [
+                "/api/auth/register",
+                "/api/auth/password-login",
+                "/api/auth/password",
+            ] {
+                let req = test::TestRequest::post()
+                    .uri(uri)
+                    .insert_header(("content-type", "application/json"))
+                    .set_payload(r#"{"email":"a@example.com","password":"x"}"#)
+                    .to_request();
+                let (status, body) = json_body(test::call_service(&app, req).await).await;
+                assert_eq!(
+                    (status, body),
+                    (404, json!({ "error": "not found" })),
+                    "{uri} {setting:?}"
+                );
+            }
+        }
+        assert!(!crate::config::tests::test_config().password_auth_enabled);
+    }
+
+    #[actix_web::test]
     async fn session_check_fails_closed_when_database_is_down() {
         // CASA 3.1.3: an error while checking the session must deny, not allow.
         let app = test_app!(unreachable_pool());
@@ -1920,6 +1953,7 @@ mod tests {
                     std::time::Duration::from_secs(3600),
                     2,
                 )))
+                .app_data(web::Data::new(auth::PasswordAuth(true)))
                 .configure(configure),
         )
         .await;

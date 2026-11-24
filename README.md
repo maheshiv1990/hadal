@@ -45,7 +45,7 @@ stack: TLS versions and suites, the redirect, HSTS, and TLS to Postgres.
 
 ### Importing Gmail
 
-Signed-in users (Google or password accounts) can link one or more Gmail
+Signed-in users can link one or more Gmail
 mailboxes on the home page and import the newest 100 messages from each with
 **Import all**. Later imports fetch only messages not imported yet.
 
@@ -101,13 +101,16 @@ cd frontend && npm install && npm run dev   # Vite on :5173, proxies /api → :8
 | GET | `/api/health` | liveness + DB check (public) |
 | GET | `/api/auth/login` | start Google sign-in (public, redirects) |
 | GET | `/api/auth/callback` | Google redirect target (public) |
-| POST | `/api/auth/register` | `{first_name, last_name, email, password}`; creates an email account and signs in (public) |
-| POST | `/api/auth/password` | signed in: `{current_password, new_password}`; signs out every other session |
-| POST | `/api/auth/password-login` | `{email, password}`; signs in (public) |
-| GET | `/api/auth/me` | `{ "email": "..." }` of the signed-in user |
+| GET | `/api/auth/me` | `{email, first_name, last_name, has_password}` of the signed-in user |
+| POST | `/api/auth/profile` | signed in: `{first_name, last_name}`; renames the user |
 | POST | `/api/auth/logout` | body `{}`; ends the session |
 
 Everything except health and sign-in needs a session, and mailboxes and mail are visible only to their owner.
+
+Hadal is Google-only by default. Email + password accounts (`POST /api/auth/register`,
+`/api/auth/password-login` and `/api/auth/password`) exist only when the backend runs with
+`PASSWORD_AUTH_ENABLED=true`; otherwise those routes return 404. The frontend shows only
+Google sign-in.
 
 ## Adding a migration
 

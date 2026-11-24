@@ -113,6 +113,11 @@ async fn main() -> anyhow::Result<()> {
     let google = web::Data::new(google);
     let cipher = web::Data::new(cipher);
     let session_config = web::Data::new(config.session.clone());
+    let password_auth = web::Data::new(auth::PasswordAuth(config.password_auth_enabled));
+    tracing::info!(
+        enabled = config.password_auth_enabled,
+        "local email sign-in accounts"
+    );
     HttpServer::new(move || {
         App::new()
             .app_data(pool.clone())
@@ -122,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
             .app_data(google.clone())
             .app_data(cipher.clone())
             .app_data(session_config.clone())
+            .app_data(password_auth.clone())
             // Order: last `wrap` runs first. Headers wrap everything, including 429s.
             .wrap(middleware::from_fn(security::rate_limit))
             .wrap(TracingLogger::default())

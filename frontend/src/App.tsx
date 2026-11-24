@@ -4,8 +4,6 @@ import {
   downloadAttachment,
   GMAIL_CONNECT_PATH,
   LOGIN_PATH,
-  MAX_PASSWORD_LENGTH,
-  MIN_PASSWORD_LENGTH,
   UnauthorizedError,
   type FolderLabel,
   type MailAccount,
@@ -43,193 +41,37 @@ function Welcome() {
 /** Result of a Gmail link, from the `?mail=` flag the server redirects with. */
 type LinkResult = 'linked' | 'failed' | null
 
-function SignIn(props: { failed: boolean; onSignedIn: (me: Me) => void; onRegister: () => void }) {
-  const [email, setEmail] = createSignal('')
-  const [password, setPassword] = createSignal('')
-  const [error, setError] = createSignal<string | null>(null)
-  const [busy, setBusy] = createSignal(false)
-
-  const submit = async (e: SubmitEvent) => {
-    e.preventDefault()
-    setError(null)
-    setBusy(true)
-    try {
-      props.onSignedIn(await api.passwordLogin(email(), password()))
-    } catch (err) {
-      setError((err as Error).message)
-      setPassword('')
-    } finally {
-      setBusy(false)
-    }
-  }
-
+/** Sign-in: Google only. (Email + password accounts are switched off.) */
+function SignIn(props: { failed: boolean; onRegister: () => void }) {
   return (
     <section class="signin">
-      <p>Sign in to see your email.</p>
+      <h2>Sign in</h2>
+      <p class="muted">Sign in with your Google account to see your email.</p>
       <Show when={props.failed}>
         <p class="error" role="alert">Sign-in failed. Please try again.</p>
       </Show>
       <a class="button" href={LOGIN_PATH}>
         Sign in with Google
       </a>
-
-      <p class="muted divider">or</p>
-
-      <form onSubmit={submit} class="auth-form">
-        <label>
-          Email
-          <input
-            type="email"
-            autocomplete="username"
-            value={email()}
-            onInput={(e) => setEmail(e.currentTarget.value)}
-            maxLength={254}
-            required
-          />
-        </label>
-        <label>
-          Password
-          <input
-            type="password"
-            autocomplete="current-password"
-            value={password()}
-            onInput={(e) => setPassword(e.currentTarget.value)}
-            maxLength={MAX_PASSWORD_LENGTH}
-            required
-          />
-        </label>
-        <Show when={error()}>
-          <p class="error" role="alert">{error()}</p>
-        </Show>
-        <button type="submit" disabled={busy()}>
-          {busy() ? 'Signing in…' : 'Sign in'}
-        </button>
-      </form>
-
       <p class="muted">
-        No account?{' '}
+        New to Hadal?{' '}
         <button type="button" class="link" onClick={props.onRegister}>
-          Create one
+          Create an account
         </button>
       </p>
     </section>
   )
 }
 
-function Register(props: { onSignedIn: (me: Me) => void; onCancel: () => void }) {
-  const [firstName, setFirstName] = createSignal('')
-  const [lastName, setLastName] = createSignal('')
-  const [email, setEmail] = createSignal('')
-  const [password, setPassword] = createSignal('')
-  const [confirm, setConfirm] = createSignal('')
-  const [error, setError] = createSignal<string | null>(null)
-  const [busy, setBusy] = createSignal(false)
-
-  // Checked here for quick feedback; the server enforces the same policy.
-  const problem = (): string | null => {
-    if (password().length < MIN_PASSWORD_LENGTH)
-      return `Password must be at least ${MIN_PASSWORD_LENGTH} characters.`
-    if (password() !== confirm()) return 'Passwords do not match.'
-    return null
-  }
-
-  const submit = async (e: SubmitEvent) => {
-    e.preventDefault()
-    const p = problem()
-    setError(p)
-    if (p) return
-    setBusy(true)
-    try {
-      props.onSignedIn(
-        await api.register({
-          first_name: firstName(),
-          last_name: lastName(),
-          email: email(),
-          password: password(),
-        }),
-      )
-    } catch (err) {
-      setError((err as Error).message)
-    } finally {
-      setBusy(false)
-    }
-  }
-
+/** Sign-up: Google only. Google sign-in creates the account on first use. */
+function Register(props: { onCancel: () => void }) {
   return (
     <section class="signin">
       <h2>Create an account</h2>
-      {/* Google sign-in creates the account on first use, so sign-up uses the same flow. */}
+      <p class="muted">Hadal accounts use Google sign-in. Your account is created the first time you sign in.</p>
       <a class="button" href={LOGIN_PATH}>
         Sign up with Google
       </a>
-
-      <p class="muted divider">or register with email</p>
-
-      <form onSubmit={submit} class="auth-form">
-        <div class="row">
-          <label>
-            First name
-            <input
-              autocomplete="given-name"
-              value={firstName()}
-              onInput={(e) => setFirstName(e.currentTarget.value)}
-              maxLength={100}
-              required
-            />
-          </label>
-          <label>
-            Last name
-            <input
-              autocomplete="family-name"
-              value={lastName()}
-              onInput={(e) => setLastName(e.currentTarget.value)}
-              maxLength={100}
-              required
-            />
-          </label>
-        </div>
-        <label>
-          Email
-          <input
-            type="email"
-            autocomplete="email"
-            value={email()}
-            onInput={(e) => setEmail(e.currentTarget.value)}
-            maxLength={254}
-            required
-          />
-        </label>
-        <label>
-          Password
-          <input
-            type="password"
-            autocomplete="new-password"
-            value={password()}
-            onInput={(e) => setPassword(e.currentTarget.value)}
-            minLength={MIN_PASSWORD_LENGTH}
-            maxLength={MAX_PASSWORD_LENGTH}
-            required
-          />
-          <span class="hint muted">At least {MIN_PASSWORD_LENGTH} characters. A passphrase works well.</span>
-        </label>
-        <label>
-          Confirm password
-          <input
-            type="password"
-            autocomplete="new-password"
-            value={confirm()}
-            onInput={(e) => setConfirm(e.currentTarget.value)}
-            maxLength={MAX_PASSWORD_LENGTH}
-            required
-          />
-        </label>
-        <Show when={error()}>
-          <p class="error" role="alert">{error()}</p>
-        </Show>
-        <button type="submit" disabled={busy()}>
-          {busy() ? 'Creating account…' : 'Create account'}
-        </button>
-      </form>
       <p class="muted">
         Already have an account?{' '}
         <button type="button" class="link" onClick={props.onCancel}>
@@ -240,82 +82,7 @@ function Register(props: { onSignedIn: (me: Me) => void; onCancel: () => void })
   )
 }
 
-/** The change-password form (for accounts that have a Hadal password). */
-function ChangePassword(props: { onDone: (me: Me) => void }) {
-  const [current, setCurrent] = createSignal('')
-  const [next, setNext] = createSignal('')
-  const [confirm, setConfirm] = createSignal('')
-  const [error, setError] = createSignal<string | null>(null)
-  const [busy, setBusy] = createSignal(false)
-
-  const submit = async (e: SubmitEvent) => {
-    e.preventDefault()
-    if (next().length < MIN_PASSWORD_LENGTH)
-      return setError(`New password must be at least ${MIN_PASSWORD_LENGTH} characters.`)
-    if (next() !== confirm()) return setError('New passwords do not match.')
-    setError(null)
-    setBusy(true)
-    try {
-      const me = await api.changePassword(current(), next())
-      setCurrent('')
-      setNext('')
-      setConfirm('')
-      props.onDone(me)
-    } catch (err) {
-      setError((err as Error).message)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <form onSubmit={submit} class="auth-form">
-      <label>
-        Current password
-        <input
-          type="password"
-          autocomplete="current-password"
-          value={current()}
-          onInput={(e) => setCurrent(e.currentTarget.value)}
-          maxLength={MAX_PASSWORD_LENGTH}
-          required
-        />
-      </label>
-      <label>
-        New password
-        <input
-          type="password"
-          autocomplete="new-password"
-          value={next()}
-          onInput={(e) => setNext(e.currentTarget.value)}
-          minLength={MIN_PASSWORD_LENGTH}
-          maxLength={MAX_PASSWORD_LENGTH}
-          required
-        />
-        <span class="hint muted">At least {MIN_PASSWORD_LENGTH} characters. A passphrase works well.</span>
-      </label>
-      <label>
-        Confirm new password
-        <input
-          type="password"
-          autocomplete="new-password"
-          value={confirm()}
-          onInput={(e) => setConfirm(e.currentTarget.value)}
-          maxLength={MAX_PASSWORD_LENGTH}
-          required
-        />
-      </label>
-      <Show when={error()}>
-        <p class="error" role="alert">{error()}</p>
-      </Show>
-      <button type="submit" disabled={busy()}>
-        {busy() ? 'Saving…' : 'Change password'}
-      </button>
-    </form>
-  )
-}
-
-/** Settings: the user's name, and their password if they have one. */
+/** Settings: the user's name, connected accounts, and sign out. */
 function Settings(props: {
   me: Me
   onUpdated: (me: Me) => void
@@ -329,7 +96,6 @@ function Settings(props: {
   const [error, setError] = createSignal<string | null>(null)
   const [saved, setSaved] = createSignal(false)
   const [busy, setBusy] = createSignal(false)
-  const [passwordChanged, setPasswordChanged] = createSignal(false)
   const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
   const [accountError, setAccountError] = createSignal<string | null>(null)
   createEffect(() => {
@@ -476,29 +242,6 @@ function Settings(props: {
               {accounts()?.length ? '+ Add another account' : '+ Add an account'}
             </a>
           </Show>
-        </Show>
-      </section>
-
-      <section class="panel settings-card" aria-labelledby="password-heading">
-        <h2 id="password-heading">Password</h2>
-        <Show
-          when={props.me.has_password}
-          fallback={
-            <p class="muted">
-              You sign in with Google, so there's no Hadal password to change. Your password is managed
-              in your Google Account.
-            </p>
-          }
-        >
-          <Show when={passwordChanged()}>
-            <p class="notice" role="status">Password changed. You were signed out everywhere else.</p>
-          </Show>
-          <ChangePassword
-            onDone={(me) => {
-              props.onUpdated(me)
-              setPasswordChanged(true)
-            }}
-          />
         </Show>
       </section>
 
@@ -1215,10 +958,10 @@ function App() {
             fallback={
               <Switch>
                 <Match when={view() === 'signin'}>
-                  <SignIn failed={loginFailed} onSignedIn={mutate} onRegister={() => navigate('register')} />
+                  <SignIn failed={loginFailed} onRegister={() => navigate('register')} />
                 </Match>
                 <Match when={view() === 'register'}>
-                  <Register onSignedIn={mutate} onCancel={() => navigate('signin')} />
+                  <Register onCancel={() => navigate('signin')} />
                 </Match>
                 <Match when={view() === 'home'}>
                   <Welcome />
