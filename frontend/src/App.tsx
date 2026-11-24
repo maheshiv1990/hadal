@@ -1199,12 +1199,8 @@ function App() {
         >
           {(user) => (
             <div class="user">
-              <span>
-                <Show when={[user().first_name, user().last_name].filter(Boolean).join(' ')}>
-                  {(name) => <strong>{name()} </strong>}
-                </Show>
-                <span class="muted">{user().email}</span>
-              </span>
+              {/* Just the name; the email only for an account without one. */}
+              <strong>{[user().first_name, user().last_name].filter(Boolean).join(' ') || user().email}</strong>
             </div>
           )}
         </Show>
