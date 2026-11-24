@@ -12,6 +12,7 @@
 //!   picked by its position in our own record, never by an ID from the request.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -19,6 +20,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::alphabet::URL_SAFE;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -27,8 +29,8 @@ use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::auth::google::{
-    GoogleApiError, GoogleClient, Identity, UserLabel, valid_attachment_id, valid_gmail_id,
-    valid_user_label_id,
+    GoogleApiError, GoogleClient, Identity, LabelCounts, UserLabel, valid_attachment_id,
+    valid_gmail_id, valid_user_label_id,
 };
 use crate::config::Secret;
 use crate::crypto::DataCipher;
@@ -36,15 +38,40 @@ use crate::error::AppError;
 
 /// Most mailboxes one user may link.
 pub const MAX_MAILBOXES: i64 = 10;
-/// Newest messages fetched per mailbox on each import.
+/// Newest messages fetched first on each import, so new mail shows up at
+/// once. The rest of the mailbox follows a page at a time (`BACKFILL_PAGE`).
 pub const IMPORT_PER_MAILBOX: u32 = 100;
+/// Messages listed per step of the walk through older mail.
+const BACKFILL_PAGE: u32 = 500;
 /// Parallel message fetches per mailbox.
 const FETCH_CONCURRENCY: usize = 8;
+/// Message fetches started per second, per mailbox. Gmail allows each user
+/// 250 quota units a second and a message costs 5, so 50 a second at most;
+/// this leaves room for the list and count calls around them. Without a
+/// pace, 8 parallel fetches outrun the quota and Gmail refuses with
+/// `rateLimitExceeded`.
+#[cfg(not(test))]
+const FETCHES_PER_SECOND: NonZeroU32 = match NonZeroU32::new(30) {
+    Some(n) => n,
+    None => NonZeroU32::MIN,
+};
+// The fake Gmail has no quota; tests shouldn't wait on one.
+#[cfg(test)]
+const FETCHES_PER_SECOND: NonZeroU32 = match NonZeroU32::new(100_000) {
+    Some(n) => n,
+    None => NonZeroU32::MIN,
+};
 /// An import must answer before nginx gives up on the request
 /// (`proxy_read_timeout 30s`). What was stored by then is kept.
 const IMPORT_BUDGET: Duration = Duration::from_secs(24);
-/// A claim on a mailbox older than this is from a crashed import.
-const STALE_CLAIM_SECS: f64 = 300.0;
+/// When the walk through older mail stops starting new fetches, leaving
+/// time to finish the ones under way within `IMPORT_BUDGET`. The next import
+/// continues from where it stopped.
+const BACKFILL_DEADLINE: Duration = Duration::from_secs(18);
+/// A claim on a mailbox older than this is from an import that died (the
+/// backend restarted mid-import, say): a live one gives up within
+/// `IMPORT_BUDGET` and then releases it.
+const STALE_CLAIM_SECS: f64 = 60.0;
 const MAX_BODY_CHARS: usize = 200_000;
 const MAX_SUBJECT_CHARS: usize = 1_000;
 const MAX_ADDRESS_CHARS: usize = 2_000;
@@ -64,11 +91,18 @@ pub const SYSTEM_LABELS: [&str; 10] = [
     "CATEGORY_PROMOTIONS",
 ];
 
+/// Gmail's mark on a message nobody has opened yet. Kept on messages so the
+/// list can show them in bold, but not a folder: the list can't be filtered
+/// by it.
+pub const UNREAD: &str = "UNREAD";
+
 /// The system label lists each import reads: how many of the newest it
 /// lists (to refresh labels on mail we have), and how many of those it
 /// imports if we don't have them yet. The categories and Important are
-/// mostly Inbox mail, so they only refresh.
-const IMPORT_LISTS: [(&str, u32, usize); 10] = [
+/// mostly Inbox mail, so they only refresh. Unread is listed as far as one
+/// list call goes, so mail read in Gmail shows as read here too.
+const IMPORT_LISTS: [(&str, u32, usize); 11] = [
+    (UNREAD, 500, 0),
     ("INBOX", 100, 100),
     ("STARRED", 50, 50),
     ("SENT", 50, 50),
@@ -89,9 +123,14 @@ const REFRESHED_USER_LABELS: usize = 20;
 const USER_LABEL_LIST: u32 = 100;
 const USER_LABEL_IMPORT: usize = 25;
 
+/// Whether a Gmail label ID is one Hadal shows as a folder or label.
+fn folder_label(id: &str) -> bool {
+    SYSTEM_LABELS.contains(&id) || valid_user_label_id(id)
+}
+
 /// Whether a Gmail label ID is one Hadal keeps on a message.
 fn kept_label(id: &str) -> bool {
-    SYSTEM_LABELS.contains(&id) || valid_user_label_id(id)
+    folder_label(id) || id == UNREAD
 }
 
 /// What the message list is filtered to: every message except spam, or one
@@ -108,7 +147,7 @@ impl LabelFilter {
     pub fn parse(raw: &str) -> Option<Self> {
         if raw == "ALL" {
             Some(LabelFilter::AllMail)
-        } else if kept_label(raw) {
+        } else if folder_label(raw) {
             Some(LabelFilter::Label(raw.to_owned()))
         } else {
             None
@@ -122,8 +161,11 @@ const MAX_FILENAME_CHARS: usize = 255;
 const MAX_MIME_CHARS: usize = 255;
 /// Gmail's own limit on attachment size.
 pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
-/// Most messages returned by one list call.
-pub const LIST_LIMIT: i64 = 200;
+/// Messages per page of the message list.
+pub const PAGE_SIZE: i64 = 50;
+/// Highest page number accepted (a million messages in), so a request
+/// can't ask Postgres to skip an absurd number of rows.
+pub const MAX_PAGE: u32 = 20_000;
 
 /// Gmail encodes bodies as base64url, sometimes with padding.
 const GMAIL_BASE64: GeneralPurpose = GeneralPurpose::new(
@@ -206,6 +248,12 @@ pub struct Account {
     /// Messages per label ID, plus `ALL` (everything but spam). Mail imported
     /// before labels were recorded counts as Inbox until the next import.
     folder_counts: HashMap<String, i64>,
+    /// Gmail's own count per label ID, plus `ALL` (everything but spam and
+    /// trash), as of the last import: the mailbox's real size, including
+    /// mail not imported yet. Empty until the first import reads them.
+    gmail_counts: HashMap<String, i64>,
+    /// Gmail's count of unread messages, for the same keys.
+    gmail_unread: HashMap<String, i64>,
     /// The mailbox's own Gmail labels, by name.
     labels: Vec<LabelInfo>,
 }
@@ -258,6 +306,12 @@ pub async fn list_accounts(
     .bind(owner)
     .fetch_all(pool)
     .await?;
+    let gmail_totals: Vec<(Uuid, String, i64, i64)> = sqlx::query_as(
+        "SELECT account_id, label_id, total, unread FROM mail_gmail_totals WHERE owner_id = $1",
+    )
+    .bind(owner)
+    .fetch_all(pool)
+    .await?;
 
     rows.into_iter()
         .map(|(id, email, created_at, last_import_at, message_count)| {
@@ -268,6 +322,11 @@ pub async fn list_accounts(
                 .collect();
             let spam = folder_counts.get("SPAM").copied().unwrap_or(0);
             folder_counts.insert("ALL".to_owned(), message_count - spam);
+            // Unread is a mark on messages, not a folder.
+            folder_counts.remove(UNREAD);
+            let mine_totals = || gmail_totals.iter().filter(|t| t.0 == id);
+            let gmail_counts = mine_totals().map(|t| (t.1.clone(), t.2)).collect();
+            let gmail_unread = mine_totals().map(|t| (t.1.clone(), t.3)).collect();
             let mut mine = labels
                 .iter()
                 .filter(|l| l.0 == id)
@@ -288,6 +347,8 @@ pub async fn list_accounts(
                 last_import_at,
                 message_count,
                 folder_counts,
+                gmail_counts,
+                gmail_unread,
                 labels: mine,
             })
         })
@@ -485,7 +546,8 @@ fn stored_labels(labels: Option<Vec<String>>) -> Vec<String> {
     labels.unwrap_or_else(|| vec!["INBOX".to_owned()])
 }
 
-/// Newest imported messages across all of the user's mailboxes.
+/// One page (`PAGE_SIZE`, newest first, `page` counted from 0) of the
+/// imported messages across all of the user's mailboxes.
 ///
 /// Optionally only one of the user's mailboxes, and only one folder. An
 /// `account` that isn't the caller's simply matches nothing.
@@ -495,7 +557,9 @@ pub async fn list_messages(
     owner: Uuid,
     account: Option<Uuid>,
     filter: Option<LabelFilter>,
+    page: u32,
 ) -> Result<Vec<MessageItem>, AppError> {
+    let offset = i64::from(page.min(MAX_PAGE)) * PAGE_SIZE;
     let (label, all_mail) = match filter {
         None => (None, false),
         Some(LabelFilter::AllMail) => (None, true),
@@ -512,14 +576,16 @@ pub async fn list_messages(
                  OR $4 = ANY(m.labels)
                  OR (m.labels IS NULL AND $4 = 'INBOX'))
             AND (NOT $5 OR NOT ('SPAM' = ANY(coalesce(m.labels, '{}'))))
-          ORDER BY m.received_at DESC
-          LIMIT $2",
+          -- id breaks ties, so a message can't appear on two pages.
+          ORDER BY m.received_at DESC, m.id DESC
+          LIMIT $2 OFFSET $6",
     )
     .bind(owner)
-    .bind(LIST_LIMIT)
+    .bind(PAGE_SIZE)
     .bind(account)
     .bind(label)
     .bind(all_mail)
+    .bind(offset)
     .fetch_all(pool)
     .await?;
     rows.into_iter()
@@ -672,6 +738,8 @@ pub struct AccountImport {
     pub email: String,
     pub imported: u32,
     pub skipped: u32,
+    /// Older mail is still to be imported; the next import continues.
+    pub remaining: bool,
     pub error: Option<&'static str>,
 }
 
@@ -686,6 +754,9 @@ struct Claimed {
     google_sub: String,
     email: String,
     sealed_token: Vec<u8>,
+    /// Where the walk through older mail stopped last time.
+    backfill_page_token: Option<String>,
+    backfill_done: bool,
 }
 
 #[derive(Debug)]
@@ -737,9 +808,11 @@ impl From<sqlx::Error> for ImportFailure {
     }
 }
 
-/// Imports the newest `IMPORT_PER_MAILBOX` messages from every mailbox the
-/// user linked, all mailboxes at once. Messages already imported are not
-/// fetched again.
+/// Imports every mailbox the user linked, all mailboxes at once: first the
+/// newest mail, then as much older mail as fits in the time left, a page at
+/// a time. A mailbox reports `remaining` until all of it is imported; each
+/// call continues where the last one stopped. Messages already imported are
+/// not fetched again.
 pub async fn import_all(
     pool: &PgPool,
     google: Arc<GoogleClient>,
@@ -747,12 +820,14 @@ pub async fn import_all(
     owner: Uuid,
 ) -> Result<ImportOutcome, AppError> {
     // Claim the mailboxes so a second click can't import them twice at once.
-    let claimed: Vec<(Uuid, String, String, Vec<u8>)> = sqlx::query_as(
+    #[allow(clippy::type_complexity)]
+    let claimed: Vec<(Uuid, String, String, Vec<u8>, Option<String>, bool)> = sqlx::query_as(
         "UPDATE mail_accounts SET import_started_at = now()
           WHERE owner_id = $1
             AND (import_started_at IS NULL
                  OR import_started_at < now() - make_interval(secs => $2))
-          RETURNING id, google_sub, email, refresh_token_enc",
+          RETURNING id, google_sub, email, refresh_token_enc,
+                    backfill_page_token, backfill_done",
     )
     .bind(owner)
     .bind(STALE_CLAIM_SECS)
@@ -772,40 +847,38 @@ pub async fn import_all(
     }
     let ids: Vec<Uuid> = claimed.iter().map(|c| c.0).collect();
 
+    let deadline = tokio::time::Instant::now() + BACKFILL_DEADLINE;
     let mut tasks = JoinSet::new();
-    for (id, google_sub, email, sealed_token) in claimed {
+    for (id, google_sub, email, sealed_token, backfill_page_token, backfill_done) in claimed {
         let account = Claimed {
             id,
             google_sub,
             email,
             sealed_token,
+            backfill_page_token,
+            backfill_done,
         };
         let (pool, google, cipher) = (pool.clone(), google.clone(), cipher.clone());
         tasks.spawn(async move {
-            let imported = Arc::new(AtomicU32::new(0));
-            let skipped = Arc::new(AtomicU32::new(0));
-            let run = import_account(
-                &pool,
-                &google,
-                &cipher,
-                owner,
-                &account,
-                imported.clone(),
-                skipped.clone(),
-            );
-            let error = match tokio::time::timeout(IMPORT_BUDGET, run).await {
-                Ok(Ok(())) => None,
+            let counts = Counts::default();
+            let run = import_account(&pool, &google, &cipher, owner, &account, deadline, &counts);
+            let (remaining, error) = match tokio::time::timeout(IMPORT_BUDGET, run).await {
+                Ok(Ok(remaining)) => (remaining, None),
                 Ok(Err(e)) => {
                     tracing::warn!(account = %account.id, error = %e, "mailbox import failed");
-                    Some(e.user_message())
+                    (true, Some(e.user_message()))
                 }
-                Err(_) => Some("Import ran out of time. Run it again to continue."),
+                Err(_) => (
+                    true,
+                    Some("Import ran out of time. Run it again to continue."),
+                ),
             };
             AccountImport {
                 id: account.id,
                 email: account.email,
-                imported: imported.load(Ordering::Relaxed),
-                skipped: skipped.load(Ordering::Relaxed),
+                imported: counts.imported.load(Ordering::Relaxed),
+                skipped: counts.skipped.load(Ordering::Relaxed),
+                remaining,
                 error,
             }
         });
@@ -840,19 +913,27 @@ pub async fn import_all(
     Ok(ImportOutcome::Done(results))
 }
 
+#[derive(Default)]
+struct Counts {
+    imported: AtomicU32,
+    skipped: AtomicU32,
+}
+
+/// Returns whether older mail is still left to import.
 async fn import_account(
     pool: &PgPool,
     google: &Arc<GoogleClient>,
     cipher: &DataCipher,
     owner: Uuid,
     account: &Claimed,
-    imported: Arc<AtomicU32>,
-    skipped: Arc<AtomicU32>,
-) -> Result<(), ImportFailure> {
+    deadline: tokio::time::Instant,
+    counts: &Counts,
+) -> Result<bool, ImportFailure> {
     let refresh = open_token(cipher, owner, &account.google_sub, &account.sealed_token)?;
     let access = google.refresh_access_token(&refresh).await?;
     let user_labels = google.list_user_labels(&access, MAX_USER_LABELS).await?;
     store_labels(pool, cipher, owner, account.id, &user_labels).await?;
+    store_gmail_totals(pool, google, &access, owner, account.id, &user_labels).await?;
 
     // The newest mail overall, plus the newest of each folder, so sent mail,
     // drafts and spam show up even when they aren't among the newest overall.
@@ -860,6 +941,7 @@ async fn import_account(
     let (mut ids, _) = google
         .list_message_ids(&access, IMPORT_PER_MAILBOX, None)
         .await?;
+    let newest = ids.clone();
     let lists = IMPORT_LISTS
         .iter()
         .map(|&(label, max, import)| (label.to_owned(), max, import))
@@ -898,53 +980,210 @@ async fn import_account(
         .filter(|k| !k.2)
         .map(|k| (k.0.clone(), k.1))
         .collect();
-    let mut pending = ids
+    // None of the newest mail was here before: more new mail arrived since
+    // the last import than the newest list holds. Walk the whole mailbox
+    // again so the mail in between isn't left out.
+    let outrun = !newest.is_empty() && !newest.iter().any(|id| known.iter().any(|k| &k.0 == id));
+    let pending: Vec<String> = ids
         .into_iter()
         .filter(|id| !complete.contains(&id.as_str()))
-        .collect::<Vec<_>>()
-        .into_iter();
-
-    let mut fetches = JoinSet::new();
-    loop {
-        while fetches.len() < FETCH_CONCURRENCY {
-            let Some(id) = pending.next() else { break };
-            let (google, access) = (google.clone(), access.clone());
-            fetches.spawn(async move { google.get_message(&access, &id).await });
-        }
-        let Some(joined) = fetches.join_next().await else {
-            break;
-        };
-        let message = match joined {
-            Ok(Ok(message)) => message,
-            Ok(Err(GoogleApiError::Revoked)) => return Err(GoogleApiError::Revoked.into()),
-            Ok(Err(e)) => {
-                tracing::warn!(account = %account.id, error = %e, "message fetch failed");
-                skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(account = %account.id, error = %e, "message fetch task failed");
-                skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-        let Some(parsed) = parse_message(&message) else {
-            skipped.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        if let Some(&existing) = backfill.get(&parsed.gmail_id) {
-            fill_details(pool, cipher, owner, existing, &parsed).await?;
-        } else if store_message(pool, cipher, owner, account.id, &parsed).await? {
-            imported.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+        .collect();
+    let run = Fetch {
+        pool,
+        google,
+        cipher,
+        owner,
+        account,
+        access: &access,
+        counts,
+        pace: RateLimiter::direct(Quota::per_second(FETCHES_PER_SECOND)),
+    };
+    run.fetch_and_store(pending, &backfill, None).await?;
 
     // Starring, sending or archiving in Gmail changes labels on mail we
     // already have: bring those up to date from the folder lists.
     for (label, listed, complete) in folder_lists {
         refresh_label(pool, owner, account.id, &label, &listed, complete).await?;
     }
-    Ok(())
+
+    if account.backfill_done && !outrun {
+        return Ok(false);
+    }
+    // A walk that started before the new mail arrived would miss it too, so
+    // that one starts over as well. Pages already imported go quickly: only
+    // listed, nothing fetched.
+    let start = if outrun {
+        None
+    } else {
+        account.backfill_page_token.clone()
+    };
+    run.backfill(start, deadline).await
+}
+
+/// One mailbox's import run: what fetching and storing its messages needs.
+struct Fetch<'a> {
+    pool: &'a PgPool,
+    google: &'a Arc<GoogleClient>,
+    cipher: &'a DataCipher,
+    owner: Uuid,
+    account: &'a Claimed,
+    access: &'a Secret,
+    counts: &'a Counts,
+    /// Keeps message fetches under Gmail's per-user quota.
+    pace: DefaultDirectRateLimiter,
+}
+
+/// How a batch of message fetches ended.
+enum Fetched {
+    /// Every message was stored, or skipped for good (gone or unreadable).
+    All,
+    /// The deadline came before every fetch was started.
+    OutOfTime,
+    /// A fetch failed in a way that may pass (Gmail unreachable or limiting
+    /// requests). The first such error.
+    Failed(GoogleApiError),
+}
+
+impl Fetch<'_> {
+    /// Fetches `ids` from Gmail, a few at a time, and stores them. IDs in
+    /// `refill` are already stored without attachments or labels: those are
+    /// filled in instead. With a deadline, no fetch starts after it.
+    async fn fetch_and_store(
+        &self,
+        ids: Vec<String>,
+        refill: &HashMap<String, Uuid>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Fetched, ImportFailure> {
+        let account = self.account.id;
+        let mut pending = ids.into_iter();
+        let mut outcome = Fetched::All;
+        let mut fetches = JoinSet::new();
+        loop {
+            let out_of_time = deadline.is_some_and(|d| tokio::time::Instant::now() >= d);
+            if out_of_time && pending.len() > 0 && matches!(outcome, Fetched::All) {
+                outcome = Fetched::OutOfTime;
+            }
+            // Once Gmail says to slow down (after its own retries), start
+            // nothing more this round: the next one carries on.
+            let held_back = matches!(&outcome, Fetched::Failed(e) if e.is_rate_limited());
+            while !out_of_time && !held_back && fetches.len() < FETCH_CONCURRENCY {
+                let Some(id) = pending.next() else { break };
+                self.pace.until_ready().await;
+                let (google, access) = (self.google.clone(), self.access.clone());
+                fetches.spawn(async move { google.get_message(&access, &id).await });
+            }
+            let Some(joined) = fetches.join_next().await else {
+                break;
+            };
+            let message = match joined {
+                Ok(Ok(message)) => message,
+                Ok(Err(GoogleApiError::Revoked)) => return Err(GoogleApiError::Revoked.into()),
+                // Deleted in Gmail since it was listed: nothing to import.
+                Ok(Err(GoogleApiError::Status(404, _))) => {
+                    self.counts.skipped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(%account, error = %e, "message fetch failed");
+                    self.counts.skipped.fetch_add(1, Ordering::Relaxed);
+                    if matches!(outcome, Fetched::All | Fetched::OutOfTime) {
+                        outcome = Fetched::Failed(e);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(%account, error = %e, "message fetch task failed");
+                    self.counts.skipped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            let Some(parsed) = parse_message(&message) else {
+                self.counts.skipped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            if let Some(&existing) = refill.get(&parsed.gmail_id) {
+                fill_details(self.pool, self.cipher, self.owner, existing, &parsed).await?;
+            } else if store_message(self.pool, self.cipher, self.owner, account, &parsed).await? {
+                self.counts.imported.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Walks the mailbox from `page` (or the newest mail) towards the oldest,
+    /// importing what isn't stored yet, until it reaches the end or the
+    /// deadline. Saves where it got to after each page, so the next import
+    /// continues there. Returns whether older mail is still left.
+    async fn backfill(
+        &self,
+        mut page: Option<String>,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, ImportFailure> {
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                self.save_backfill(page.as_deref(), false).await?;
+                return Ok(true);
+            }
+            let (ids, next) = self
+                .google
+                .list_message_page(self.access, BACKFILL_PAGE, page.as_deref())
+                .await?;
+            let stored: Vec<String> = sqlx::query_scalar(
+                "SELECT gmail_id FROM mail_messages
+                  WHERE owner_id = $1 AND account_id = $2 AND gmail_id = ANY($3)",
+            )
+            .bind(self.owner)
+            .bind(self.account.id)
+            .bind(&ids)
+            .fetch_all(self.pool)
+            .await?;
+            let new: Vec<String> = ids.into_iter().filter(|id| !stored.contains(id)).collect();
+            match self
+                .fetch_and_store(new, &HashMap::new(), Some(deadline))
+                .await?
+            {
+                Fetched::All => {}
+                // This page again next time; what was stored is skipped then.
+                Fetched::OutOfTime => {
+                    self.save_backfill(page.as_deref(), false).await?;
+                    return Ok(true);
+                }
+                // Gmail asked to slow down: not a failure, just where this
+                // round stops. The page is tried again next round.
+                Fetched::Failed(e) if e.is_rate_limited() => {
+                    tracing::info!(account = %self.account.id, "Gmail rate limit; continuing next round");
+                    self.save_backfill(page.as_deref(), false).await?;
+                    return Ok(true);
+                }
+                Fetched::Failed(e) => {
+                    self.save_backfill(page.as_deref(), false).await?;
+                    return Err(e.into());
+                }
+            }
+            match next {
+                Some(next) => page = Some(next),
+                None => {
+                    self.save_backfill(None, true).await?;
+                    return Ok(false);
+                }
+            }
+            self.save_backfill(page.as_deref(), false).await?;
+        }
+    }
+
+    async fn save_backfill(&self, page: Option<&str>, done: bool) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE mail_accounts SET backfill_page_token = $3, backfill_done = $4
+              WHERE id = $1 AND owner_id = $2",
+        )
+        .bind(self.account.id)
+        .bind(self.owner)
+        .bind(page)
+        .bind(done)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Stores the mailbox's own labels as Gmail has them now: names encrypted,
@@ -987,6 +1226,123 @@ async fn store_labels(
         .execute(pool)
         .await?;
     }
+    Ok(())
+}
+
+/// Reads Gmail's own message and unread counts for every folder and label
+/// the inbox shows, plus `ALL` (everything but spam and trash), and stores
+/// them in place of the last ones. A count Gmail won't give right now leaves
+/// the stored ones as they were: they're only for display, so that doesn't
+/// stop the import. Revoked access does.
+async fn store_gmail_totals(
+    pool: &PgPool,
+    google: &Arc<GoogleClient>,
+    access: &Secret,
+    owner: Uuid,
+    account_id: Uuid,
+    user_labels: &[UserLabel],
+) -> Result<(), ImportFailure> {
+    // TRASH and UNREAD only go into the ALL numbers below.
+    let labels: Vec<String> = SYSTEM_LABELS
+        .iter()
+        .map(|l| (*l).to_owned())
+        .chain(["TRASH".to_owned(), UNREAD.to_owned()])
+        .chain(user_labels.iter().map(|l| l.id.clone()))
+        .collect();
+    let mut pending = labels.into_iter();
+    let mut reads = JoinSet::new();
+    let mut counts: HashMap<String, LabelCounts> = HashMap::new();
+    let mut profile = None;
+    {
+        let (google, access) = (google.clone(), access.clone());
+        reads.spawn(async move {
+            let total = google
+                .mailbox_total(&access)
+                .await
+                .map(|messages| LabelCounts {
+                    messages,
+                    ..LabelCounts::default()
+                });
+            (None, total)
+        });
+    }
+    loop {
+        while reads.len() < FETCH_CONCURRENCY {
+            let Some(label) = pending.next() else { break };
+            let (google, access) = (google.clone(), access.clone());
+            reads.spawn(async move {
+                let counted = google.label_counts(&access, &label).await;
+                (Some(label), counted)
+            });
+        }
+        let Some(joined) = reads.join_next().await else {
+            break;
+        };
+        let (label, counted) = match joined {
+            Ok((label, Ok(counted))) => (label, counted),
+            Ok((_, Err(GoogleApiError::Revoked))) => return Err(GoogleApiError::Revoked.into()),
+            Ok((_, Err(e))) => {
+                tracing::warn!(account = %account_id, error = %e, "Gmail counts unavailable");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(account = %account_id, error = %e, "Gmail count task failed");
+                return Ok(());
+            }
+        };
+        match label {
+            Some(label) => {
+                counts.insert(label, counted);
+            }
+            None => profile = Some(counted.messages),
+        }
+    }
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    // All mail but spam and trash: the whole mailbox, and every unread
+    // conversation (those carrying UNREAD), less what is in Spam or Trash.
+    let spam = counts.get("SPAM").copied().unwrap_or_default();
+    let trash = counts.remove("TRASH").unwrap_or_default();
+    let unread = counts.remove(UNREAD).unwrap_or_default();
+    counts.insert(
+        "ALL".to_owned(),
+        LabelCounts {
+            messages: (profile - spam.messages - trash.messages).max(0),
+            threads: 0,
+            unread_threads: (unread.threads - spam.unread_threads - trash.unread_threads).max(0),
+        },
+    );
+
+    // Stored: the message total (what the list pages through) and unread
+    // conversations (what Gmail's sidebar shows).
+    let mut ids = Vec::with_capacity(counts.len());
+    let mut totals = Vec::with_capacity(counts.len());
+    let mut unreads = Vec::with_capacity(counts.len());
+    for (id, c) in counts {
+        ids.push(id);
+        totals.push(c.messages);
+        unreads.push(c.unread_threads);
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM mail_gmail_totals WHERE owner_id = $1 AND account_id = $2")
+        .bind(owner)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO mail_gmail_totals (account_id, owner_id, label_id, total, unread)
+         SELECT $2, $1, label_id, total, unread
+           FROM unnest($3::text[], $4::bigint[], $5::bigint[]) AS t (label_id, total, unread)",
+    )
+    .bind(owner)
+    .bind(account_id)
+    .bind(&ids)
+    .bind(&totals)
+    .bind(&unreads)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1481,10 +1837,17 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(p.body, "Line one\nLine two");
-        assert_eq!(p.labels, ["INBOX"], "only labels Hadal shows are kept");
+        assert_eq!(
+            p.labels,
+            ["INBOX", "UNREAD"],
+            "only labels Hadal shows, and the unread mark, are kept"
+        );
         let mut msg = gmail_message("abc", "s", "t");
         msg["labelIds"] = json!(["Label_3", "UNREAD", "SPAM", "Label_3", "Label_../x", "CHAT"]);
-        assert_eq!(parse_message(&msg).unwrap().labels, ["Label_3", "SPAM"]);
+        assert_eq!(
+            parse_message(&msg).unwrap().labels,
+            ["Label_3", "UNREAD", "SPAM"]
+        );
     }
 
     #[test]

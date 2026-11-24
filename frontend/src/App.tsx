@@ -4,6 +4,7 @@ import {
   downloadAttachment,
   GMAIL_CONNECT_PATH,
   LOGIN_PATH,
+  PAGE_SIZE,
   UnauthorizedError,
   type FolderLabel,
   type MailAccount,
@@ -206,7 +207,7 @@ function Settings(props: {
                       <span class="connected-info">
                         <span class="connected-email">{account.email}</span>
                         <span class="muted">
-                          {plural(account.message_count, 'message', 'messages')}
+                          {plural(mailboxSize(account), 'message', 'messages')}
                           {' · connected '}
                           {readerDate(account.created_at)}
                           {account.last_import_at
@@ -257,6 +258,40 @@ function Settings(props: {
 }
 
 const formatDate = (iso: string) => new Date(iso).toLocaleString()
+
+/** A sidebar count: unread in bold, when there is any, then the total. */
+/** How long to wait before importing again when the mailbox is busy. */
+const BUSY_RETRY_MS = 20_000
+/** How long to wait after an import round that Gmail slowed to nothing. */
+const SLOW_DOWN_MS = 10_000
+
+/**
+ * The number next to a folder, as Gmail's sidebar shows it: unread
+ * conversations, in bold, and nothing when none are unread. Drafts show how
+ * many there are; Sent, Starred, Important and All mail show nothing.
+ */
+function FolderCount(props: { label: FolderLabel; counts: Record<string, number>; unread: Record<string, number> }) {
+  const shown = () => {
+    if (props.label === 'DRAFT') return { n: props.counts.DRAFT ?? 0, unread: false }
+    if (['SENT', 'STARRED', 'IMPORTANT', 'ALL'].includes(props.label)) return { n: 0, unread: false }
+    return { n: props.unread[props.label] ?? 0, unread: true }
+  }
+  return (
+    <Show when={shown().n > 0}>
+      <span
+        class="count"
+        classList={{ 'unread-count': shown().unread }}
+        title={shown().unread ? `${shown().n.toLocaleString()} unread` : undefined}
+      >
+        {shown().n.toLocaleString()}
+      </span>
+    </Show>
+  )
+}
+
+/** A mailbox's size in Gmail (all but spam and trash); until the first
+ * import has read it, the messages imported so far. */
+const mailboxSize = (account: MailAccount) => account.gmail_counts.ALL ?? account.message_count
 
 /** Inbox-list date: the time for today, "Nov 23" for this year, otherwise a short date. */
 const listDate = (iso: string) => {
@@ -423,8 +458,6 @@ function Mail(props: {
   const [folder, setFolder] = createSignal<FolderLabel>('INBOX')
   const [openId, setOpenId] = createSignal<string | null>(null)
   const [detail] = createResource(openId, api.getMessage)
-  const [importing, setImporting] = createSignal(false)
-  const [status, setStatus] = createSignal<string | null>(null)
   const [problems, setProblems] = createSignal<string[]>([])
   const [error, setError] = createSignal<string | null>(null)
 
@@ -456,15 +489,22 @@ function Mail(props: {
     const list = orderedAccounts()
     return list.find((a) => a.id === mailbox()) ?? list[0]
   }
-  // The open folder of the selected mailbox, fetched from the server.
+  /** The selected mailbox if it can be disconnected (it isn't the sign-in one). */
+  const disconnectable = () => {
+    const account = selectedAccount()
+    return account && !isPrimary(account) ? account : undefined
+  }
+  /** Page of the list being shown, counted from 0; back to 0 on a new folder. */
+  const [page, setPage] = createSignal(0)
+  // The shown page of the selected mailbox's open folder, fetched from the server.
   const [messages, { refetch: refetchMessages }] = createResource(
     () => {
       const id = selectedAccount()?.id
-      return id ? `${id}|${folder()}` : false
+      return id ? `${id}|${folder()}|${page()}` : false
     },
     (key) => {
-      const [account, label] = key.split('|')
-      return api.listMessages(account, label as FolderLabel)
+      const [account, label, n] = key.split('|')
+      return api.listMessages(account, label as FolderLabel, Number(n))
     },
   )
   const visible = () => messages() ?? []
@@ -472,7 +512,14 @@ function Mail(props: {
     [...FOLDERS, ...MORE_FOLDERS].find((f) => f.label === folder())?.name ??
     selectedAccount()?.labels.find((l) => l.id === folder())?.name ??
     ''
-  const countOf = (label: FolderLabel) => selectedAccount()?.folder_counts[label] ?? 0
+  /** How many messages a folder holds in Gmail: shown, so it doesn't climb
+   * while the import catches up. Before Gmail's counts arrive, what's here. */
+  const countOf = (label: FolderLabel) => {
+    const account = selectedAccount()
+    return account?.gmail_counts[label] ?? account?.folder_counts[label] ?? 0
+  }
+  /** How many of them are imported, so far: as far as the pages go. */
+  const importedOf = (label: FolderLabel) => selectedAccount()?.folder_counts[label] ?? 0
   /** "More" is open when asked, or when one of its folders is showing. */
   const [moreOpen, setMoreOpen] = createSignal(false)
   const showMore = () => moreOpen() || MORE_FOLDERS.some((f) => f.label === folder())
@@ -483,33 +530,88 @@ function Mail(props: {
   const showMailbox = (id: string | null) => {
     setMailbox(id)
     setOpenId(null)
+    setPage(0)
     // A user label belongs to one mailbox; another one starts at its Inbox.
     if (folder().startsWith('Label_')) setFolder('INBOX')
   }
   const showFolder = (label: FolderLabel) => {
     setFolder(label)
     setOpenId(null)
+    setPage(0)
   }
 
+  /** Messages in the open folder, for "1–50 of N" and the page buttons. */
+  const total = () => countOf(folder())
+  const firstShown = () => page() * PAGE_SIZE + 1
+  const lastShown = () => page() * PAGE_SIZE + visible().length
+  // Up to the imported mail: Gmail's count may be ahead of it for a while.
+  const hasNext = () => (page() + 1) * PAGE_SIZE < importedOf(folder())
+  /** Page buttons only when the folder doesn't fit on one page. */
+  const paged = () => page() > 0 || total() > PAGE_SIZE
+  const turnPage = (to: number) => {
+    setPage(to)
+    document.querySelector('.inbox-main')?.scrollIntoView({ block: 'nearest' })
+  }
+
+  /** True while an import refreshes the list: the list stays up meanwhile. */
+  const [refreshing, setRefreshing] = createSignal(false)
+  let stopped = false
+  onCleanup(() => {
+    stopped = true
+  })
+
+  /**
+   * Imports every connected account in full. Each request imports what fits
+   * in its time and the next one continues, so this repeats until no account
+   * has older mail left, one fails, or the user leaves. Runs by itself once
+   * the accounts have loaded; only failures are shown.
+   */
   const importAll = async () => {
     setError(null)
-    setStatus(null)
     setProblems([])
-    setImporting(true)
     try {
-      const res = await api.importMail()
-      const ok = res.accounts.filter((a) => !a.error).length
-      setStatus(
-        `Imported ${plural(res.imported, 'new message', 'new messages')} from ${plural(ok, 'account', 'accounts')}.`,
-      )
-      setProblems(res.accounts.filter((a) => a.error).map((a) => `${a.email}: ${a.error}`))
-      await Promise.all([refetchAccounts(), refetchMessages()])
+      while (!stopped) {
+        let res
+        try {
+          res = await api.importMail()
+        } catch (err) {
+          // Another tab is importing, or an import cut short (the server
+          // restarted) still holds the mailbox for up to a minute: wait,
+          // then try again rather than give up.
+          if (err instanceof Error && err.message === 'an import is already running') {
+            await new Promise((resolve) => setTimeout(resolve, BUSY_RETRY_MS))
+            continue
+          }
+          throw err
+        }
+        setProblems(res.accounts.filter((a) => a.error).map((a) => `${a.email}: ${a.error}`))
+        // Always: Gmail's counts and read marks may change without new mail.
+        if (!stopped) {
+          setRefreshing(true)
+          try {
+            await Promise.all([refetchAccounts(), refetchMessages()])
+          } finally {
+            setRefreshing(false)
+          }
+        }
+        if (!res.accounts.some((a) => a.remaining && !a.error)) break
+        // Mail is left but this round got none: Gmail asked to slow down.
+        // Give its per-user quota a moment before the next round.
+        if (res.imported === 0) await new Promise((resolve) => setTimeout(resolve, SLOW_DOWN_MS))
+      }
     } catch (err) {
       handle(err)
-    } finally {
-      setImporting(false)
     }
   }
+
+  // Import automatically once per page load, as soon as there is an account.
+  let autoImported = false
+  createEffect(() => {
+    if (!autoImported && accounts()?.length) {
+      autoImported = true
+      void importAll()
+    }
+  })
 
   /** `${messageId}:${index}` of the attachment being downloaded. */
   const [downloading, setDownloading] = createSignal<string | null>(null)
@@ -562,7 +664,8 @@ function Mail(props: {
                     <span class="mailbox-label">
                       <span class="mailbox-name">{account.email}</span>
                     </span>
-                    <span class="count">{account.message_count}</span>
+                    {/* Like Gmail's account list: unread in the Inbox. */}
+                    <FolderCount label="INBOX" counts={account.gmail_counts} unread={account.gmail_unread} />
                   </button>
                 )}
               </For>
@@ -584,9 +687,11 @@ function Mail(props: {
                     <FolderIcon label={f.label} />
                     {f.name}
                   </span>
-                  <Show when={countOf(f.label) > 0}>
-                    <span class="count">{countOf(f.label)}</span>
-                  </Show>
+                  <FolderCount
+                    label={f.label}
+                    counts={selectedAccount()?.gmail_counts ?? {}}
+                    unread={selectedAccount()?.gmail_unread ?? {}}
+                  />
                 </button>
               )}
             </For>
@@ -620,9 +725,11 @@ function Mail(props: {
                       <LabelIcon color={l.color} />
                       <span class="mailbox-name">{l.name}</span>
                     </span>
-                    <Show when={countOf(l.id) > 0}>
-                      <span class="count">{countOf(l.id)}</span>
-                    </Show>
+                    <FolderCount
+                      label={l.id}
+                      counts={selectedAccount()?.gmail_counts ?? {}}
+                      unread={selectedAccount()?.gmail_unread ?? {}}
+                    />
                   </button>
                 )}
               </For>
@@ -639,48 +746,63 @@ function Mail(props: {
       </aside>
 
       <div class="inbox-main">
-        <div class="inbox-toolbar">
-          <Show
-            when={openId()}
-            fallback={
-              <div class="toolbar-group">
-                <button
-                  class="ghost"
-                  onClick={importAll}
-                  disabled={importing() || !accounts()?.length}
-                  title="Import new mail from every connected account"
-                >
-                  {importing() ? 'Importing…' : '↻ Import'}
-                </button>
-                <Show when={selectedAccount() && !isPrimary(selectedAccount()!) && selectedAccount()}>
-                  {(account) => (
-                    <button class="ghost danger" onClick={() => disconnect(account())}>
-                      Disconnect
-                    </button>
-                  )}
-                </Show>
-              </div>
-            }
-          >
-            <button class="ghost" onClick={() => setOpenId(null)} aria-label="Back to the list">
-              ← Back
-            </button>
-          </Show>
-          <Show when={selectedAccount()}>
-            {(account) => (
-              <span
-                class="muted toolbar-status"
-                title={account().last_import_at ? formatDate(account().last_import_at!) : undefined}
-              >
-                {account().last_import_at ? `Imported ${listDate(account().last_import_at!)}` : 'Not imported yet'}
-              </span>
-            )}
-          </Show>
-        </div>
+        {/* Only when there's something in it: Back, Disconnect for a
+            non-primary mailbox, or the page buttons. */}
+        <Show when={openId() || disconnectable() || paged()}>
+          <div class="inbox-toolbar">
+            <Show
+              when={openId()}
+              fallback={
+                <>
+                  <div class="toolbar-group">
+                    <Show when={disconnectable()}>
+                      {(account) => (
+                        <button class="ghost danger" onClick={() => disconnect(account())}>
+                          Disconnect
+                        </button>
+                      )}
+                    </Show>
+                  </div>
+                  <Show when={paged()}>
+                    <nav class="toolbar-group pager" aria-label="Pages">
+                      <span class="muted toolbar-status">
+                        {visible().length
+                          ? `${firstShown()}–${lastShown()} of ${total().toLocaleString()}`
+                          : `${total().toLocaleString()} messages`}
+                      </span>
+                      <button
+                        class="ghost"
+                        onClick={() => turnPage(page() - 1)}
+                        disabled={page() === 0}
+                        aria-label="Newer messages"
+                        title="Newer"
+                      >
+                        ‹ Previous
+                      </button>
+                      <button
+                        class="ghost"
+                        onClick={() => turnPage(page() + 1)}
+                        disabled={!hasNext()}
+                        aria-label="Older messages"
+                        title="Older"
+                      >
+                        Next ›
+                      </button>
+                    </nav>
+                  </Show>
+                </>
+              }
+            >
+              <button class="ghost" onClick={() => setOpenId(null)} aria-label="Back to the list">
+                ← Back
+              </button>
+            </Show>
+          </div>
+        </Show>
 
         <Show when={props.linkResult === 'linked'}>
           <p class="notice inbox-note" role="status">
-            Gmail connected. Use “Import” to fetch its mail.
+            Gmail connected.
           </p>
         </Show>
         <Show when={props.linkResult === 'failed'}>
@@ -688,16 +810,16 @@ function Mail(props: {
             Gmail wasn't connected. Allow read access to your mail on Google's screen and try again.
           </p>
         </Show>
-        <Show when={status()}>
-          <p class="notice inbox-note" role="status">{status()}</p>
-        </Show>
         <For each={problems()}>{(p) => <p class="error inbox-note" role="alert">{p}</p>}</For>
         <Show when={error()}>
           <p class="error inbox-note" role="alert">{error()}</p>
         </Show>
 
         <Show when={!accounts.error && !messages.error} fallback={<p class="error inbox-empty">Could not load your mail.</p>}>
-          <Show when={!accounts.loading && !messages.loading} fallback={<p class="muted inbox-empty">Loading…</p>}>
+          <Show
+            when={refreshing() || (!accounts.loading && !messages.loading)}
+            fallback={<p class="muted inbox-empty">Loading…</p>}
+          >
             <Show
               when={openId()}
               fallback={
@@ -706,10 +828,10 @@ function Mail(props: {
                   fallback={
                     <p class="muted inbox-empty">
                       {!accounts()?.length
-                        ? 'No accounts connected. Connect a Gmail account to import its newest 100 messages.'
+                        ? 'No accounts connected. Connect a Gmail account to import its mail.'
                         : selectedAccount()?.message_count
                           ? `Nothing in ${folderName()}.`
-                          : 'No messages yet. Use “Import” to fetch the newest mail from each account.'}
+                          : 'No messages yet.'}
                     </p>
                   }
                 >
@@ -717,7 +839,11 @@ function Mail(props: {
                     <For each={visible()}>
                       {(m) => (
                         <li>
-                          <button class="message-row" onClick={() => setOpenId(m.id)}>
+                          <button
+                            class="message-row"
+                            classList={{ unread: m.labels.includes('UNREAD') }}
+                            onClick={() => setOpenId(m.id)}
+                          >
                             <Show
                               when={byRecipient()}
                               fallback={

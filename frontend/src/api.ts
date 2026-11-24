@@ -16,6 +16,14 @@ export interface MailAccount {
   message_count: number
   /** Messages per label ID (`INBOX`, `Label_12`, …), plus `ALL` for everything but spam. */
   folder_counts: Record<string, number>
+  /**
+   * Gmail's own count per label ID, plus `ALL` (everything but spam and
+   * trash), read at each import: the mailbox's real size, mail not imported
+   * yet included. Empty until the first import has read them.
+   */
+  gmail_counts: Record<string, number>
+  /** Gmail's count of unread messages, for the same keys. */
+  gmail_unread: Record<string, number>
   /** The mailbox's own Gmail labels. */
   labels: MailLabel[]
 }
@@ -55,7 +63,7 @@ export interface MailMessage {
   subject: string
   snippet: string
   attachments: MailAttachment[]
-  /** Which folders the message is in. */
+  /** Which folders the message is in, plus `UNREAD` while it is unread in Gmail. */
   labels: FolderLabel[]
 }
 
@@ -64,6 +72,9 @@ export interface MailMessageDetail extends MailMessage {
   body: string
 }
 
+/** Messages per page of the list (the backend's `mail::PAGE_SIZE`). */
+export const PAGE_SIZE = 50
+
 export interface MailImportResult {
   imported: number
   accounts: {
@@ -71,6 +82,8 @@ export interface MailImportResult {
     email: string
     imported: number
     skipped: number
+    /** Older mail is still to come: importing again continues. */
+    remaining: boolean
     /** A user-facing reason this mailbox failed, or null. */
     error: string | null
   }[]
@@ -157,8 +170,10 @@ export const api = {
     request<void>(`/mail/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   // JSON body so a cross-site form can't start an import (CASA 3.1.5).
   importMail: () => request<MailImportResult>('/mail/import', { method: 'POST', body: '{}' }),
-  /** The newest messages of one mailbox's folder. */
-  listMessages: (account: string, label: FolderLabel) =>
-    request<MailMessage[]>(`/mail/messages?${new URLSearchParams({ account, label })}`),
+  /** One page (`PAGE_SIZE`, newest first, counted from 0) of a mailbox's folder. */
+  listMessages: (account: string, label: FolderLabel, page: number) =>
+    request<MailMessage[]>(
+      `/mail/messages?${new URLSearchParams({ account, label, page: String(page) })}`,
+    ),
   getMessage: (id: string) => request<MailMessageDetail>(`/mail/messages/${encodeURIComponent(id)}`),
 }

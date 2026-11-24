@@ -83,13 +83,14 @@ pub async fn import(
     }
 }
 
-/// `?account=<mailbox id>&label=<ALL, a system folder or a user label ID>`,
-/// both optional.
+/// `?account=<mailbox id>&label=<ALL, a system folder or a user label ID>&page=<n>`,
+/// all optional. Pages hold `mail::PAGE_SIZE` messages and count from 0.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessagesQuery {
     account: Option<Uuid>,
     label: Option<String>,
+    page: Option<u32>,
 }
 
 #[get("/messages")]
@@ -99,16 +100,22 @@ pub async fn messages(
     cipher: web::Data<DataCipher>,
     query: web::Query<MessagesQuery>,
 ) -> Result<HttpResponse, AppError> {
-    let MessagesQuery { account, label } = query.into_inner();
+    let MessagesQuery {
+        account,
+        label,
+        page,
+    } = query.into_inner();
+    let invalid = || AppError::BadRequest("invalid query string".into());
     let filter = match label {
         None => None,
-        Some(raw) => Some(
-            mail::LabelFilter::parse(&raw)
-                .ok_or_else(|| AppError::BadRequest("invalid query string".into()))?,
-        ),
+        Some(raw) => Some(mail::LabelFilter::parse(&raw).ok_or_else(invalid)?),
     };
+    let page = page.unwrap_or(0);
+    if page > mail::MAX_PAGE {
+        return Err(invalid());
+    }
     Ok(HttpResponse::Ok()
-        .json(mail::list_messages(&pool, &cipher, user.user_id, account, filter).await?))
+        .json(mail::list_messages(&pool, &cipher, user.user_id, account, filter, page).await?))
 }
 
 #[get("/messages/{id}")]

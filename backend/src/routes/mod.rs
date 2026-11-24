@@ -330,6 +330,7 @@ mod tests {
             "label=ALL&label=INBOX".to_owned(),
             "label=ALL&label=ALL".to_owned(),
             format!("account={account}&account={account}"),
+            "page=0&page=1".to_owned(),
         ] {
             let uri = format!("/api/mail/messages?{query}");
             let (status, body) = json_body(test::call_service(&app, get(&uri)).await).await;
@@ -482,6 +483,16 @@ mod tests {
         labels: Mutex<Vec<Value>>,
         /// How many upcoming message-list calls answer 403 rateLimitExceeded.
         rate_limited: Mutex<u32>,
+        /// Messages whose fetch answers 403 rateLimitExceeded, every time.
+        rate_limited_messages: Mutex<Vec<String>>,
+    }
+
+    fn rate_limit_exceeded() -> HttpResponse {
+        HttpResponse::Forbidden().json(json!({ "error": {
+            "code": 403,
+            "message": "Rate Limit Exceeded",
+            "errors": [{ "reason": "rateLimitExceeded", "domain": "usageLimits" }],
+        }}))
     }
 
     const FAKE_ACCESS: &str = "fake-gmail-access";
@@ -587,24 +598,30 @@ mod tests {
                         .as_array()
                         .is_some_and(|ls| ls.iter().any(|l| l == label))
                 };
+                // Like Gmail: spam and trash only with includeSpamTrash,
+                // label or not.
+                let include = q.get("includeSpamTrash").map(String::as_str) == Some("true");
+                let listed = include || !(has("SPAM") || has("TRASH"));
                 match q.get("labelIds") {
-                    // Like Gmail: spam only when asked for, with includeSpamTrash.
-                    Some(label) if label == "SPAM" => {
-                        q.get("includeSpamTrash").map(String::as_str) == Some("true") && has("SPAM")
-                    }
-                    Some(label) => has(label),
-                    None => !has("SPAM"),
+                    Some(label) => listed && has(label),
+                    None => listed,
                 }
             })
             .map(|m| json!({ "id": m["id"], "threadId": m["id"] }))
             .collect();
-        if matching.is_empty() {
+        // Page tokens are the offset of the page, like "p500".
+        let start: usize = q
+            .get("pageToken")
+            .map(|t| t.strip_prefix('p').unwrap().parse().unwrap())
+            .unwrap_or(0);
+        if matching.len() <= start {
             return HttpResponse::Ok().json(json!({ "resultSizeEstimate": 0 }));
         }
-        let more = matching.len() > max;
-        let list: Vec<Value> = matching.into_iter().take(max).collect();
+        let more = matching.len() > start + max;
+        let list: Vec<Value> = matching.into_iter().skip(start).take(max).collect();
         if more {
-            return HttpResponse::Ok().json(json!({ "messages": list, "nextPageToken": "next" }));
+            let next = format!("p{}", start + max);
+            return HttpResponse::Ok().json(json!({ "messages": list, "nextPageToken": next }));
         }
         HttpResponse::Ok().json(json!({ "messages": list }))
     }
@@ -619,6 +636,9 @@ mod tests {
             return HttpResponse::Unauthorized().finish();
         }
         assert_eq!(q["format"], "full");
+        if st.rate_limited_messages.lock().unwrap().contains(&id) {
+            return rate_limit_exceeded();
+        }
         *st.message_fetches.lock().unwrap() += 1;
         let found = st
             .messages
@@ -661,6 +681,46 @@ mod tests {
         HttpResponse::Ok().json(json!({ "labels": *st.labels.lock().unwrap() }))
     }
 
+    /// `users.labels.get`: like Gmail, `messagesTotal` counts the mailbox's
+    /// messages carrying the label.
+    async fn fake_gmail_label(
+        st: web::Data<FakeGoogle>,
+        req: actix_web::HttpRequest,
+        id: web::Path<String>,
+    ) -> HttpResponse {
+        if !bearer_ok(&req) {
+            return HttpResponse::Unauthorized().finish();
+        }
+        let has = |m: &Value, label: &str| {
+            m["labelIds"]
+                .as_array()
+                .is_some_and(|ls| ls.iter().any(|l| l == label))
+        };
+        let messages = st.messages.lock().unwrap();
+        let carrying: Vec<&Value> = messages.iter().filter(|m| has(m, id.as_str())).collect();
+        let unread = carrying.iter().filter(|m| has(m, "UNREAD")).count();
+        // One conversation per message here (threadId = id).
+        HttpResponse::Ok().json(json!({
+            "id": *id,
+            "messagesTotal": carrying.len(),
+            "messagesUnread": unread,
+            "threadsTotal": carrying.len(),
+            "threadsUnread": unread,
+        }))
+    }
+
+    /// `users.getProfile`: every message, spam and trash included.
+    async fn fake_gmail_profile(
+        st: web::Data<FakeGoogle>,
+        req: actix_web::HttpRequest,
+    ) -> HttpResponse {
+        if !bearer_ok(&req) {
+            return HttpResponse::Unauthorized().finish();
+        }
+        let total = st.messages.lock().unwrap().len();
+        HttpResponse::Ok().json(json!({ "emailAddress": "x@example.com", "messagesTotal": total }))
+    }
+
     async fn start_fake_google(st: Arc<FakeGoogle>) -> GoogleClient {
         let data = web::Data::from(st);
         let server = HttpServer::new(move || {
@@ -675,6 +735,14 @@ mod tests {
                 .route(
                     "/gmail/v1/users/me/labels",
                     web::get().to(fake_gmail_labels),
+                )
+                .route(
+                    "/gmail/v1/users/me/labels/{id}",
+                    web::get().to(fake_gmail_label),
+                )
+                .route(
+                    "/gmail/v1/users/me/profile",
+                    web::get().to(fake_gmail_profile),
                 )
                 .route(
                     "/gmail/v1/users/me/messages/{id}",
@@ -1067,6 +1135,228 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn mailboxes_carry_gmails_own_counts() {
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        *fake.labels.lock().unwrap() =
+            vec![json!({"id": "Label_5", "name": "newsletters", "type": "user"})];
+        let with_labels = |id: &str, labels: Value| {
+            let mut m = gmail_message(id, id, "Body");
+            m["labelIds"] = labels;
+            m
+        };
+        *fake.messages.lock().unwrap() = vec![
+            with_labels("a0", json!(["INBOX", "UNREAD"])),
+            with_labels("a1", json!(["INBOX", "Label_5", "UNREAD"])),
+            with_labels("a2", json!(["SENT"])),
+            with_labels("s0", json!(["SPAM", "UNREAD"])),
+            with_labels("t0", json!(["TRASH", "UNREAD"])),
+        ];
+
+        let accounts = || async {
+            let (status, list) = json_body(
+                test::call_service(&app, req!("GET", "/api/mail/accounts", &session)).await,
+            )
+            .await;
+            assert_eq!(status, 200);
+            (
+                list[0]["gmail_counts"].clone(),
+                list[0]["gmail_unread"].clone(),
+            )
+        };
+        assert_eq!(
+            accounts().await,
+            (json!({}), json!({})),
+            "nothing until an import reads them"
+        );
+
+        let (status, _) =
+            json_body(test::call_service(&app, req!("POST", "/api/mail/import", &session)).await)
+                .await;
+        assert_eq!(status, 200);
+        let (counts, unread) = accounts().await;
+        // ALL is the whole mailbox but spam and trash; trash and unread
+        // aren't folders.
+        assert_eq!(counts["ALL"], 3);
+        assert_eq!(counts["INBOX"], 2);
+        assert_eq!(counts["SENT"], 1);
+        assert_eq!(counts["SPAM"], 1);
+        assert_eq!(counts["Label_5"], 1);
+        assert_eq!(counts["STARRED"], 0);
+        assert!(counts.get("TRASH").is_none() && counts.get("UNREAD").is_none());
+        assert_eq!(unread["ALL"], 2, "a0 and a1; not the spam or trash");
+        assert_eq!(unread["INBOX"], 2);
+        assert_eq!(unread["Label_5"], 1);
+        assert_eq!(unread["SENT"], 0);
+        assert_eq!(unread["SPAM"], 1);
+
+        // Messages carry the unread mark, so the list can show it.
+        let unread_subjects = || async {
+            let (_, list) = json_body(
+                test::call_service(&app, req!("GET", "/api/mail/messages?label=ALL", &session))
+                    .await,
+            )
+            .await;
+            let mut subjects: Vec<String> = list
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["labels"].as_array().unwrap().contains(&json!("UNREAD")))
+                .map(|m| m["subject"].as_str().unwrap().to_owned())
+                .collect();
+            subjects.sort();
+            subjects
+        };
+        assert_eq!(unread_subjects().await, ["a0", "a1"]);
+
+        // Gmail's numbers, not what is stored here: they follow the mailbox.
+        // And mail read in Gmail shows as read here after the next import.
+        {
+            let mut msgs = fake.messages.lock().unwrap();
+            msgs.retain(|m| m["id"] != "a0");
+            msgs[0]["labelIds"] = json!(["INBOX", "Label_5"]);
+        }
+        test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
+        let (counts, unread) = accounts().await;
+        assert_eq!(
+            (counts["ALL"].clone(), counts["INBOX"].clone()),
+            (json!(2), json!(1))
+        );
+        assert_eq!(
+            (unread["ALL"].clone(), unread["INBOX"].clone()),
+            (json!(0), json!(0))
+        );
+        assert_eq!(unread_subjects().await, Vec::<String>::new());
+
+        // Unread is a mark, not a folder: the list can't be filtered by it.
+        let resp = test::call_service(
+            &app,
+            req!("GET", "/api/mail/messages?label=UNREAD", &session),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[actix_web::test]
+    async fn import_takes_the_whole_mailbox_and_resumes_where_it_stopped() {
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        // More than the newest-mail list (100) and than one page (500).
+        let mail = |prefix: &str, n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| gmail_message(&format!("{prefix}{i}"), "Old news", "Body"))
+                .collect()
+        };
+        *fake.messages.lock().unwrap() = mail("old", 620);
+        let stored = || async {
+            sqlx::query_as::<_, (i64, Option<String>, bool)>(
+                "SELECT (SELECT count(*) FROM mail_messages m WHERE m.account_id = a.id),
+                        a.backfill_page_token, a.backfill_done
+                   FROM mail_accounts a WHERE a.google_sub = $1",
+            )
+            .bind(&sub)
+            .fetch_one(pool.get_ref())
+            .await
+            .unwrap()
+        };
+        let import = || async {
+            json_body(test::call_service(&app, req!("POST", "/api/mail/import", &session)).await)
+                .await
+        };
+
+        let (status, body) = import().await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["imported"], 620);
+        assert_eq!(body["accounts"][0]["remaining"], false);
+        assert_eq!(body["accounts"][0]["error"], Value::Null);
+        assert_eq!(stored().await, (620, None, true));
+        assert_eq!(
+            *fake.message_fetches.lock().unwrap(),
+            620,
+            "each message fetched once"
+        );
+
+        // The list comes 50 at a time; together the pages hold every
+        // message exactly once.
+        let mut seen = std::collections::HashSet::new();
+        for page in 0..13 {
+            let uri = format!("/api/mail/messages?label=ALL&page={page}");
+            let (status, list) =
+                json_body(test::call_service(&app, req!("GET", &uri, &session)).await).await;
+            assert_eq!(status, 200);
+            let list = list.as_array().unwrap();
+            assert_eq!(list.len(), if page < 12 { 50 } else { 20 }, "page {page}");
+            for m in list {
+                assert!(
+                    seen.insert(m["id"].as_str().unwrap().to_owned()),
+                    "repeated"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 620);
+        let (_, past_the_end) = json_body(
+            test::call_service(&app, req!("GET", "/api/mail/messages?page=13", &session)).await,
+        )
+        .await;
+        assert_eq!(past_the_end, json!([]));
+
+        // Nothing new: nothing fetched, and the walk isn't repeated.
+        let (_, body) = import().await;
+        assert_eq!(body["imported"], 0);
+        assert_eq!(body["accounts"][0]["remaining"], false);
+        assert_eq!(*fake.message_fetches.lock().unwrap(), 620);
+
+        // More new mail than the newest list holds: the walk starts over and
+        // picks up the new mail past the first 100, without refetching.
+        let mut newer = mail("new", 150);
+        newer.extend(fake.messages.lock().unwrap().drain(..));
+        *fake.messages.lock().unwrap() = newer;
+        let (_, body) = import().await;
+        assert_eq!(body["imported"], 150);
+        assert_eq!(stored().await, (770, None, true));
+        assert_eq!(*fake.message_fetches.lock().unwrap(), 770);
+
+        // An import cut short continues from the page it saved: only that
+        // page and older are walked.
+        sqlx::query(
+            "DELETE FROM mail_messages WHERE account_id =
+                 (SELECT id FROM mail_accounts WHERE google_sub = $1)
+               AND gmail_id IN ('old0', 'old600')",
+        )
+        .bind(&sub)
+        .execute(pool.get_ref())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE mail_accounts SET backfill_page_token = 'p500', backfill_done = false
+              WHERE google_sub = $1",
+        )
+        .bind(&sub)
+        .execute(pool.get_ref())
+        .await
+        .unwrap();
+        let (_, body) = import().await;
+        assert_eq!(
+            body["imported"], 1,
+            "only old600 is at or past the saved page"
+        );
+        assert_eq!(body["accounts"][0]["remaining"], false);
+        assert_eq!(stored().await, (769, None, true));
+    }
+
+    #[actix_web::test]
     async fn import_reports_revoked_google_access() {
         let pool = test_db().await;
         let fake = Arc::new(FakeGoogle::default());
@@ -1443,6 +1733,9 @@ mod tests {
             "/api/mail/messages?label=Label_..%2Fx",
             "/api/mail/messages?folder=INBOX",
             "/api/mail/messages?account=not-a-uuid",
+            "/api/mail/messages?page=-1",
+            "/api/mail/messages?page=x",
+            "/api/mail/messages?page=20001",
         ] {
             let resp = test::call_service(&app, req!("GET", uri, &session)).await;
             assert_eq!(resp.status(), 400, "{uri}");
@@ -1504,6 +1797,41 @@ mod tests {
         .await;
         assert_eq!(list.as_array().unwrap().len(), 1);
         assert_eq!(list[0]["subject"], "Weekly digest");
+    }
+
+    #[actix_web::test]
+    async fn a_rate_limited_import_round_carries_on_next_round_without_an_error() {
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        // Past the newest 100, so the last 30 come in the walk through older mail.
+        *fake.messages.lock().unwrap() = (0..150)
+            .map(|i| gmail_message(&format!("m{i}"), "Hello", "Body"))
+            .collect();
+        *fake.rate_limited_messages.lock().unwrap() = (120..150).map(|i| format!("m{i}")).collect();
+        let import = || async {
+            json_body(test::call_service(&app, req!("POST", "/api/mail/import", &session)).await)
+                .await
+        };
+
+        // Gmail keeps refusing those 30: the round stops there, quietly.
+        let (status, body) = import().await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["imported"], 120);
+        assert_eq!(body["accounts"][0]["error"], Value::Null, "{body}");
+        assert_eq!(body["accounts"][0]["remaining"], true);
+
+        // Once Gmail lets up, the next round picks up where it stopped.
+        fake.rate_limited_messages.lock().unwrap().clear();
+        let (_, body) = import().await;
+        assert_eq!(body["imported"], 30);
+        assert_eq!(body["accounts"][0]["error"], Value::Null);
+        assert_eq!(body["accounts"][0]["remaining"], false);
     }
 
     #[actix_web::test]

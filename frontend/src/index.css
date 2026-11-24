@@ -232,7 +232,11 @@ button.ghost.danger { color: var(--danger); }
   box-shadow: inset 3px 0 0 var(--accent);
 }
 .m-from, .m-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.m-from, .m-subject, .m-date { font-weight: 600; }
+/* Read mail is plain; unread mail is bold, with an accent edge like Gmail. */
+.m-from, .m-subject, .m-date { font-weight: 400; }
+.message-row.unread .m-from, .message-row.unread .m-subject, .message-row.unread .m-date { font-weight: 700; }
+.message-row.unread { box-shadow: inset 3px 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+.unread-count { color: var(--fg); font-weight: 700; }
 .m-snippet { color: var(--muted); }
 .m-date { font-size: 0.8rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
 
