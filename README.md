@@ -106,12 +106,8 @@ cd frontend && npm install && npm run dev   # Vite on :5173, proxies /api → :8
 | POST | `/api/auth/password-login` | `{email, password}`; signs in (public) |
 | GET | `/api/auth/me` | `{ "email": "..." }` of the signed-in user |
 | POST | `/api/auth/logout` | body `{}`; ends the session |
-| GET | `/api/notes` | your notes (latest 100) |
-| POST | `/api/notes` | `{ "title": "...", "body": "..." }` |
-| GET | `/api/notes/{id}` | fetch one |
-| DELETE | `/api/notes/{id}` | delete |
 
-Everything except health and sign-in needs a session, and notes are visible only to their owner.
+Everything except health and sign-in needs a session, and mailboxes and mail are visible only to their owner.
 
 ## Adding a migration
 
