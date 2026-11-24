@@ -262,6 +262,8 @@ const formatDate = (iso: string) => new Date(iso).toLocaleString()
 /** A sidebar count: unread in bold, when there is any, then the total. */
 /** How long to wait before importing again when the mailbox is busy. */
 const BUSY_RETRY_MS = 20_000
+/** How long to wait after an import round that Gmail slowed to nothing. */
+const SLOW_DOWN_MS = 10_000
 
 /**
  * The number next to a folder, as Gmail's sidebar shows it: unread
@@ -593,6 +595,9 @@ function Mail(props: {
           }
         }
         if (!res.accounts.some((a) => a.remaining && !a.error)) break
+        // Mail is left but this round got none: Gmail asked to slow down.
+        // Give its per-user quota a moment before the next round.
+        if (res.imported === 0) await new Promise((resolve) => setTimeout(resolve, SLOW_DOWN_MS))
       }
     } catch (err) {
       handle(err)

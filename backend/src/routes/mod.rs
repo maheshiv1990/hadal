@@ -483,6 +483,16 @@ mod tests {
         labels: Mutex<Vec<Value>>,
         /// How many upcoming message-list calls answer 403 rateLimitExceeded.
         rate_limited: Mutex<u32>,
+        /// Messages whose fetch answers 403 rateLimitExceeded, every time.
+        rate_limited_messages: Mutex<Vec<String>>,
+    }
+
+    fn rate_limit_exceeded() -> HttpResponse {
+        HttpResponse::Forbidden().json(json!({ "error": {
+            "code": 403,
+            "message": "Rate Limit Exceeded",
+            "errors": [{ "reason": "rateLimitExceeded", "domain": "usageLimits" }],
+        }}))
     }
 
     const FAKE_ACCESS: &str = "fake-gmail-access";
@@ -626,6 +636,9 @@ mod tests {
             return HttpResponse::Unauthorized().finish();
         }
         assert_eq!(q["format"], "full");
+        if st.rate_limited_messages.lock().unwrap().contains(&id) {
+            return rate_limit_exceeded();
+        }
         *st.message_fetches.lock().unwrap() += 1;
         let found = st
             .messages
@@ -1784,6 +1797,41 @@ mod tests {
         .await;
         assert_eq!(list.as_array().unwrap().len(), 1);
         assert_eq!(list[0]["subject"], "Weekly digest");
+    }
+
+    #[actix_web::test]
+    async fn a_rate_limited_import_round_carries_on_next_round_without_an_error() {
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        // Past the newest 100, so the last 30 come in the walk through older mail.
+        *fake.messages.lock().unwrap() = (0..150)
+            .map(|i| gmail_message(&format!("m{i}"), "Hello", "Body"))
+            .collect();
+        *fake.rate_limited_messages.lock().unwrap() = (120..150).map(|i| format!("m{i}")).collect();
+        let import = || async {
+            json_body(test::call_service(&app, req!("POST", "/api/mail/import", &session)).await)
+                .await
+        };
+
+        // Gmail keeps refusing those 30: the round stops there, quietly.
+        let (status, body) = import().await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["imported"], 120);
+        assert_eq!(body["accounts"][0]["error"], Value::Null, "{body}");
+        assert_eq!(body["accounts"][0]["remaining"], true);
+
+        // Once Gmail lets up, the next round picks up where it stopped.
+        fake.rate_limited_messages.lock().unwrap().clear();
+        let (_, body) = import().await;
+        assert_eq!(body["imported"], 30);
+        assert_eq!(body["accounts"][0]["error"], Value::Null);
+        assert_eq!(body["accounts"][0]["remaining"], false);
     }
 
     #[actix_web::test]

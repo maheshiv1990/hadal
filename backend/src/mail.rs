@@ -12,6 +12,7 @@
 //!   picked by its position in our own record, never by an ID from the request.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -19,6 +20,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::alphabet::URL_SAFE;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
@@ -43,6 +45,22 @@ pub const IMPORT_PER_MAILBOX: u32 = 100;
 const BACKFILL_PAGE: u32 = 500;
 /// Parallel message fetches per mailbox.
 const FETCH_CONCURRENCY: usize = 8;
+/// Message fetches started per second, per mailbox. Gmail allows each user
+/// 250 quota units a second and a message costs 5, so 50 a second at most;
+/// this leaves room for the list and count calls around them. Without a
+/// pace, 8 parallel fetches outrun the quota and Gmail refuses with
+/// `rateLimitExceeded`.
+#[cfg(not(test))]
+const FETCHES_PER_SECOND: NonZeroU32 = match NonZeroU32::new(30) {
+    Some(n) => n,
+    None => NonZeroU32::MIN,
+};
+// The fake Gmail has no quota; tests shouldn't wait on one.
+#[cfg(test)]
+const FETCHES_PER_SECOND: NonZeroU32 = match NonZeroU32::new(100_000) {
+    Some(n) => n,
+    None => NonZeroU32::MIN,
+};
 /// An import must answer before nginx gives up on the request
 /// (`proxy_read_timeout 30s`). What was stored by then is kept.
 const IMPORT_BUDGET: Duration = Duration::from_secs(24);
@@ -978,6 +996,7 @@ async fn import_account(
         account,
         access: &access,
         counts,
+        pace: RateLimiter::direct(Quota::per_second(FETCHES_PER_SECOND)),
     };
     run.fetch_and_store(pending, &backfill, None).await?;
 
@@ -1010,6 +1029,8 @@ struct Fetch<'a> {
     account: &'a Claimed,
     access: &'a Secret,
     counts: &'a Counts,
+    /// Keeps message fetches under Gmail's per-user quota.
+    pace: DefaultDirectRateLimiter,
 }
 
 /// How a batch of message fetches ended.
@@ -1042,8 +1063,12 @@ impl Fetch<'_> {
             if out_of_time && pending.len() > 0 && matches!(outcome, Fetched::All) {
                 outcome = Fetched::OutOfTime;
             }
-            while !out_of_time && fetches.len() < FETCH_CONCURRENCY {
+            // Once Gmail says to slow down (after its own retries), start
+            // nothing more this round: the next one carries on.
+            let held_back = matches!(&outcome, Fetched::Failed(e) if e.is_rate_limited());
+            while !out_of_time && !held_back && fetches.len() < FETCH_CONCURRENCY {
                 let Some(id) = pending.next() else { break };
+                self.pace.until_ready().await;
                 let (google, access) = (self.google.clone(), self.access.clone());
                 fetches.spawn(async move { google.get_message(&access, &id).await });
             }
@@ -1120,6 +1145,13 @@ impl Fetch<'_> {
                 Fetched::All => {}
                 // This page again next time; what was stored is skipped then.
                 Fetched::OutOfTime => {
+                    self.save_backfill(page.as_deref(), false).await?;
+                    return Ok(true);
+                }
+                // Gmail asked to slow down: not a failure, just where this
+                // round stops. The page is tried again next round.
+                Fetched::Failed(e) if e.is_rate_limited() => {
+                    tracing::info!(account = %self.account.id, "Gmail rate limit; continuing next round");
                     self.save_backfill(page.as_deref(), false).await?;
                     return Ok(true);
                 }
