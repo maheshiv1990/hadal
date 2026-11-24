@@ -87,8 +87,11 @@ Scanner ignores:
   the per-IP auth limit. Sign-in itself doesn't reveal accounts: one message,
   and the same Argon2 work for unknown emails.
 - **Not yet built for password accounts:** email verification, password reset
-  and change (2.2.2 stays pending until they exist and revoke other sessions),
-  and a breached-password check.
+  and a breached-password check. Password change exists
+  (`POST /api/auth/password`) and signs out every other session, so 2.2.2 is
+  verified (`password_change_signs_out_every_other_session`). A future reset
+  flow must revoke sessions the same way. All of this sits behind
+  `PASSWORD_AUTH_ENABLED`, which is off by default and in production.
 
 ## Gate limitations
 

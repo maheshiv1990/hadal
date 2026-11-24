@@ -309,6 +309,39 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn duplicate_query_params_are_rejected() {
+        // CASA 5.1.1: a repeated query parameter is refused, not resolved to the
+        // first or last value. The single-value request succeeds, so each 400
+        // below is the duplicate's doing.
+        let pool = test_db().await;
+        let (_, cookie) = signed_in_user(&pool).await;
+        let app = test_app!(pool);
+        let get = |uri: &str| {
+            test::TestRequest::get()
+                .uri(uri)
+                .insert_header(("cookie", cookie.as_str()))
+                .to_request()
+        };
+        let (status, _) =
+            json_body(test::call_service(&app, get("/api/mail/messages?label=ALL")).await).await;
+        assert_eq!(status, 200);
+        let account = "00000000-0000-0000-0000-000000000000";
+        for query in [
+            "label=ALL&label=INBOX".to_owned(),
+            "label=ALL&label=ALL".to_owned(),
+            format!("account={account}&account={account}"),
+        ] {
+            let uri = format!("/api/mail/messages?{query}");
+            let (status, body) = json_body(test::call_service(&app, get(&uri)).await).await;
+            assert_eq!(
+                (status, body),
+                (400, json!({ "error": "invalid query string" })),
+                "accepted {query}"
+            );
+        }
+    }
+
+    #[actix_web::test]
     async fn cross_site_form_post_is_rejected() {
         // CASA 3.1.5: even with a valid session, a plain HTML form (no CORS
         // preflight) cannot send application/json, so it is refused.
