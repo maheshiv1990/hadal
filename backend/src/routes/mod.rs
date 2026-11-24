@@ -588,13 +588,13 @@ mod tests {
                         .as_array()
                         .is_some_and(|ls| ls.iter().any(|l| l == label))
                 };
+                // Like Gmail: spam and trash only with includeSpamTrash,
+                // label or not.
+                let include = q.get("includeSpamTrash").map(String::as_str) == Some("true");
+                let listed = include || !(has("SPAM") || has("TRASH"));
                 match q.get("labelIds") {
-                    // Like Gmail: spam only when asked for, with includeSpamTrash.
-                    Some(label) if label == "SPAM" => {
-                        q.get("includeSpamTrash").map(String::as_str) == Some("true") && has("SPAM")
-                    }
-                    Some(label) => has(label),
-                    None => !has("SPAM"),
+                    Some(label) => listed && has(label),
+                    None => listed,
                 }
             })
             .map(|m| json!({ "id": m["id"], "threadId": m["id"] }))
@@ -668,6 +668,46 @@ mod tests {
         HttpResponse::Ok().json(json!({ "labels": *st.labels.lock().unwrap() }))
     }
 
+    /// `users.labels.get`: like Gmail, `messagesTotal` counts the mailbox's
+    /// messages carrying the label.
+    async fn fake_gmail_label(
+        st: web::Data<FakeGoogle>,
+        req: actix_web::HttpRequest,
+        id: web::Path<String>,
+    ) -> HttpResponse {
+        if !bearer_ok(&req) {
+            return HttpResponse::Unauthorized().finish();
+        }
+        let has = |m: &Value, label: &str| {
+            m["labelIds"]
+                .as_array()
+                .is_some_and(|ls| ls.iter().any(|l| l == label))
+        };
+        let messages = st.messages.lock().unwrap();
+        let carrying: Vec<&Value> = messages.iter().filter(|m| has(m, id.as_str())).collect();
+        let unread = carrying.iter().filter(|m| has(m, "UNREAD")).count();
+        // One conversation per message here (threadId = id).
+        HttpResponse::Ok().json(json!({
+            "id": *id,
+            "messagesTotal": carrying.len(),
+            "messagesUnread": unread,
+            "threadsTotal": carrying.len(),
+            "threadsUnread": unread,
+        }))
+    }
+
+    /// `users.getProfile`: every message, spam and trash included.
+    async fn fake_gmail_profile(
+        st: web::Data<FakeGoogle>,
+        req: actix_web::HttpRequest,
+    ) -> HttpResponse {
+        if !bearer_ok(&req) {
+            return HttpResponse::Unauthorized().finish();
+        }
+        let total = st.messages.lock().unwrap().len();
+        HttpResponse::Ok().json(json!({ "emailAddress": "x@example.com", "messagesTotal": total }))
+    }
+
     async fn start_fake_google(st: Arc<FakeGoogle>) -> GoogleClient {
         let data = web::Data::from(st);
         let server = HttpServer::new(move || {
@@ -682,6 +722,14 @@ mod tests {
                 .route(
                     "/gmail/v1/users/me/labels",
                     web::get().to(fake_gmail_labels),
+                )
+                .route(
+                    "/gmail/v1/users/me/labels/{id}",
+                    web::get().to(fake_gmail_label),
+                )
+                .route(
+                    "/gmail/v1/users/me/profile",
+                    web::get().to(fake_gmail_profile),
                 )
                 .route(
                     "/gmail/v1/users/me/messages/{id}",
@@ -1071,6 +1119,115 @@ mod tests {
                 .await;
         assert_eq!(body["imported"], 1);
         assert_eq!(*fake.message_fetches.lock().unwrap(), fetched + 1);
+    }
+
+    #[actix_web::test]
+    async fn mailboxes_carry_gmails_own_counts() {
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        *fake.labels.lock().unwrap() =
+            vec![json!({"id": "Label_5", "name": "newsletters", "type": "user"})];
+        let with_labels = |id: &str, labels: Value| {
+            let mut m = gmail_message(id, id, "Body");
+            m["labelIds"] = labels;
+            m
+        };
+        *fake.messages.lock().unwrap() = vec![
+            with_labels("a0", json!(["INBOX", "UNREAD"])),
+            with_labels("a1", json!(["INBOX", "Label_5", "UNREAD"])),
+            with_labels("a2", json!(["SENT"])),
+            with_labels("s0", json!(["SPAM", "UNREAD"])),
+            with_labels("t0", json!(["TRASH", "UNREAD"])),
+        ];
+
+        let accounts = || async {
+            let (status, list) = json_body(
+                test::call_service(&app, req!("GET", "/api/mail/accounts", &session)).await,
+            )
+            .await;
+            assert_eq!(status, 200);
+            (
+                list[0]["gmail_counts"].clone(),
+                list[0]["gmail_unread"].clone(),
+            )
+        };
+        assert_eq!(
+            accounts().await,
+            (json!({}), json!({})),
+            "nothing until an import reads them"
+        );
+
+        let (status, _) =
+            json_body(test::call_service(&app, req!("POST", "/api/mail/import", &session)).await)
+                .await;
+        assert_eq!(status, 200);
+        let (counts, unread) = accounts().await;
+        // ALL is the whole mailbox but spam and trash; trash and unread
+        // aren't folders.
+        assert_eq!(counts["ALL"], 3);
+        assert_eq!(counts["INBOX"], 2);
+        assert_eq!(counts["SENT"], 1);
+        assert_eq!(counts["SPAM"], 1);
+        assert_eq!(counts["Label_5"], 1);
+        assert_eq!(counts["STARRED"], 0);
+        assert!(counts.get("TRASH").is_none() && counts.get("UNREAD").is_none());
+        assert_eq!(unread["ALL"], 2, "a0 and a1; not the spam or trash");
+        assert_eq!(unread["INBOX"], 2);
+        assert_eq!(unread["Label_5"], 1);
+        assert_eq!(unread["SENT"], 0);
+        assert_eq!(unread["SPAM"], 1);
+
+        // Messages carry the unread mark, so the list can show it.
+        let unread_subjects = || async {
+            let (_, list) = json_body(
+                test::call_service(&app, req!("GET", "/api/mail/messages?label=ALL", &session))
+                    .await,
+            )
+            .await;
+            let mut subjects: Vec<String> = list
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|m| m["labels"].as_array().unwrap().contains(&json!("UNREAD")))
+                .map(|m| m["subject"].as_str().unwrap().to_owned())
+                .collect();
+            subjects.sort();
+            subjects
+        };
+        assert_eq!(unread_subjects().await, ["a0", "a1"]);
+
+        // Gmail's numbers, not what is stored here: they follow the mailbox.
+        // And mail read in Gmail shows as read here after the next import.
+        {
+            let mut msgs = fake.messages.lock().unwrap();
+            msgs.retain(|m| m["id"] != "a0");
+            msgs[0]["labelIds"] = json!(["INBOX", "Label_5"]);
+        }
+        test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
+        let (counts, unread) = accounts().await;
+        assert_eq!(
+            (counts["ALL"].clone(), counts["INBOX"].clone()),
+            (json!(2), json!(1))
+        );
+        assert_eq!(
+            (unread["ALL"].clone(), unread["INBOX"].clone()),
+            (json!(0), json!(0))
+        );
+        assert_eq!(unread_subjects().await, Vec::<String>::new());
+
+        // Unread is a mark, not a folder: the list can't be filtered by it.
+        let resp = test::call_service(
+            &app,
+            req!("GET", "/api/mail/messages?label=UNREAD", &session),
+        )
+        .await;
+        assert_eq!(resp.status(), 400);
     }
 
     #[actix_web::test]

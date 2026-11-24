@@ -27,8 +27,8 @@ use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::auth::google::{
-    GoogleApiError, GoogleClient, Identity, UserLabel, valid_attachment_id, valid_gmail_id,
-    valid_user_label_id,
+    GoogleApiError, GoogleClient, Identity, LabelCounts, UserLabel, valid_attachment_id,
+    valid_gmail_id, valid_user_label_id,
 };
 use crate::config::Secret;
 use crate::crypto::DataCipher;
@@ -50,8 +50,10 @@ const IMPORT_BUDGET: Duration = Duration::from_secs(24);
 /// time to finish the ones under way within `IMPORT_BUDGET`. The next import
 /// continues from where it stopped.
 const BACKFILL_DEADLINE: Duration = Duration::from_secs(18);
-/// A claim on a mailbox older than this is from a crashed import.
-const STALE_CLAIM_SECS: f64 = 300.0;
+/// A claim on a mailbox older than this is from an import that died (the
+/// backend restarted mid-import, say): a live one gives up within
+/// `IMPORT_BUDGET` and then releases it.
+const STALE_CLAIM_SECS: f64 = 60.0;
 const MAX_BODY_CHARS: usize = 200_000;
 const MAX_SUBJECT_CHARS: usize = 1_000;
 const MAX_ADDRESS_CHARS: usize = 2_000;
@@ -71,11 +73,18 @@ pub const SYSTEM_LABELS: [&str; 10] = [
     "CATEGORY_PROMOTIONS",
 ];
 
+/// Gmail's mark on a message nobody has opened yet. Kept on messages so the
+/// list can show them in bold, but not a folder: the list can't be filtered
+/// by it.
+pub const UNREAD: &str = "UNREAD";
+
 /// The system label lists each import reads: how many of the newest it
 /// lists (to refresh labels on mail we have), and how many of those it
 /// imports if we don't have them yet. The categories and Important are
-/// mostly Inbox mail, so they only refresh.
-const IMPORT_LISTS: [(&str, u32, usize); 10] = [
+/// mostly Inbox mail, so they only refresh. Unread is listed as far as one
+/// list call goes, so mail read in Gmail shows as read here too.
+const IMPORT_LISTS: [(&str, u32, usize); 11] = [
+    (UNREAD, 500, 0),
     ("INBOX", 100, 100),
     ("STARRED", 50, 50),
     ("SENT", 50, 50),
@@ -96,9 +105,14 @@ const REFRESHED_USER_LABELS: usize = 20;
 const USER_LABEL_LIST: u32 = 100;
 const USER_LABEL_IMPORT: usize = 25;
 
+/// Whether a Gmail label ID is one Hadal shows as a folder or label.
+fn folder_label(id: &str) -> bool {
+    SYSTEM_LABELS.contains(&id) || valid_user_label_id(id)
+}
+
 /// Whether a Gmail label ID is one Hadal keeps on a message.
 fn kept_label(id: &str) -> bool {
-    SYSTEM_LABELS.contains(&id) || valid_user_label_id(id)
+    folder_label(id) || id == UNREAD
 }
 
 /// What the message list is filtered to: every message except spam, or one
@@ -115,7 +129,7 @@ impl LabelFilter {
     pub fn parse(raw: &str) -> Option<Self> {
         if raw == "ALL" {
             Some(LabelFilter::AllMail)
-        } else if kept_label(raw) {
+        } else if folder_label(raw) {
             Some(LabelFilter::Label(raw.to_owned()))
         } else {
             None
@@ -216,6 +230,12 @@ pub struct Account {
     /// Messages per label ID, plus `ALL` (everything but spam). Mail imported
     /// before labels were recorded counts as Inbox until the next import.
     folder_counts: HashMap<String, i64>,
+    /// Gmail's own count per label ID, plus `ALL` (everything but spam and
+    /// trash), as of the last import: the mailbox's real size, including
+    /// mail not imported yet. Empty until the first import reads them.
+    gmail_counts: HashMap<String, i64>,
+    /// Gmail's count of unread messages, for the same keys.
+    gmail_unread: HashMap<String, i64>,
     /// The mailbox's own Gmail labels, by name.
     labels: Vec<LabelInfo>,
 }
@@ -268,6 +288,12 @@ pub async fn list_accounts(
     .bind(owner)
     .fetch_all(pool)
     .await?;
+    let gmail_totals: Vec<(Uuid, String, i64, i64)> = sqlx::query_as(
+        "SELECT account_id, label_id, total, unread FROM mail_gmail_totals WHERE owner_id = $1",
+    )
+    .bind(owner)
+    .fetch_all(pool)
+    .await?;
 
     rows.into_iter()
         .map(|(id, email, created_at, last_import_at, message_count)| {
@@ -278,6 +304,11 @@ pub async fn list_accounts(
                 .collect();
             let spam = folder_counts.get("SPAM").copied().unwrap_or(0);
             folder_counts.insert("ALL".to_owned(), message_count - spam);
+            // Unread is a mark on messages, not a folder.
+            folder_counts.remove(UNREAD);
+            let mine_totals = || gmail_totals.iter().filter(|t| t.0 == id);
+            let gmail_counts = mine_totals().map(|t| (t.1.clone(), t.2)).collect();
+            let gmail_unread = mine_totals().map(|t| (t.1.clone(), t.3)).collect();
             let mut mine = labels
                 .iter()
                 .filter(|l| l.0 == id)
@@ -298,6 +329,8 @@ pub async fn list_accounts(
                 last_import_at,
                 message_count,
                 folder_counts,
+                gmail_counts,
+                gmail_unread,
                 labels: mine,
             })
         })
@@ -882,6 +915,7 @@ async fn import_account(
     let access = google.refresh_access_token(&refresh).await?;
     let user_labels = google.list_user_labels(&access, MAX_USER_LABELS).await?;
     store_labels(pool, cipher, owner, account.id, &user_labels).await?;
+    store_gmail_totals(pool, google, &access, owner, account.id, &user_labels).await?;
 
     // The newest mail overall, plus the newest of each folder, so sent mail,
     // drafts and spam show up even when they aren't among the newest overall.
@@ -1160,6 +1194,123 @@ async fn store_labels(
         .execute(pool)
         .await?;
     }
+    Ok(())
+}
+
+/// Reads Gmail's own message and unread counts for every folder and label
+/// the inbox shows, plus `ALL` (everything but spam and trash), and stores
+/// them in place of the last ones. A count Gmail won't give right now leaves
+/// the stored ones as they were: they're only for display, so that doesn't
+/// stop the import. Revoked access does.
+async fn store_gmail_totals(
+    pool: &PgPool,
+    google: &Arc<GoogleClient>,
+    access: &Secret,
+    owner: Uuid,
+    account_id: Uuid,
+    user_labels: &[UserLabel],
+) -> Result<(), ImportFailure> {
+    // TRASH and UNREAD only go into the ALL numbers below.
+    let labels: Vec<String> = SYSTEM_LABELS
+        .iter()
+        .map(|l| (*l).to_owned())
+        .chain(["TRASH".to_owned(), UNREAD.to_owned()])
+        .chain(user_labels.iter().map(|l| l.id.clone()))
+        .collect();
+    let mut pending = labels.into_iter();
+    let mut reads = JoinSet::new();
+    let mut counts: HashMap<String, LabelCounts> = HashMap::new();
+    let mut profile = None;
+    {
+        let (google, access) = (google.clone(), access.clone());
+        reads.spawn(async move {
+            let total = google
+                .mailbox_total(&access)
+                .await
+                .map(|messages| LabelCounts {
+                    messages,
+                    ..LabelCounts::default()
+                });
+            (None, total)
+        });
+    }
+    loop {
+        while reads.len() < FETCH_CONCURRENCY {
+            let Some(label) = pending.next() else { break };
+            let (google, access) = (google.clone(), access.clone());
+            reads.spawn(async move {
+                let counted = google.label_counts(&access, &label).await;
+                (Some(label), counted)
+            });
+        }
+        let Some(joined) = reads.join_next().await else {
+            break;
+        };
+        let (label, counted) = match joined {
+            Ok((label, Ok(counted))) => (label, counted),
+            Ok((_, Err(GoogleApiError::Revoked))) => return Err(GoogleApiError::Revoked.into()),
+            Ok((_, Err(e))) => {
+                tracing::warn!(account = %account_id, error = %e, "Gmail counts unavailable");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(account = %account_id, error = %e, "Gmail count task failed");
+                return Ok(());
+            }
+        };
+        match label {
+            Some(label) => {
+                counts.insert(label, counted);
+            }
+            None => profile = Some(counted.messages),
+        }
+    }
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    // All mail but spam and trash: the whole mailbox, and every unread
+    // conversation (those carrying UNREAD), less what is in Spam or Trash.
+    let spam = counts.get("SPAM").copied().unwrap_or_default();
+    let trash = counts.remove("TRASH").unwrap_or_default();
+    let unread = counts.remove(UNREAD).unwrap_or_default();
+    counts.insert(
+        "ALL".to_owned(),
+        LabelCounts {
+            messages: (profile - spam.messages - trash.messages).max(0),
+            threads: 0,
+            unread_threads: (unread.threads - spam.unread_threads - trash.unread_threads).max(0),
+        },
+    );
+
+    // Stored: the message total (what the list pages through) and unread
+    // conversations (what Gmail's sidebar shows).
+    let mut ids = Vec::with_capacity(counts.len());
+    let mut totals = Vec::with_capacity(counts.len());
+    let mut unreads = Vec::with_capacity(counts.len());
+    for (id, c) in counts {
+        ids.push(id);
+        totals.push(c.messages);
+        unreads.push(c.unread_threads);
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM mail_gmail_totals WHERE owner_id = $1 AND account_id = $2")
+        .bind(owner)
+        .bind(account_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO mail_gmail_totals (account_id, owner_id, label_id, total, unread)
+         SELECT $2, $1, label_id, total, unread
+           FROM unnest($3::text[], $4::bigint[], $5::bigint[]) AS t (label_id, total, unread)",
+    )
+    .bind(owner)
+    .bind(account_id)
+    .bind(&ids)
+    .bind(&totals)
+    .bind(&unreads)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1654,10 +1805,17 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(p.body, "Line one\nLine two");
-        assert_eq!(p.labels, ["INBOX"], "only labels Hadal shows are kept");
+        assert_eq!(
+            p.labels,
+            ["INBOX", "UNREAD"],
+            "only labels Hadal shows, and the unread mark, are kept"
+        );
         let mut msg = gmail_message("abc", "s", "t");
         msg["labelIds"] = json!(["Label_3", "UNREAD", "SPAM", "Label_3", "Label_../x", "CHAT"]);
-        assert_eq!(parse_message(&msg).unwrap().labels, ["Label_3", "SPAM"]);
+        assert_eq!(
+            parse_message(&msg).unwrap().labels,
+            ["Label_3", "UNREAD", "SPAM"]
+        );
     }
 
     #[test]

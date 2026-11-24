@@ -229,6 +229,30 @@ pub fn valid_label_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// Gmail's counts for one label.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LabelCounts {
+    /// Messages carrying the label (`messagesTotal`).
+    pub messages: i64,
+    /// Conversations carrying it (`threadsTotal`).
+    pub threads: i64,
+    /// Unread conversations (`threadsUnread`): the number Gmail's own
+    /// sidebar shows, since Gmail groups mail into conversations by default.
+    pub unread_threads: i64,
+}
+
+/// A count (`messagesTotal`, `threadsUnread`, …) from a Gmail label or
+/// profile: a non-negative integer. Gmail leaves it out when it is zero.
+fn count(json: &Value, field: &str) -> Result<i64, GoogleApiError> {
+    match json.get(field) {
+        None => Ok(0),
+        Some(n) => n
+            .as_i64()
+            .filter(|n| *n >= 0)
+            .ok_or(GoogleApiError::Malformed),
+    }
+}
+
 /// A label the user made in Gmail (not a system label).
 pub fn valid_user_label_id(id: &str) -> bool {
     id.strip_prefix("Label_")
@@ -660,6 +684,43 @@ impl GoogleClient {
             })
             .take(max)
             .collect())
+    }
+
+    /// Gmail's own counts for `label` (`users.labels.get`). The label is one
+    /// of our constants or a label ID Gmail gave us, checked again here.
+    pub async fn label_counts(
+        &self,
+        access: &Secret,
+        label: &str,
+    ) -> Result<LabelCounts, GoogleApiError> {
+        if !valid_label_id(label) {
+            return Err(GoogleApiError::Malformed);
+        }
+        let mut url = self
+            .gmail_api
+            .join("labels/")
+            .map_err(|_| GoogleApiError::Malformed)?;
+        url.path_segments_mut()
+            .map_err(|_| GoogleApiError::Malformed)?
+            .pop_if_empty()
+            .push(label);
+        let json = self.gmail_get(url, access, MAX_RESPONSE_BYTES).await?;
+        Ok(LabelCounts {
+            messages: count(&json, "messagesTotal")?,
+            threads: count(&json, "threadsTotal")?,
+            unread_threads: count(&json, "threadsUnread")?,
+        })
+    }
+
+    /// Gmail's count of every message in the mailbox, spam and trash
+    /// included (`messagesTotal` of `users.getProfile`).
+    pub async fn mailbox_total(&self, access: &Secret) -> Result<i64, GoogleApiError> {
+        let url = self
+            .gmail_api
+            .join("profile")
+            .map_err(|_| GoogleApiError::Malformed)?;
+        let json = self.gmail_get(url, access, MAX_RESPONSE_BYTES).await?;
+        count(&json, "messagesTotal")
     }
 
     /// One message with headers and body parts (`format=full`).

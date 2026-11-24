@@ -59,6 +59,9 @@ CASES = {
     "notes-owner-scope-labels": ("x.rs",
         'sqlx::query("DELETE FROM mail_labels WHERE account_id = $1").bind(id)',
         'sqlx::query("DELETE FROM mail_labels WHERE owner_id = $1 AND account_id = $2")'),
+    "notes-owner-scope-totals": ("x.rs",
+        'sqlx::query("SELECT total FROM mail_gmail_totals WHERE account_id = $1").bind(id)',
+        'sqlx::query("SELECT total FROM mail_gmail_totals WHERE owner_id = $1 AND account_id = $2")'),
     "notes-owner-scope-multiline": ("x.rs",
         'sqlx::query_as::<_, Note>(\n    "SELECT id, title\n     FROM notes ORDER BY created_at",\n)',
         'sqlx::query_as::<_, Note>(\n    "SELECT id, title FROM notes\n     WHERE owner_id = $1",\n)'),
@@ -76,6 +79,7 @@ ALIASES = {"sql-string-building-var": "sql-string-building", "sql-string-buildin
            "notes-owner-scope-multiline": "notes-owner-scope",
            "notes-owner-scope-mail": "notes-owner-scope",
            "notes-owner-scope-labels": "notes-owner-scope",
+           "notes-owner-scope-totals": "notes-owner-scope",
            "directory-listing-template": "directory-listing"}
 
 

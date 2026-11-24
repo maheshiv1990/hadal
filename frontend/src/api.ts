@@ -16,6 +16,14 @@ export interface MailAccount {
   message_count: number
   /** Messages per label ID (`INBOX`, `Label_12`, …), plus `ALL` for everything but spam. */
   folder_counts: Record<string, number>
+  /**
+   * Gmail's own count per label ID, plus `ALL` (everything but spam and
+   * trash), read at each import: the mailbox's real size, mail not imported
+   * yet included. Empty until the first import has read them.
+   */
+  gmail_counts: Record<string, number>
+  /** Gmail's count of unread messages, for the same keys. */
+  gmail_unread: Record<string, number>
   /** The mailbox's own Gmail labels. */
   labels: MailLabel[]
 }
@@ -55,7 +63,7 @@ export interface MailMessage {
   subject: string
   snippet: string
   attachments: MailAttachment[]
-  /** Which folders the message is in. */
+  /** Which folders the message is in, plus `UNREAD` while it is unread in Gmail. */
   labels: FolderLabel[]
 }
 
