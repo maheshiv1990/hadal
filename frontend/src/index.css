@@ -173,13 +173,12 @@ button.folder.active .count { color: inherit; font-weight: 600; }
 }
 .side-heading {
   margin: 0; padding: 0 0.75rem;
-  font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted);
+  font-size: 0.85rem; font-weight: 600; color: var(--muted);
 }
 .m-star { color: #e3a008; font-size: 0.9rem; }
 .m-draft { color: var(--danger); font-weight: 600; }
 .mailbox-label { display: flex; flex-direction: column; min-width: 0; }
 .mailbox-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.primary-tag { font-size: 0.7rem; font-weight: 600; color: var(--accent); }
 .count { color: var(--muted); font-size: 0.8rem; font-weight: normal; font-variant-numeric: tabular-nums; }
 
 .inbox-main { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; min-width: 0; }

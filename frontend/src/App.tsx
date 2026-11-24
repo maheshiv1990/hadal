@@ -493,7 +493,7 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
       const res = await api.importMail()
       const ok = res.accounts.filter((a) => !a.error).length
       setStatus(
-        `Imported ${plural(res.imported, 'new message', 'new messages')} from ${plural(ok, 'mailbox', 'mailboxes')}.`,
+        `Imported ${plural(res.imported, 'new message', 'new messages')} from ${plural(ok, 'account', 'accounts')}.`,
       )
       setProblems(res.accounts.filter((a) => a.error).map((a) => `${a.email}: ${a.error}`))
       await Promise.all([refetchAccounts(), refetchMessages()])
@@ -540,8 +540,8 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
     <section class="inbox">
       <aside class="inbox-side">
         <div class="side-block">
-          <h2 class="side-heading">Mailboxes</h2>
-          <nav class="mailboxes" aria-label="Mailboxes">
+          <h2 class="side-heading">Accounts</h2>
+          <nav class="mailboxes" aria-label="Accounts">
             <For each={orderedAccounts()}>
               {(account) => (
                 <button
@@ -553,9 +553,6 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                 >
                   <span class="mailbox-label">
                     <span class="mailbox-name">{account.email}</span>
-                    <Show when={isPrimary(account)}>
-                      <span class="primary-tag">Primary</span>
-                    </Show>
                   </span>
                   <span class="count">{account.message_count}</span>
                 </button>
@@ -598,7 +595,7 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                   class="ghost"
                   onClick={importAll}
                   disabled={importing() || !accounts()?.length}
-                  title="Import new mail from every connected mailbox"
+                  title="Import new mail from every connected account"
                 >
                   {importing() ? 'Importing…' : '↻ Import'}
                 </button>
@@ -656,10 +653,10 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                   fallback={
                     <p class="muted inbox-empty">
                       {!accounts()?.length
-                        ? 'No mailboxes connected. Connect a Gmail account to import its newest 100 messages.'
+                        ? 'No accounts connected. Connect a Gmail account to import its newest 100 messages.'
                         : selectedAccount()?.message_count
                           ? `Nothing in ${folderName()}.`
-                          : 'No messages yet. Use “Import” to fetch the newest mail from each mailbox.'}
+                          : 'No messages yet. Use “Import” to fetch the newest mail from each account.'}
                     </p>
                   }
                 >
