@@ -35,12 +35,19 @@ pub async fn disconnect(
     cipher: web::Data<DataCipher>,
     id: web::Path<Uuid>,
 ) -> Result<HttpResponse, AppError> {
-    let Some(grant) = mail::delete_account(&pool, &cipher, user.user_id, id.into_inner()).await?
-    else {
-        return Err(AppError::NotFound);
+    let grant = match mail::delete_account(&pool, &cipher, user.user_id, id.into_inner()).await? {
+        mail::Unlinked::Removed(grant) => grant,
+        mail::Unlinked::SignInAccount => {
+            return Err(AppError::Conflict(
+                "This is the account you sign in with, so it can't be disconnected.",
+            ));
+        }
+        mail::Unlinked::NotFound => return Err(AppError::NotFound),
     };
     // Best effort: the mailbox and its mail are already deleted here.
-    if let Err(e) = google.revoke(&grant).await {
+    if let Some(grant) = grant
+        && let Err(e) = google.revoke(&grant).await
+    {
         tracing::warn!(error = %e, "could not revoke Google access for an unlinked mailbox");
     }
     Ok(HttpResponse::NoContent().finish())

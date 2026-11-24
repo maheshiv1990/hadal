@@ -1510,6 +1510,46 @@ mod tests {
         );
     }
 
+    #[actix_web::test]
+    async fn the_sign_in_account_cannot_be_disconnected() {
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (user_id, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        *fake.messages.lock().unwrap() = vec![gmail_message("p1", "keep", "me")];
+        test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
+        // The user signs in with this mailbox's address (any letter case).
+        sqlx::query("UPDATE users SET email = $2 WHERE id = $1")
+            .bind(user_id)
+            .bind(format!("{sub}@EXAMPLE.com"))
+            .execute(pool.get_ref())
+            .await
+            .unwrap();
+        let (_, accounts) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/accounts", &session)).await)
+                .await;
+        let uri = format!("/api/mail/accounts/{}", accounts[0]["id"].as_str().unwrap());
+
+        let (status, body) =
+            json_body(test::call_service(&app, req!("DELETE", &uri, &session)).await).await;
+        assert_eq!(
+            (status, body),
+            (
+                409,
+                json!({ "error": "This is the account you sign in with, so it can't be disconnected." })
+            )
+        );
+        assert!(fake.revoked.lock().unwrap().is_empty(), "access kept");
+        let (_, accounts) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/accounts", &session)).await)
+                .await;
+        assert_eq!(accounts[0]["message_count"], 1, "mail kept");
+    }
+
     // ---- email + password accounts --------------------------------------
 
     const PASSPHRASE: &str = "correct horse battery staple";

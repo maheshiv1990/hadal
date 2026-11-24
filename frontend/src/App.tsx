@@ -328,6 +328,24 @@ function Settings(props: {
   const [saved, setSaved] = createSignal(false)
   const [busy, setBusy] = createSignal(false)
   const [passwordChanged, setPasswordChanged] = createSignal(false)
+  const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
+  const [accountError, setAccountError] = createSignal<string | null>(null)
+  createEffect(() => {
+    if (accounts.error instanceof UnauthorizedError) props.onSignedOut()
+  })
+  const disconnect = async (account: MailAccount) => {
+    if (!window.confirm(`Disconnect ${account.email}? Its imported mail will be deleted from Hadal.`)) {
+      return
+    }
+    setAccountError(null)
+    try {
+      await api.disconnectMailAccount(account.id)
+      await refetchAccounts()
+    } catch (err) {
+      if (err instanceof UnauthorizedError) props.onSignedOut()
+      else setAccountError((err as Error).message)
+    }
+  }
   const unchanged = () =>
     first().trim() === (props.me.first_name ?? '') && last().trim() === (props.me.last_name ?? '')
 
@@ -403,6 +421,60 @@ function Settings(props: {
             {busy() ? 'Saving…' : 'Save'}
           </button>
         </form>
+      </section>
+
+      <section class="panel settings-card" aria-labelledby="accounts-heading">
+        <h2 id="accounts-heading">Connected accounts</h2>
+        <Show when={!accounts.error} fallback={<p class="error">Could not load your connected accounts.</p>}>
+          <Show when={!accounts.loading} fallback={<p class="muted">Loading…</p>}>
+            <Show
+              when={accounts()?.length}
+              fallback={<p class="muted">No Gmail accounts connected yet.</p>}
+            >
+              <ul class="connected-accounts">
+                <For each={accounts()}>
+                  {(account) => (
+                    <li>
+                      <span class="connected-info">
+                        <span class="connected-email">{account.email}</span>
+                        <span class="muted">
+                          {plural(account.message_count, 'message', 'messages')}
+                          {' · connected '}
+                          {readerDate(account.created_at)}
+                          {account.last_import_at
+                            ? ` · imported ${listDate(account.last_import_at)}`
+                            : ' · not imported yet'}
+                        </span>
+                      </span>
+                      <Show
+                        when={account.email.toLowerCase() !== props.me.email.toLowerCase()}
+                        fallback={
+                          <span class="muted sign-in-account" title="The account you sign in with can't be disconnected">
+                            Sign-in account
+                          </span>
+                        }
+                      >
+                        <button
+                          class="ghost danger"
+                          onClick={() => disconnect(account)}
+                          aria-label={`Disconnect ${account.email}`}
+                        >
+                          Disconnect
+                        </button>
+                      </Show>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Show>
+            <Show when={accountError()}>
+              <p class="error" role="alert">{accountError()}</p>
+            </Show>
+            <a class="add-account" href={GMAIL_CONNECT_PATH}>
+              {accounts()?.length ? '+ Add another account' : '+ Add an account'}
+            </a>
+          </Show>
+        </Show>
       </section>
 
       <section class="panel settings-card" aria-labelledby="password-heading">
@@ -812,7 +884,7 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                 >
                   {importing() ? 'Importing…' : '↻ Import'}
                 </button>
-                <Show when={selectedAccount()}>
+                <Show when={selectedAccount() && !isPrimary(selectedAccount()!) && selectedAccount()}>
                   {(account) => (
                     <button class="ghost danger" onClick={() => disconnect(account())}>
                       Disconnect
