@@ -433,31 +433,39 @@ impl GoogleClient {
     }
 
     /// IDs of the newest `max` messages in the mailbox (Gmail excludes spam
-    /// and trash by default).
+    /// and trash by default), or only those carrying the system `label`.
+    /// `label` is one of our own constants, never user input. The flag says
+    /// whether the list is complete (Gmail has no further page).
     pub async fn list_message_ids(
         &self,
         access: &Secret,
         max: u32,
-    ) -> Result<Vec<String>, GoogleApiError> {
+        label: Option<&'static str>,
+    ) -> Result<(Vec<String>, bool), GoogleApiError> {
         let mut url = self
             .gmail_api
             .join("messages")
             .map_err(|_| GoogleApiError::Malformed)?;
         url.query_pairs_mut()
             .append_pair("maxResults", &max.clamp(1, MAX_LIST_RESULTS).to_string());
+        if let Some(label) = label {
+            url.query_pairs_mut().append_pair("labelIds", label);
+        }
         let json = self.gmail_get(url, access, MAX_RESPONSE_BYTES).await?;
+        let complete = json.get("nextPageToken").is_none();
         let Some(list) = json.get("messages") else {
-            // An empty mailbox has no `messages` key at all.
-            return Ok(Vec::new());
+            // An empty mailbox or label has no `messages` key at all.
+            return Ok((Vec::new(), complete));
         };
         let list = list.as_array().ok_or(GoogleApiError::Malformed)?;
-        Ok(list
+        let ids = list
             .iter()
             .filter_map(|m| m.get("id").and_then(Value::as_str))
             .filter(|id| valid_gmail_id(id))
             .take(max as usize)
             .map(str::to_owned)
-            .collect())
+            .collect();
+        Ok((ids, complete))
     }
 
     /// One message with headers and body parts (`format=full`).

@@ -7,6 +7,7 @@ import {
   MAX_PASSWORD_LENGTH,
   MIN_PASSWORD_LENGTH,
   UnauthorizedError,
+  type FolderLabel,
   type MailAccount,
   type MailAttachment,
   type Me,
@@ -378,6 +379,36 @@ const fileKind = (a: MailAttachment): { label: string; kind: string } => {
   return { label, kind }
 }
 
+/** Simple outline icons for the folder menu (24×24, drawn with the text colour). */
+const FolderIcon = (props: { label: FolderLabel }) => (
+  <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true">
+    <Switch>
+      <Match when={props.label === 'INBOX'}>
+        <path d="M3 13.5 5.6 5h12.8L21 13.5V19H3z" />
+        <path d="M3 13.5h5.2l1.3 2.5h5l1.3-2.5H21" />
+      </Match>
+      <Match when={props.label === 'STARRED'}>
+        <path d="m12 3.5 2.6 5.4 5.9.8-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.8z" />
+      </Match>
+      <Match when={props.label === 'SENT'}>
+        <path d="M3.5 11.5 20.5 4l-7.5 17-2.3-7.2z" />
+        <path d="m10.7 13.8 9.8-9.8" />
+      </Match>
+      <Match when={props.label === 'DRAFT'}>
+        <path d="M6 3h8.5L19 7.5V21H6z" />
+        <path d="M14.5 3v4.5H19" />
+      </Match>
+    </Switch>
+  </svg>
+)
+
+const FOLDERS: { label: FolderLabel; name: string; count: (a: MailAccount) => number }[] = [
+  { label: 'INBOX', name: 'Inbox', count: (a) => a.inbox_count },
+  { label: 'STARRED', name: 'Starred', count: (a) => a.starred_count },
+  { label: 'SENT', name: 'Sent', count: (a) => a.sent_count },
+  { label: 'DRAFT', name: 'Drafts', count: (a) => a.draft_count },
+]
+
 /** Attachment chips shown under a message row. */
 const MAX_ROW_CHIPS = 3
 
@@ -390,9 +421,9 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
  */
 function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryEmail: string }) {
   const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
-  const [messages, { refetch: refetchMessages }] = createResource(api.listMessages)
   /** The mailbox the user picked; null (or one since disconnected) means the primary one. */
   const [mailbox, setMailbox] = createSignal<string | null>(null)
+  const [folder, setFolder] = createSignal<FolderLabel>('INBOX')
   const [openId, setOpenId] = createSignal<string | null>(null)
   const [detail] = createResource(openId, api.getMessage)
   const [importing, setImporting] = createSignal(false)
@@ -428,13 +459,28 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
     const list = orderedAccounts()
     return list.find((a) => a.id === mailbox()) ?? list[0]
   }
-  const visible = () => {
-    const id = selectedAccount()?.id
-    return id ? (messages() ?? []).filter((m) => m.account_id === id) : []
-  }
+  // The open folder of the selected mailbox, fetched from the server.
+  const [messages, { refetch: refetchMessages }] = createResource(
+    () => {
+      const id = selectedAccount()?.id
+      return id ? `${id}|${folder()}` : false
+    },
+    (key) => {
+      const [account, label] = key.split('|')
+      return api.listMessages(account, label as FolderLabel)
+    },
+  )
+  const visible = () => messages() ?? []
+  const folderName = () => FOLDERS.find((f) => f.label === folder())?.name ?? ''
+  /** Sent mail and drafts are listed by recipient, the rest by sender. */
+  const byRecipient = () => folder() === 'SENT' || folder() === 'DRAFT'
 
   const showMailbox = (id: string | null) => {
     setMailbox(id)
+    setOpenId(null)
+  }
+  const showFolder = (label: FolderLabel) => {
+    setFolder(label)
     setOpenId(null)
   }
 
@@ -493,6 +539,27 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
   return (
     <section class="inbox">
       <aside class="inbox-side">
+        <nav class="folders" aria-label="Folders">
+          <For each={FOLDERS}>
+            {(f) => (
+              <button
+                class="mailbox folder"
+                classList={{ active: folder() === f.label }}
+                aria-current={folder() === f.label ? 'true' : undefined}
+                onClick={() => showFolder(f.label)}
+              >
+                <span class="folder-label">
+                  <FolderIcon label={f.label} />
+                  {f.name}
+                </span>
+                <Show when={selectedAccount() && f.count(selectedAccount()!) > 0}>
+                  <span class="count">{f.count(selectedAccount()!)}</span>
+                </Show>
+              </button>
+            )}
+          </For>
+        </nav>
+        <h2 class="side-heading">Mailboxes</h2>
         <nav class="mailboxes" aria-label="Mailboxes">
           <For each={orderedAccounts()}>
             {(account) => (
@@ -586,9 +653,11 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                   when={visible().length}
                   fallback={
                     <p class="muted inbox-empty">
-                      {accounts()?.length
-                        ? 'No messages yet. Use “Import” to fetch the newest 100 from each mailbox.'
-                        : 'No mailboxes connected. Connect a Gmail account to import its newest 100 messages.'}
+                      {!accounts()?.length
+                        ? 'No mailboxes connected. Connect a Gmail account to import its newest 100 messages.'
+                        : selectedAccount()?.message_count
+                          ? `Nothing in ${folderName()}.`
+                          : 'No messages yet. Use “Import” to fetch the newest mail from each mailbox.'}
                     </p>
                   }
                 >
@@ -597,9 +666,21 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                       {(m) => (
                         <li>
                           <button class="message-row" onClick={() => setOpenId(m.id)}>
-                            <span class="m-from" title={m.from}>
-                              {senderName(m.from)}
-                            </span>
+                            <Show
+                              when={byRecipient()}
+                              fallback={
+                                <span class="m-from" title={m.from}>
+                                  {senderName(m.from)}
+                                </span>
+                              }
+                            >
+                              <span class="m-from" title={m.to}>
+                                <Show when={folder() === 'DRAFT'}>
+                                  <span class="m-draft">Draft </span>
+                                </Show>
+                                To: {m.to ? senderName(m.to) : '(no recipient)'}
+                              </span>
+                            </Show>
                             <span class="m-text">
                               <span class="m-subject">{m.subject || '(no subject)'}</span>
                               <Show when={m.snippet}>
@@ -607,6 +688,11 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                               </Show>
                             </span>
                             <span class="m-end">
+                              <Show when={m.labels.includes('STARRED')}>
+                                <span class="m-star" role="img" aria-label="Starred" title="Starred">
+                                  ★
+                                </span>
+                              </Show>
                               <Show when={m.attachments.length}>
                                 <span
                                   class="m-clip"

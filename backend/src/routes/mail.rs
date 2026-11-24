@@ -72,13 +72,24 @@ pub async fn import(
     }
 }
 
+/// `?account=<mailbox id>&label=INBOX|STARRED|SENT|DRAFT`, both optional.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessagesQuery {
+    account: Option<Uuid>,
+    label: Option<mail::Folder>,
+}
+
 #[get("/messages")]
 pub async fn messages(
     user: AuthUser,
     pool: web::Data<PgPool>,
     cipher: web::Data<DataCipher>,
+    query: web::Query<MessagesQuery>,
 ) -> Result<HttpResponse, AppError> {
-    Ok(HttpResponse::Ok().json(mail::list_messages(&pool, &cipher, user.user_id).await?))
+    let MessagesQuery { account, label } = query.into_inner();
+    Ok(HttpResponse::Ok()
+        .json(mail::list_messages(&pool, &cipher, user.user_id, account, label).await?))
 }
 
 #[get("/messages/{id}")]

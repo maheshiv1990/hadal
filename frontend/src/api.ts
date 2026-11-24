@@ -14,7 +14,14 @@ export interface MailAccount {
   created_at: string
   last_import_at: string | null
   message_count: number
+  inbox_count: number
+  starred_count: number
+  sent_count: number
+  draft_count: number
 }
+
+/** The folders in the mailbox menu, as the Gmail labels the server filters on. */
+export type FolderLabel = 'INBOX' | 'STARRED' | 'SENT' | 'DRAFT'
 
 /** A file attached to an imported message. It is fetched from Gmail only when downloaded. */
 export interface MailAttachment {
@@ -37,6 +44,8 @@ export interface MailMessage {
   subject: string
   snippet: string
   attachments: MailAttachment[]
+  /** Which folders the message is in. */
+  labels: FolderLabel[]
 }
 
 /** A message with its body. The body is plain text: never render it as HTML. */
@@ -163,6 +172,8 @@ export const api = {
     request<void>(`/mail/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   // JSON body so a cross-site form can't start an import (CASA 3.1.5).
   importMail: () => request<MailImportResult>('/mail/import', { method: 'POST', body: '{}' }),
-  listMessages: () => request<MailMessage[]>('/mail/messages'),
+  /** The newest messages of one mailbox's folder. */
+  listMessages: (account: string, label: FolderLabel) =>
+    request<MailMessage[]>(`/mail/messages?${new URLSearchParams({ account, label })}`),
   getMessage: (id: string) => request<MailMessageDetail>(`/mail/messages/${encodeURIComponent(id)}`),
 }

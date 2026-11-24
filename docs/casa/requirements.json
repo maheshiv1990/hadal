@@ -135,8 +135,8 @@
       "id": "3.1.2",
       "title": "User and data attributes used by access controls cannot be manipulated by end users",
       "status": "verified",
-      "evidence": ["lint:permissive-deserialize", "test:unknown_fields_are_rejected", "test:registration_validates_input"],
-      "notes": "Every request body struct uses deny_unknown_fields, so server-controlled fields such as id, created_at and (later) owner_id cannot be mass-assigned. Registration rejects extra fields such as id, password_hash and google_sub."
+      "evidence": ["lint:permissive-deserialize", "test:unknown_fields_are_rejected", "test:registration_validates_input", "test:folders_follow_gmail_labels"],
+      "notes": "Every request body struct uses deny_unknown_fields, so server-controlled fields such as id, created_at and (later) owner_id cannot be mass-assigned. Registration rejects extra fields such as id, password_hash and google_sub. Query strings are typed the same way: the message list accepts only account (a UUID) and label (one of four folders), and anything else is a 400."
     },
     {
       "id": "3.1.3",
@@ -149,7 +149,7 @@
       "title": "Sensitive resources are protected against IDOR on create, read, update and delete",
       "status": "verified",
       "evidence": ["test:users_cannot_reach_each_others_mail", "test:unknown_fields_are_rejected", "lint:notes-owner-scope"],
-      "notes": "Every mail_accounts and mail_messages query is scoped by owner_id from the session, never from the request (lint:notes-owner-scope covers both tables, and still flags the removed notes table if it comes back). mail_messages has a composite foreign key to (mailbox id, owner_id), so a message can't belong to someone else's mailbox. Another user's mailbox, message or attachment returns the same 404 as a missing one; an attachment download is picked by its position in the owner's own encrypted record, never by a Gmail ID from the request. The Gmail link callback takes the user from the single-use pending row, not the request."
+      "notes": "Every mail_accounts and mail_messages query is scoped by owner_id from the session, never from the request (lint:notes-owner-scope covers both tables, and still flags the removed notes table if it comes back). mail_messages has a composite foreign key to (mailbox id, owner_id), so a message can't belong to someone else's mailbox. The message list's optional account filter is ANDed with owner_id, so another user's mailbox id matches nothing. Another user's mailbox, message or attachment returns the same 404 as a missing one; an attachment download is picked by its position in the owner's own encrypted record, never by a Gmail ID from the request. The Gmail link callback takes the user from the single-use pending row, not the request."
     },
     {
       "id": "3.1.5",
@@ -244,7 +244,7 @@
       "title": "Prevent server-side request forgery",
       "status": "verified",
       "evidence": ["lint:outbound-http", "test:production_client_refuses_plain_http", "test:gmail_ids_are_checked_before_use_in_a_url"],
-      "notes": "All outbound HTTP is in backend/src/auth/google.rs, to Google's constant endpoints: token (code exchange and refresh), revoke, and the Gmail API under https://gmail.googleapis.com/gmail/v1/users/me/ (message list, messages, and message attachments). No host or URL comes from user input; Gmail message IDs from Google are checked to be plain alphanumeric, and attachment IDs plain base64url, before they go into a path segment. Responses are size-capped (attachments at Gmail's 25 MB limit). Redirects and proxies are disabled on the client; lint:outbound-http rejects HTTP clients anywhere else."
+      "notes": "All outbound HTTP is in backend/src/auth/google.rs, to Google's constant endpoints: token (code exchange and refresh), revoke, and the Gmail API under https://gmail.googleapis.com/gmail/v1/users/me/ (message list, messages, and message attachments). No host or URL comes from user input; Gmail message IDs from Google are checked to be plain alphanumeric, and attachment IDs plain base64url, before they go into a path segment; the only label ever sent as a list filter is one of four fixed constants (INBOX, STARRED, SENT, DRAFT). Responses are size-capped (attachments at Gmail's 25 MB limit). Redirects and proxies are disabled on the client; lint:outbound-http rejects HTTP clients anywhere else."
     },
     {
       "id": "5.1.6",

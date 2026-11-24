@@ -494,16 +494,27 @@ mod tests {
             return HttpResponse::Unauthorized().finish();
         }
         let max: usize = q["maxResults"].parse().unwrap();
-        let list: Vec<Value> = st
+        let matching: Vec<Value> = st
             .messages
             .lock()
             .unwrap()
             .iter()
-            .take(max)
+            .filter(|m| {
+                q.get("labelIds").is_none_or(|label| {
+                    m["labelIds"]
+                        .as_array()
+                        .is_some_and(|ls| ls.iter().any(|l| l == label.as_str()))
+                })
+            })
             .map(|m| json!({ "id": m["id"], "threadId": m["id"] }))
             .collect();
-        if list.is_empty() {
+        if matching.is_empty() {
             return HttpResponse::Ok().json(json!({ "resultSizeEstimate": 0 }));
+        }
+        let more = matching.len() > max;
+        let list: Vec<Value> = matching.into_iter().take(max).collect();
+        if more {
+            return HttpResponse::Ok().json(json!({ "messages": list, "nextPageToken": "next" }));
         }
         HttpResponse::Ok().json(json!({ "messages": list }))
     }
@@ -1171,7 +1182,7 @@ mod tests {
         let id = list[0]["id"].as_str().unwrap().to_owned();
 
         // As if it had been imported before attachments were recorded.
-        sqlx::query("UPDATE mail_messages SET attachments_enc = NULL WHERE id = $1")
+        sqlx::query("UPDATE mail_messages SET attachments_enc = NULL, labels = NULL WHERE id = $1")
             .bind(uuid::Uuid::parse_str(&id).unwrap())
             .execute(pool.get_ref())
             .await
@@ -1180,6 +1191,11 @@ mod tests {
             json_body(test::call_service(&app, req!("GET", "/api/mail/messages", &session)).await)
                 .await;
         assert_eq!(list[0]["attachments"], json!([]));
+        assert_eq!(
+            list[0]["labels"],
+            json!(["INBOX"]),
+            "unlabelled mail reads as Inbox"
+        );
 
         let fetched = *fake.message_fetches.lock().unwrap();
         let (_, body) =
@@ -1197,6 +1213,108 @@ mod tests {
         // Once filled in, it isn't fetched again.
         test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
         assert_eq!(*fake.message_fetches.lock().unwrap(), fetched + 1);
+    }
+
+    #[actix_web::test]
+    async fn folders_follow_gmail_labels() {
+        use crate::mail::tests::gmail_message;
+        let with_labels = |id: &str, labels: &[&str]| {
+            let mut m = gmail_message(id, &format!("subject {id}"), "body");
+            m["labelIds"] = json!(labels);
+            m
+        };
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        *fake.messages.lock().unwrap() = vec![
+            with_labels("f1", &["INBOX", "UNREAD", "CATEGORY_UPDATES"]),
+            with_labels("f2", &["INBOX", "STARRED", "IMPORTANT"]),
+            with_labels("f3", &["SENT"]),
+            with_labels("f4", &["DRAFT"]),
+        ];
+        test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
+
+        let ids = |list: &Value| -> Vec<String> {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["subject"].as_str().unwrap().replace("subject ", ""))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let folder = |label: &'static str| {
+            let app = &app;
+            let session = &session;
+            async move {
+                let uri = format!("/api/mail/messages?label={label}");
+                let (status, list) =
+                    json_body(test::call_service(app, req!("GET", &uri, session)).await).await;
+                assert_eq!(status, 200, "{label}");
+                list
+            }
+        };
+        assert_eq!(ids(&folder("INBOX").await), ["f1", "f2"]);
+        assert_eq!(ids(&folder("STARRED").await), ["f2"]);
+        assert_eq!(ids(&folder("SENT").await), ["f3"]);
+        assert_eq!(ids(&folder("DRAFT").await), ["f4"]);
+        // Only our four folder labels are kept.
+        assert_eq!(
+            folder("STARRED").await[0]["labels"],
+            json!(["INBOX", "STARRED"])
+        );
+
+        let (_, accounts) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/accounts", &session)).await)
+                .await;
+        let a = &accounts[0];
+        assert_eq!(
+            (
+                &a["message_count"],
+                &a["inbox_count"],
+                &a["starred_count"],
+                &a["sent_count"],
+                &a["draft_count"]
+            ),
+            (&json!(4), &json!(2), &json!(1), &json!(1), &json!(1))
+        );
+        let account_id = a["id"].as_str().unwrap().to_owned();
+        let uri = format!("/api/mail/messages?account={account_id}&label=INBOX");
+        let (_, list) =
+            json_body(test::call_service(&app, req!("GET", &uri, &session)).await).await;
+        assert_eq!(ids(&list), ["f1", "f2"]);
+        // A mailbox id that isn't the caller's matches nothing.
+        let uri = format!("/api/mail/messages?account={}", uuid::Uuid::new_v4());
+        let (status, list) =
+            json_body(test::call_service(&app, req!("GET", &uri, &session)).await).await;
+        assert_eq!((status, list), (200, json!([])));
+        // Only the four folders, and no other parameters (CASA 3.1.2).
+        for uri in [
+            "/api/mail/messages?label=TRASH",
+            "/api/mail/messages?label=inbox",
+            "/api/mail/messages?folder=INBOX",
+            "/api/mail/messages?account=not-a-uuid",
+        ] {
+            let resp = test::call_service(&app, req!("GET", uri, &session)).await;
+            assert_eq!(resp.status(), 400, "{uri}");
+        }
+
+        // Starred and unstarred in Gmail: the next import catches up without
+        // fetching those messages again.
+        {
+            let mut msgs = fake.messages.lock().unwrap();
+            msgs[0]["labelIds"] = json!(["INBOX", "STARRED"]);
+            msgs[1]["labelIds"] = json!(["INBOX"]);
+        }
+        let fetched = *fake.message_fetches.lock().unwrap();
+        test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
+        assert_eq!(*fake.message_fetches.lock().unwrap(), fetched);
+        assert_eq!(ids(&folder("STARRED").await), ["f1"]);
+        assert_eq!(ids(&folder("INBOX").await), ["f1", "f2"]);
     }
 
     #[actix_web::test]
