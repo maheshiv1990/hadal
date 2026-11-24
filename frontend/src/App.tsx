@@ -388,10 +388,10 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
  * mailboxes on the left, one row per message, and a reading view. Bodies are
  * plain text from the server and are only ever shown as text (CASA 5.1.7).
  */
-function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
+function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryEmail: string }) {
   const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
   const [messages, { refetch: refetchMessages }] = createResource(api.listMessages)
-  /** The mailbox the user picked; null (or one since disconnected) means the first. */
+  /** The mailbox the user picked; null (or one since disconnected) means the primary one. */
   const [mailbox, setMailbox] = createSignal<string | null>(null)
   const [openId, setOpenId] = createSignal<string | null>(null)
   const [detail] = createResource(openId, api.getMessage)
@@ -416,8 +416,16 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
   })
 
   /** The mailbox being shown: the one picked, or the first one. */
-  const selectedAccount = () => {
+  const isPrimary = (account: MailAccount) =>
+    account.email.toLowerCase() === props.primaryEmail.toLowerCase()
+  /** Mailboxes with the one for the signed-in email (the primary) first. */
+  const orderedAccounts = () => {
     const list = accounts() ?? []
+    return [...list.filter(isPrimary), ...list.filter((a) => !isPrimary(a))]
+  }
+  /** The mailbox being shown: the one picked, else the primary, else the first. */
+  const selectedAccount = () => {
+    const list = orderedAccounts()
     return list.find((a) => a.id === mailbox()) ?? list[0]
   }
   const visible = () => {
@@ -486,7 +494,7 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
     <section class="inbox">
       <aside class="inbox-side">
         <nav class="mailboxes" aria-label="Mailboxes">
-          <For each={accounts()}>
+          <For each={orderedAccounts()}>
             {(account) => (
               <button
                 class="mailbox"
@@ -495,7 +503,12 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
                 title={account.email}
                 onClick={() => showMailbox(account.id)}
               >
-                <span class="mailbox-name">{account.email}</span>
+                <span class="mailbox-label">
+                  <span class="mailbox-name">{account.email}</span>
+                  <Show when={isPrimary(account)}>
+                    <span class="primary-tag">Primary</span>
+                  </Show>
+                </span>
                 <span class="count">{account.message_count}</span>
               </button>
             )}
@@ -835,7 +848,7 @@ function App() {
                 }}
               />
             </Show>
-            <Mail onSignedOut={() => mutate(null)} linkResult={linkResult} />
+            <Mail onSignedOut={() => mutate(null)} linkResult={linkResult} primaryEmail={me()?.email ?? ''} />
           </Show>
         </Show>
       </Show>

@@ -157,7 +157,9 @@ button.mailbox {
 }
 button.mailbox:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
 button.mailbox.active { background: color-mix(in srgb, var(--accent) 16%, transparent); font-weight: 600; }
+.mailbox-label { display: flex; flex-direction: column; min-width: 0; }
 .mailbox-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.primary-tag { font-size: 0.7rem; font-weight: 600; color: var(--accent); }
 .count { color: var(--muted); font-size: 0.8rem; font-weight: normal; font-variant-numeric: tabular-nums; }
 
 .inbox-main { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; min-width: 0; }
