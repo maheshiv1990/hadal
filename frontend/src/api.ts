@@ -14,7 +14,25 @@ export interface MailAccount {
   created_at: string
   last_import_at: string | null
   message_count: number
+  /** Messages per label ID (`INBOX`, `Label_12`, …), plus `ALL` for everything but spam. */
+  folder_counts: Record<string, number>
+  /** The mailbox's own Gmail labels. */
+  labels: MailLabel[]
 }
+
+/** One of the user's own Gmail labels. */
+export interface MailLabel {
+  id: string
+  name: string
+  /** `#rrggbb`, if Gmail gives it a colour. */
+  color: string | null
+}
+
+/**
+ * What the message list shows: `ALL` (everything but spam), a Gmail system
+ * label such as `INBOX` or `CATEGORY_UPDATES`, or a user label ID.
+ */
+export type FolderLabel = string
 
 /** A file attached to an imported message. It is fetched from Gmail only when downloaded. */
 export interface MailAttachment {
@@ -37,6 +55,8 @@ export interface MailMessage {
   subject: string
   snippet: string
   attachments: MailAttachment[]
+  /** Which folders the message is in. */
+  labels: FolderLabel[]
 }
 
 /** A message with its body. The body is plain text: never render it as HTML. */
@@ -163,6 +183,8 @@ export const api = {
     request<void>(`/mail/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   // JSON body so a cross-site form can't start an import (CASA 3.1.5).
   importMail: () => request<MailImportResult>('/mail/import', { method: 'POST', body: '{}' }),
-  listMessages: () => request<MailMessage[]>('/mail/messages'),
+  /** The newest messages of one mailbox's folder. */
+  listMessages: (account: string, label: FolderLabel) =>
+    request<MailMessage[]>(`/mail/messages?${new URLSearchParams({ account, label })}`),
   getMessage: (id: string) => request<MailMessageDetail>(`/mail/messages/${encodeURIComponent(id)}`),
 }

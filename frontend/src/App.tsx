@@ -7,6 +7,7 @@ import {
   MAX_PASSWORD_LENGTH,
   MIN_PASSWORD_LENGTH,
   UnauthorizedError,
+  type FolderLabel,
   type MailAccount,
   type MailAttachment,
   type Me,
@@ -378,6 +379,84 @@ const fileKind = (a: MailAttachment): { label: string; kind: string } => {
   return { label, kind }
 }
 
+/** Simple outline icons for the folder menu (24×24, drawn with the text colour). */
+const FolderIcon = (props: { label: FolderLabel }) => (
+  <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true">
+    <Switch>
+      <Match when={props.label === 'INBOX'}>
+        <path d="M3 13.5 5.6 5h12.8L21 13.5V19H3z" />
+        <path d="M3 13.5h5.2l1.3 2.5h5l1.3-2.5H21" />
+      </Match>
+      <Match when={props.label === 'STARRED'}>
+        <path d="m12 3.5 2.6 5.4 5.9.8-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.8z" />
+      </Match>
+      <Match when={props.label === 'SENT'}>
+        <path d="M3.5 11.5 20.5 4l-7.5 17-2.3-7.2z" />
+        <path d="m10.7 13.8 9.8-9.8" />
+      </Match>
+      <Match when={props.label === 'DRAFT'}>
+        <path d="M6 3h8.5L19 7.5V21H6z" />
+        <path d="M14.5 3v4.5H19" />
+      </Match>
+      <Match when={props.label === 'IMPORTANT'}>
+        <path d="M4 6h11l5 6-5 6H4l4-6z" />
+      </Match>
+      <Match when={props.label === 'ALL'}>
+        <path d="M4 8h16v11H4z" />
+        <path d="M6 5h12M8 2.5h8" />
+      </Match>
+      <Match when={props.label === 'SPAM'}>
+        <path d="M8.3 3h7.4L21 8.3v7.4L15.7 21H8.3L3 15.7V8.3z" />
+        <path d="M12 7.5v5.5M12 16.5v.01" />
+      </Match>
+      <Match when={props.label === 'CATEGORY_SOCIAL'}>
+        <circle cx="9" cy="8" r="3.2" />
+        <path d="M3 19c.6-3.4 3-5 6-5s5.4 1.6 6 5" />
+        <path d="M15.5 4.9a3.2 3.2 0 0 1 0 6.2M17.5 14.3c1.8.6 3 2.1 3.5 4.7" />
+      </Match>
+      <Match when={props.label === 'CATEGORY_UPDATES'}>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 11v6M12 7.5v.01" />
+      </Match>
+      <Match when={props.label === 'CATEGORY_FORUMS'}>
+        <path d="M3 4h13v9H8l-5 4z" />
+        <path d="M16 8h5v12l-4-3h-7v-4" />
+      </Match>
+      <Match when={props.label === 'CATEGORY_PROMOTIONS'}>
+        <path d="M3 12.6V4h8.6L21 13.4 13.4 21z" />
+        <path d="M7.5 7.5v.01" />
+      </Match>
+    </Switch>
+  </svg>
+)
+
+/** A user label's icon: a tag in the label's own colour. */
+const LabelIcon = (props: { color: string | null }) => (
+  <svg class="folder-icon label-icon" viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M3 6.5h12.5L21 12l-5.5 5.5H3z" style={{ fill: props.color ?? 'var(--muted)' }} />
+  </svg>
+)
+
+type Folder = { label: FolderLabel; name: string }
+
+const FOLDERS: Folder[] = [
+  { label: 'INBOX', name: 'Inbox' },
+  { label: 'STARRED', name: 'Starred' },
+  { label: 'SENT', name: 'Sent' },
+  { label: 'DRAFT', name: 'Drafts' },
+]
+
+/** Shown under "More". (Gmail's API has no Scheduled, Snoozed or Purchases.) */
+const MORE_FOLDERS: Folder[] = [
+  { label: 'IMPORTANT', name: 'Important' },
+  { label: 'ALL', name: 'All mail' },
+  { label: 'SPAM', name: 'Spam' },
+  { label: 'CATEGORY_SOCIAL', name: 'Social' },
+  { label: 'CATEGORY_UPDATES', name: 'Updates' },
+  { label: 'CATEGORY_FORUMS', name: 'Forums' },
+  { label: 'CATEGORY_PROMOTIONS', name: 'Promotions' },
+]
+
 /** Attachment chips shown under a message row. */
 const MAX_ROW_CHIPS = 3
 
@@ -390,9 +469,9 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
  */
 function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryEmail: string }) {
   const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
-  const [messages, { refetch: refetchMessages }] = createResource(api.listMessages)
   /** The mailbox the user picked; null (or one since disconnected) means the primary one. */
   const [mailbox, setMailbox] = createSignal<string | null>(null)
+  const [folder, setFolder] = createSignal<FolderLabel>('INBOX')
   const [openId, setOpenId] = createSignal<string | null>(null)
   const [detail] = createResource(openId, api.getMessage)
   const [importing, setImporting] = createSignal(false)
@@ -428,13 +507,38 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
     const list = orderedAccounts()
     return list.find((a) => a.id === mailbox()) ?? list[0]
   }
-  const visible = () => {
-    const id = selectedAccount()?.id
-    return id ? (messages() ?? []).filter((m) => m.account_id === id) : []
-  }
+  // The open folder of the selected mailbox, fetched from the server.
+  const [messages, { refetch: refetchMessages }] = createResource(
+    () => {
+      const id = selectedAccount()?.id
+      return id ? `${id}|${folder()}` : false
+    },
+    (key) => {
+      const [account, label] = key.split('|')
+      return api.listMessages(account, label as FolderLabel)
+    },
+  )
+  const visible = () => messages() ?? []
+  const folderName = () =>
+    [...FOLDERS, ...MORE_FOLDERS].find((f) => f.label === folder())?.name ??
+    selectedAccount()?.labels.find((l) => l.id === folder())?.name ??
+    ''
+  const countOf = (label: FolderLabel) => selectedAccount()?.folder_counts[label] ?? 0
+  /** "More" is open when asked, or when one of its folders is showing. */
+  const [moreOpen, setMoreOpen] = createSignal(false)
+  const showMore = () => moreOpen() || MORE_FOLDERS.some((f) => f.label === folder())
+  const userLabel = (id: string) => selectedAccount()?.labels.find((l) => l.id === id)
+  /** Sent mail and drafts are listed by recipient, the rest by sender. */
+  const byRecipient = () => folder() === 'SENT' || folder() === 'DRAFT'
 
   const showMailbox = (id: string | null) => {
     setMailbox(id)
+    setOpenId(null)
+    // A user label belongs to one mailbox; another one starts at its Inbox.
+    if (folder().startsWith('Label_')) setFolder('INBOX')
+  }
+  const showFolder = (label: FolderLabel) => {
+    setFolder(label)
     setOpenId(null)
   }
 
@@ -447,7 +551,7 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
       const res = await api.importMail()
       const ok = res.accounts.filter((a) => !a.error).length
       setStatus(
-        `Imported ${plural(res.imported, 'new message', 'new messages')} from ${plural(ok, 'mailbox', 'mailboxes')}.`,
+        `Imported ${plural(res.imported, 'new message', 'new messages')} from ${plural(ok, 'account', 'accounts')}.`,
       )
       setProblems(res.accounts.filter((a) => a.error).map((a) => `${a.email}: ${a.error}`))
       await Promise.all([refetchAccounts(), refetchMessages()])
@@ -493,30 +597,87 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
   return (
     <section class="inbox">
       <aside class="inbox-side">
-        <nav class="mailboxes" aria-label="Mailboxes">
-          <For each={orderedAccounts()}>
-            {(account) => (
+        <div class="side-block">
+          <h2 class="side-heading">Accounts</h2>
+          <nav class="mailboxes" aria-label="Accounts">
+            <For each={orderedAccounts()}>
+              {(account) => (
+                <button
+                  class="mailbox"
+                  classList={{ active: selectedAccount()?.id === account.id }}
+                  aria-current={selectedAccount()?.id === account.id ? 'true' : undefined}
+                  title={account.email}
+                  onClick={() => showMailbox(account.id)}
+                >
+                  <span class="mailbox-label">
+                    <span class="mailbox-name">{account.email}</span>
+                  </span>
+                  <span class="count">{account.message_count}</span>
+                </button>
+              )}
+            </For>
+            <a class="add-account" href={GMAIL_CONNECT_PATH}>
+              {accounts()?.length ? '+ Add another account' : '+ Add an account'}
+            </a>
+          </nav>
+        </div>
+        <nav class="folders" aria-label="Folders">
+          <For each={showMore() ? [...FOLDERS, ...MORE_FOLDERS] : FOLDERS}>
+            {(f) => (
               <button
-                class="mailbox"
-                classList={{ active: selectedAccount()?.id === account.id }}
-                aria-current={selectedAccount()?.id === account.id ? 'true' : undefined}
-                title={account.email}
-                onClick={() => showMailbox(account.id)}
+                class="mailbox folder"
+                classList={{ active: folder() === f.label }}
+                aria-current={folder() === f.label ? 'true' : undefined}
+                onClick={() => showFolder(f.label)}
               >
-                <span class="mailbox-label">
-                  <span class="mailbox-name">{account.email}</span>
-                  <Show when={isPrimary(account)}>
-                    <span class="primary-tag">Primary</span>
-                  </Show>
+                <span class="folder-label">
+                  <FolderIcon label={f.label} />
+                  {f.name}
                 </span>
-                <span class="count">{account.message_count}</span>
+                <Show when={countOf(f.label) > 0}>
+                  <span class="count">{countOf(f.label)}</span>
+                </Show>
               </button>
             )}
           </For>
-          <a class="add-account" href={GMAIL_CONNECT_PATH}>
-            {accounts()?.length ? '+ Add another account' : '+ Add an account'}
-          </a>
+          <button
+            class="mailbox folder more-toggle"
+            aria-expanded={showMore()}
+            onClick={() => setMoreOpen(!showMore())}
+            disabled={MORE_FOLDERS.some((f) => f.label === folder())}
+          >
+            <span class="folder-label">
+              <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d={showMore() ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'} />
+              </svg>
+              {showMore() ? 'Less' : 'More'}
+            </span>
+          </button>
         </nav>
+        <Show when={selectedAccount()?.labels.length}>
+          <h2 class="side-heading labels-heading">Labels</h2>
+          <nav class="folders labels" aria-label="Labels">
+            <For each={selectedAccount()?.labels}>
+              {(l) => (
+                <button
+                  class="mailbox folder"
+                  classList={{ active: folder() === l.id }}
+                  aria-current={folder() === l.id ? 'true' : undefined}
+                  title={l.name}
+                  onClick={() => showFolder(l.id)}
+                >
+                  <span class="folder-label">
+                    <LabelIcon color={l.color} />
+                    <span class="mailbox-name">{l.name}</span>
+                  </span>
+                  <Show when={countOf(l.id) > 0}>
+                    <span class="count">{countOf(l.id)}</span>
+                  </Show>
+                </button>
+              )}
+            </For>
+          </nav>
+        </Show>
       </aside>
 
       <div class="inbox-main">
@@ -529,7 +690,7 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                   class="ghost"
                   onClick={importAll}
                   disabled={importing() || !accounts()?.length}
-                  title="Import new mail from every connected mailbox"
+                  title="Import new mail from every connected account"
                 >
                   {importing() ? 'Importing…' : '↻ Import'}
                 </button>
@@ -586,9 +747,11 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                   when={visible().length}
                   fallback={
                     <p class="muted inbox-empty">
-                      {accounts()?.length
-                        ? 'No messages yet. Use “Import” to fetch the newest 100 from each mailbox.'
-                        : 'No mailboxes connected. Connect a Gmail account to import its newest 100 messages.'}
+                      {!accounts()?.length
+                        ? 'No accounts connected. Connect a Gmail account to import its newest 100 messages.'
+                        : selectedAccount()?.message_count
+                          ? `Nothing in ${folderName()}.`
+                          : 'No messages yet. Use “Import” to fetch the newest mail from each account.'}
                     </p>
                   }
                 >
@@ -597,16 +760,43 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                       {(m) => (
                         <li>
                           <button class="message-row" onClick={() => setOpenId(m.id)}>
-                            <span class="m-from" title={m.from}>
-                              {senderName(m.from)}
-                            </span>
+                            <Show
+                              when={byRecipient()}
+                              fallback={
+                                <span class="m-from" title={m.from}>
+                                  {senderName(m.from)}
+                                </span>
+                              }
+                            >
+                              <span class="m-from" title={m.to}>
+                                <Show when={folder() === 'DRAFT'}>
+                                  <span class="m-draft">Draft </span>
+                                </Show>
+                                To: {m.to ? senderName(m.to) : '(no recipient)'}
+                              </span>
+                            </Show>
                             <span class="m-text">
+                              <For each={m.labels.filter((l) => l !== folder() && userLabel(l))}>
+                                {(l) => (
+                                  <span
+                                    class="m-label"
+                                    style={{ 'border-color': userLabel(l)?.color ?? 'var(--border)' }}
+                                  >
+                                    {userLabel(l)?.name}
+                                  </span>
+                                )}
+                              </For>
                               <span class="m-subject">{m.subject || '(no subject)'}</span>
                               <Show when={m.snippet}>
                                 <span class="m-snippet"> - {m.snippet}</span>
                               </Show>
                             </span>
                             <span class="m-end">
+                              <Show when={m.labels.includes('STARRED')}>
+                                <span class="m-star" role="img" aria-label="Starred" title="Starred">
+                                  ★
+                                </span>
+                              </Show>
                               <Show when={m.attachments.length}>
                                 <span
                                   class="m-clip"

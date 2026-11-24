@@ -411,6 +411,10 @@ mod tests {
         message_fetches: Mutex<u32>,
         /// Attachment files by Gmail attachment ID.
         attachments: Mutex<HashMap<String, Vec<u8>>>,
+        /// `users.labels.list` entries.
+        labels: Mutex<Vec<Value>>,
+        /// How many upcoming message-list calls answer 403 rateLimitExceeded.
+        rate_limited: Mutex<u32>,
     }
 
     const FAKE_ACCESS: &str = "fake-gmail-access";
@@ -493,17 +497,47 @@ mod tests {
         if !bearer_ok(&req) {
             return HttpResponse::Unauthorized().finish();
         }
+        {
+            let mut limited = st.rate_limited.lock().unwrap();
+            if *limited > 0 {
+                *limited -= 1;
+                return HttpResponse::Forbidden().json(json!({ "error": {
+                    "code": 403,
+                    "message": "Rate Limit Exceeded",
+                    "errors": [{ "reason": "rateLimitExceeded", "domain": "usageLimits" }],
+                }}));
+            }
+        }
         let max: usize = q["maxResults"].parse().unwrap();
-        let list: Vec<Value> = st
+        let matching: Vec<Value> = st
             .messages
             .lock()
             .unwrap()
             .iter()
-            .take(max)
+            .filter(|m| {
+                let has = |label: &str| {
+                    m["labelIds"]
+                        .as_array()
+                        .is_some_and(|ls| ls.iter().any(|l| l == label))
+                };
+                match q.get("labelIds") {
+                    // Like Gmail: spam only when asked for, with includeSpamTrash.
+                    Some(label) if label == "SPAM" => {
+                        q.get("includeSpamTrash").map(String::as_str) == Some("true") && has("SPAM")
+                    }
+                    Some(label) => has(label),
+                    None => !has("SPAM"),
+                }
+            })
             .map(|m| json!({ "id": m["id"], "threadId": m["id"] }))
             .collect();
-        if list.is_empty() {
+        if matching.is_empty() {
             return HttpResponse::Ok().json(json!({ "resultSizeEstimate": 0 }));
+        }
+        let more = matching.len() > max;
+        let list: Vec<Value> = matching.into_iter().take(max).collect();
+        if more {
+            return HttpResponse::Ok().json(json!({ "messages": list, "nextPageToken": "next" }));
         }
         HttpResponse::Ok().json(json!({ "messages": list }))
     }
@@ -550,6 +584,16 @@ mod tests {
         }
     }
 
+    async fn fake_gmail_labels(
+        st: web::Data<FakeGoogle>,
+        req: actix_web::HttpRequest,
+    ) -> HttpResponse {
+        if !bearer_ok(&req) {
+            return HttpResponse::Unauthorized().finish();
+        }
+        HttpResponse::Ok().json(json!({ "labels": *st.labels.lock().unwrap() }))
+    }
+
     async fn start_fake_google(st: Arc<FakeGoogle>) -> GoogleClient {
         let data = web::Data::from(st);
         let server = HttpServer::new(move || {
@@ -560,6 +604,10 @@ mod tests {
                 .route(
                     "/gmail/v1/users/me/messages",
                     web::get().to(fake_gmail_list),
+                )
+                .route(
+                    "/gmail/v1/users/me/labels",
+                    web::get().to(fake_gmail_labels),
                 )
                 .route(
                     "/gmail/v1/users/me/messages/{id}",
@@ -1171,7 +1219,7 @@ mod tests {
         let id = list[0]["id"].as_str().unwrap().to_owned();
 
         // As if it had been imported before attachments were recorded.
-        sqlx::query("UPDATE mail_messages SET attachments_enc = NULL WHERE id = $1")
+        sqlx::query("UPDATE mail_messages SET attachments_enc = NULL, labels = NULL WHERE id = $1")
             .bind(uuid::Uuid::parse_str(&id).unwrap())
             .execute(pool.get_ref())
             .await
@@ -1180,6 +1228,11 @@ mod tests {
             json_body(test::call_service(&app, req!("GET", "/api/mail/messages", &session)).await)
                 .await;
         assert_eq!(list[0]["attachments"], json!([]));
+        assert_eq!(
+            list[0]["labels"],
+            json!(["INBOX"]),
+            "unlabelled mail reads as Inbox"
+        );
 
         let fetched = *fake.message_fetches.lock().unwrap();
         let (_, body) =
@@ -1197,6 +1250,224 @@ mod tests {
         // Once filled in, it isn't fetched again.
         test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
         assert_eq!(*fake.message_fetches.lock().unwrap(), fetched + 1);
+    }
+
+    #[actix_web::test]
+    async fn folders_follow_gmail_labels() {
+        use crate::mail::tests::gmail_message;
+        let with_labels = |id: &str, labels: &[&str]| {
+            let mut m = gmail_message(id, &format!("subject {id}"), "body");
+            m["labelIds"] = json!(labels);
+            m
+        };
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        *fake.labels.lock().unwrap() = vec![
+            json!({"id": "INBOX", "name": "INBOX", "type": "system"}),
+            json!({"id": "Label_7", "name": "Receipts", "type": "user",
+                   "color": {"backgroundColor": "#16A766", "textColor": "#ffffff"}}),
+            json!({"id": "Label_9", "name": "action needed", "type": "user"}),
+            // Not an ID Gmail gives user labels: ignored.
+            json!({"id": "../labels", "name": "evil", "type": "user"}),
+        ];
+        *fake.messages.lock().unwrap() = vec![
+            with_labels("f1", &["INBOX", "UNREAD", "CATEGORY_UPDATES"]),
+            with_labels("f2", &["INBOX", "STARRED", "IMPORTANT", "Label_7"]),
+            with_labels("f3", &["SENT"]),
+            with_labels("f4", &["DRAFT"]),
+            with_labels("f5", &["SPAM"]),
+        ];
+        test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
+
+        let ids = |list: &Value| -> Vec<String> {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["subject"].as_str().unwrap().replace("subject ", ""))
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        let folder = |label: &'static str| {
+            let app = &app;
+            let session = &session;
+            async move {
+                let uri = format!("/api/mail/messages?label={label}");
+                let (status, list) =
+                    json_body(test::call_service(app, req!("GET", &uri, session)).await).await;
+                assert_eq!(status, 200, "{label}");
+                list
+            }
+        };
+        assert_eq!(ids(&folder("INBOX").await), ["f1", "f2"]);
+        assert_eq!(ids(&folder("STARRED").await), ["f2"]);
+        assert_eq!(ids(&folder("SENT").await), ["f3"]);
+        assert_eq!(ids(&folder("DRAFT").await), ["f4"]);
+        assert_eq!(ids(&folder("SPAM").await), ["f5"]);
+        assert_eq!(ids(&folder("IMPORTANT").await), ["f2"]);
+        assert_eq!(ids(&folder("CATEGORY_UPDATES").await), ["f1"]);
+        assert_eq!(ids(&folder("Label_7").await), ["f2"]);
+        assert_eq!(
+            ids(&folder("ALL").await),
+            ["f1", "f2", "f3", "f4"],
+            "all but spam"
+        );
+        // Only the labels Hadal shows are kept (not UNREAD).
+        assert_eq!(
+            folder("STARRED").await[0]["labels"],
+            json!(["INBOX", "STARRED", "IMPORTANT", "Label_7"])
+        );
+
+        let (_, accounts) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/accounts", &session)).await)
+                .await;
+        let a = &accounts[0];
+        assert_eq!(a["message_count"], 5);
+        let counts = &a["folder_counts"];
+        for (label, n) in [
+            ("INBOX", 2),
+            ("STARRED", 1),
+            ("SENT", 1),
+            ("DRAFT", 1),
+            ("SPAM", 1),
+            ("ALL", 4),
+            ("Label_7", 1),
+        ] {
+            assert_eq!(counts[label], n, "{label}");
+        }
+        assert_eq!(
+            a["labels"],
+            json!([
+                { "id": "Label_9", "name": "action needed", "color": null },
+                { "id": "Label_7", "name": "Receipts", "color": "#16a766" },
+            ])
+        );
+        // CASA 6.7.1: label names are encrypted at rest.
+        let sealed: Vec<Vec<u8>> = sqlx::query_scalar("SELECT name_enc FROM mail_labels")
+            .fetch_all(pool.get_ref())
+            .await
+            .unwrap();
+        assert!(
+            sealed
+                .iter()
+                .all(|n| !n.windows(8).any(|w| w == b"Receipts"))
+        );
+        let account_id = a["id"].as_str().unwrap().to_owned();
+        let uri = format!("/api/mail/messages?account={account_id}&label=INBOX");
+        let (_, list) =
+            json_body(test::call_service(&app, req!("GET", &uri, &session)).await).await;
+        assert_eq!(ids(&list), ["f1", "f2"]);
+        // A mailbox id that isn't the caller's matches nothing.
+        let uri = format!("/api/mail/messages?account={}", uuid::Uuid::new_v4());
+        let (status, list) =
+            json_body(test::call_service(&app, req!("GET", &uri, &session)).await).await;
+        assert_eq!((status, list), (200, json!([])));
+        // Only known labels, and no other parameters (CASA 3.1.2).
+        for uri in [
+            "/api/mail/messages?label=TRASH",
+            "/api/mail/messages?label=UNREAD",
+            "/api/mail/messages?label=inbox",
+            "/api/mail/messages?label=Label_",
+            "/api/mail/messages?label=Label_..%2Fx",
+            "/api/mail/messages?folder=INBOX",
+            "/api/mail/messages?account=not-a-uuid",
+        ] {
+            let resp = test::call_service(&app, req!("GET", uri, &session)).await;
+            assert_eq!(resp.status(), 400, "{uri}");
+        }
+
+        // Starred, unstarred and relabelled in Gmail, and a label deleted
+        // there: the next import catches up without fetching those messages
+        // again.
+        {
+            let mut msgs = fake.messages.lock().unwrap();
+            msgs[0]["labelIds"] = json!(["INBOX", "STARRED", "Label_9"]);
+            msgs[1]["labelIds"] = json!(["INBOX"]);
+        }
+        fake.labels.lock().unwrap().remove(1);
+        let fetched = *fake.message_fetches.lock().unwrap();
+        test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
+        assert_eq!(*fake.message_fetches.lock().unwrap(), fetched);
+        assert_eq!(ids(&folder("STARRED").await), ["f1"]);
+        assert_eq!(ids(&folder("INBOX").await), ["f1", "f2"]);
+        assert_eq!(ids(&folder("Label_9").await), ["f1"]);
+        let (_, accounts) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/accounts", &session)).await)
+                .await;
+        assert_eq!(
+            accounts[0]["labels"],
+            json!([{ "id": "Label_9", "name": "action needed", "color": null }])
+        );
+    }
+
+    #[actix_web::test]
+    async fn labelled_mail_is_imported_even_when_older_than_the_newest() {
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        *fake.labels.lock().unwrap() =
+            vec![json!({"id": "Label_5", "name": "newsletters", "type": "user"})];
+        // 100 newer Inbox messages, then an older one only in the label.
+        let mut msgs: Vec<Value> = (0..100)
+            .map(|i| gmail_message(&format!("n{i}"), "news", "body"))
+            .collect();
+        let mut old = gmail_message("old1", "Weekly digest", "body");
+        old["labelIds"] = json!(["Label_5"]);
+        msgs.push(old);
+        *fake.messages.lock().unwrap() = msgs;
+
+        test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
+        let (_, list) = json_body(
+            test::call_service(
+                &app,
+                req!("GET", "/api/mail/messages?label=Label_5", &session),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["subject"], "Weekly digest");
+    }
+
+    #[actix_web::test]
+    async fn gmail_rate_limits_are_retried_then_reported_plainly() {
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        *fake.messages.lock().unwrap() = vec![gmail_message("r1", "Hello", "body")];
+
+        // Two refusals: each call is retried twice, so the import still works.
+        *fake.rate_limited.lock().unwrap() = 2;
+        let (_, body) =
+            json_body(test::call_service(&app, req!("POST", "/api/mail/import", &session)).await)
+                .await;
+        assert_eq!(body["accounts"][0]["error"], Value::Null, "{body}");
+        assert_eq!(body["imported"], 1);
+
+        // Still refused after the retries: a plain, fixed message.
+        *fake.rate_limited.lock().unwrap() = 3;
+        let (_, body) =
+            json_body(test::call_service(&app, req!("POST", "/api/mail/import", &session)).await)
+                .await;
+        assert_eq!(
+            body["accounts"][0]["error"],
+            "Gmail is limiting requests right now. Wait a minute, then import again."
+        );
     }
 
     #[actix_web::test]

@@ -89,17 +89,61 @@ impl Grant {
 #[derive(Debug)]
 pub enum GoogleApiError {
     Unreachable(String),
-    Status(u16),
+    /// A failure status, with Google's machine-readable reason when it gave
+    /// one (such as `rateLimitExceeded`): a short code, never a token.
+    Status(u16, Option<String>),
     /// The user revoked our access, or the grant expired: relink needed.
     Revoked,
     Malformed,
 }
 
+impl GoogleApiError {
+    /// Gmail asked us to slow down: 429, or 403 with a rate-limit reason.
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            GoogleApiError::Status(429, _) => true,
+            GoogleApiError::Status(403, Some(reason)) => reason.contains("ateLimitExceeded"),
+            _ => false,
+        }
+    }
+}
+
+/// Google's error reason from an error response body (`error.errors[0].reason`,
+/// else `error.status`), reduced to a short alphanumeric code. Reads at most
+/// 4 KiB. Anything unexpected gives `None`.
+async fn error_reason(resp: reqwest::Response) -> Option<String> {
+    let json = read_json(resp, 4 * 1024).await.ok()?;
+    let err = json.get("error")?;
+    let reason = err
+        .get("errors")
+        .and_then(Value::as_array)
+        .and_then(|e| e.first())
+        .and_then(|e| e.get("reason"))
+        .or_else(|| err.get("status"))?
+        .as_str()?;
+    let reason: String = reason
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(64)
+        .collect();
+    (!reason.is_empty()).then_some(reason)
+}
+
+/// Waits before each retry of a rate-limited Gmail call.
+#[cfg(not(test))]
+const RATE_LIMIT_BACKOFF: [Duration; 2] =
+    [Duration::from_millis(1000), Duration::from_millis(2500)];
+#[cfg(test)]
+const RATE_LIMIT_BACKOFF: [Duration; 2] = [Duration::from_millis(5), Duration::from_millis(10)];
+
 impl std::fmt::Display for GoogleApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GoogleApiError::Unreachable(e) => write!(f, "Google unreachable: {e}"),
-            GoogleApiError::Status(s) => write!(f, "Google returned HTTP {s}"),
+            GoogleApiError::Status(s, Some(reason)) => {
+                write!(f, "Google returned HTTP {s} ({reason})")
+            }
+            GoogleApiError::Status(s, None) => write!(f, "Google returned HTTP {s}"),
             GoogleApiError::Revoked => f.write_str("Google access was revoked or expired"),
             GoogleApiError::Malformed => f.write_str("malformed Google response"),
         }
@@ -165,6 +209,33 @@ pub fn valid_attachment_id(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
+
+/// A Gmail label ID as it may appear in a list filter: system labels are
+/// upper-case words, user labels look like `Label_12`. Nothing else.
+pub fn valid_label_id(id: &str) -> bool {
+    (1..=80).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A label the user made in Gmail (not a system label).
+pub fn valid_user_label_id(id: &str) -> bool {
+    id.strip_prefix("Label_")
+        .is_some_and(|rest| (1..=64).contains(&rest.len()) && valid_label_id(rest))
+}
+
+/// One of the user's own Gmail labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserLabel {
+    pub id: String,
+    pub name: String,
+    /// `#rrggbb`, lower-case, if Gmail gives the label a colour.
+    pub color: Option<String>,
+}
+
+/// Most characters of a label name we keep (Gmail allows 225).
+const MAX_LABEL_NAME_CHARS: usize = 225;
 
 /// Cleans an optional name claim. A missing, non-string or blank value is
 /// `None`; control characters are dropped and long names are cut to fit the
@@ -390,7 +461,10 @@ impl GoogleClient {
             return Err(GoogleApiError::Revoked);
         }
         if !status.is_success() {
-            return Err(GoogleApiError::Status(status.as_u16()));
+            return Err(GoogleApiError::Status(
+                status.as_u16(),
+                error_reason(resp).await,
+            ));
         }
         let json = read_json(resp, MAX_RESPONSE_BYTES).await?;
         json.get("access_token")
@@ -409,7 +483,8 @@ impl GoogleClient {
         self.gmail_get_within(url, access, max, None).await
     }
 
-    /// `gmail_get` with a longer timeout than the client's default.
+    /// `gmail_get` with a longer timeout than the client's default. When
+    /// Gmail rate-limits the call, it is retried after a short wait, twice.
     async fn gmail_get_within(
         &self,
         url: Url,
@@ -417,46 +492,121 @@ impl GoogleClient {
         max: usize,
         timeout: Option<Duration>,
     ) -> Result<Value, GoogleApiError> {
-        let mut req = self.http.get(url).bearer_auth(access.expose());
-        if let Some(t) = timeout {
-            req = req.timeout(t);
+        let mut waits = RATE_LIMIT_BACKOFF.iter();
+        loop {
+            let mut req = self.http.get(url.clone()).bearer_auth(access.expose());
+            if let Some(t) = timeout {
+                req = req.timeout(t);
+            }
+            let resp = req.send().await.map_err(unreachable)?;
+            let status = resp.status();
+            if status.as_u16() == 401 {
+                return Err(GoogleApiError::Revoked);
+            }
+            if status.is_success() {
+                return Ok(read_json(resp, max).await?);
+            }
+            let err = GoogleApiError::Status(status.as_u16(), error_reason(resp).await);
+            match waits.next() {
+                Some(wait) if err.is_rate_limited() => tokio::time::sleep(*wait).await,
+                _ => return Err(err),
+            }
         }
-        let resp = req.send().await.map_err(unreachable)?;
-        let status = resp.status();
-        if status.as_u16() == 401 {
-            return Err(GoogleApiError::Revoked);
-        }
-        if !status.is_success() {
-            return Err(GoogleApiError::Status(status.as_u16()));
-        }
-        Ok(read_json(resp, max).await?)
     }
 
     /// IDs of the newest `max` messages in the mailbox (Gmail excludes spam
-    /// and trash by default).
+    /// and trash by default), or only those carrying `label`. The label is
+    /// one of our constants or a user label ID Gmail gave us, never request
+    /// input, and is checked again here. The flag says whether the list is
+    /// complete (Gmail has no further page).
     pub async fn list_message_ids(
         &self,
         access: &Secret,
         max: u32,
-    ) -> Result<Vec<String>, GoogleApiError> {
+        label: Option<&str>,
+    ) -> Result<(Vec<String>, bool), GoogleApiError> {
         let mut url = self
             .gmail_api
             .join("messages")
             .map_err(|_| GoogleApiError::Malformed)?;
         url.query_pairs_mut()
             .append_pair("maxResults", &max.clamp(1, MAX_LIST_RESULTS).to_string());
+        if let Some(label) = label {
+            if !valid_label_id(label) {
+                return Err(GoogleApiError::Malformed);
+            }
+            url.query_pairs_mut().append_pair("labelIds", label);
+            if label == "SPAM" {
+                url.query_pairs_mut()
+                    .append_pair("includeSpamTrash", "true");
+            }
+        }
         let json = self.gmail_get(url, access, MAX_RESPONSE_BYTES).await?;
+        let complete = json.get("nextPageToken").is_none();
         let Some(list) = json.get("messages") else {
-            // An empty mailbox has no `messages` key at all.
-            return Ok(Vec::new());
+            // An empty mailbox or label has no `messages` key at all.
+            return Ok((Vec::new(), complete));
         };
         let list = list.as_array().ok_or(GoogleApiError::Malformed)?;
-        Ok(list
+        let ids = list
             .iter()
             .filter_map(|m| m.get("id").and_then(Value::as_str))
             .filter(|id| valid_gmail_id(id))
             .take(max as usize)
             .map(str::to_owned)
+            .collect();
+        Ok((ids, complete))
+    }
+
+    /// The user's own labels (Gmail's system labels are left out), at most
+    /// `max`, with cleaned names and validated colours.
+    pub async fn list_user_labels(
+        &self,
+        access: &Secret,
+        max: usize,
+    ) -> Result<Vec<UserLabel>, GoogleApiError> {
+        let url = self
+            .gmail_api
+            .join("labels")
+            .map_err(|_| GoogleApiError::Malformed)?;
+        let json = self.gmail_get(url, access, MAX_RESPONSE_BYTES).await?;
+        let Some(list) = json.get("labels") else {
+            return Ok(Vec::new());
+        };
+        let list = list.as_array().ok_or(GoogleApiError::Malformed)?;
+        Ok(list
+            .iter()
+            .filter(|l| l.get("type").and_then(Value::as_str) == Some("user"))
+            .filter_map(|l| {
+                let id = l.get("id")?.as_str().filter(|id| valid_user_label_id(id))?;
+                let name: String = l
+                    .get("name")?
+                    .as_str()?
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(MAX_LABEL_NAME_CHARS)
+                    .collect();
+                let name = name.trim().to_owned();
+                if name.is_empty() {
+                    return None;
+                }
+                let color = l
+                    .get("color")
+                    .and_then(|c| c.get("backgroundColor"))
+                    .and_then(Value::as_str)
+                    .map(str::to_ascii_lowercase)
+                    .filter(|c| {
+                        c.len() == 7
+                            && c.starts_with('#')
+                            && c[1..].bytes().all(|b| b.is_ascii_hexdigit())
+                    });
+                Some(UserLabel {
+                    id: id.to_owned(),
+                    name,
+                    color,
+                })
+            })
+            .take(max)
             .collect())
     }
 
@@ -527,7 +677,7 @@ impl GoogleClient {
         if status.is_success() || status.as_u16() == 400 {
             Ok(())
         } else {
-            Err(GoogleApiError::Status(status.as_u16()))
+            Err(GoogleApiError::Status(status.as_u16(), None))
         }
     }
 }
@@ -780,6 +930,25 @@ pub(crate) mod tests {
         for bad in ["", "../../labels", "a/b", "a?b", "a%2Fb", &"a".repeat(65)] {
             assert!(!valid_gmail_id(bad), "accepted {bad:?}");
         }
+        // Label IDs go into the list query; user labels look like Label_12.
+        for good in ["INBOX", "CATEGORY_UPDATES", "Label_12"] {
+            assert!(valid_label_id(good), "{good}");
+        }
+        assert!(valid_user_label_id("Label_12") && !valid_user_label_id("INBOX"));
+        for bad in [
+            "",
+            "Label_",
+            "Label_../x",
+            "Label_1&x=y",
+            "a b",
+            &"a".repeat(81),
+        ] {
+            assert!(
+                !valid_label_id(bad) || !valid_user_label_id(bad),
+                "accepted {bad:?}"
+            );
+        }
+        assert!(!valid_label_id("Label_1&x=y") && !valid_label_id("../x"));
         // Attachment IDs are long base64url; still nothing that changes the path.
         assert!(valid_attachment_id("ANGjdJ8w-x_Yz09"));
         for bad in [

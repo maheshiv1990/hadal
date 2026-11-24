@@ -27,7 +27,8 @@ use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::auth::google::{
-    GoogleApiError, GoogleClient, Identity, valid_attachment_id, valid_gmail_id,
+    GoogleApiError, GoogleClient, Identity, UserLabel, valid_attachment_id, valid_gmail_id,
+    valid_user_label_id,
 };
 use crate::config::Secret;
 use crate::crypto::DataCipher;
@@ -48,6 +49,73 @@ const MAX_BODY_CHARS: usize = 200_000;
 const MAX_SUBJECT_CHARS: usize = 1_000;
 const MAX_ADDRESS_CHARS: usize = 2_000;
 const MAX_SNIPPET_CHARS: usize = 500;
+/// The Gmail system labels Hadal shows as folders. (Scheduled, Snoozed and
+/// Purchases aren't available through the Gmail API.)
+pub const SYSTEM_LABELS: [&str; 10] = [
+    "INBOX",
+    "STARRED",
+    "SENT",
+    "DRAFT",
+    "IMPORTANT",
+    "SPAM",
+    "CATEGORY_SOCIAL",
+    "CATEGORY_UPDATES",
+    "CATEGORY_FORUMS",
+    "CATEGORY_PROMOTIONS",
+];
+
+/// The system label lists each import reads: how many of the newest it
+/// lists (to refresh labels on mail we have), and how many of those it
+/// imports if we don't have them yet. The categories and Important are
+/// mostly Inbox mail, so they only refresh.
+const IMPORT_LISTS: [(&str, u32, usize); 10] = [
+    ("INBOX", 100, 100),
+    ("STARRED", 50, 50),
+    ("SENT", 50, 50),
+    ("DRAFT", 25, 25),
+    ("SPAM", 25, 25),
+    ("IMPORTANT", 100, 0),
+    ("CATEGORY_SOCIAL", 100, 0),
+    ("CATEGORY_UPDATES", 100, 0),
+    ("CATEGORY_FORUMS", 100, 0),
+    ("CATEGORY_PROMOTIONS", 100, 0),
+];
+/// Most of a mailbox's own labels kept, and how many of them are read on
+/// each import: their newest messages are listed to refresh labels, and the
+/// newest few imported so every label in the menu has mail. Labels past
+/// these keep what Gmail said when each message was imported.
+const MAX_USER_LABELS: usize = 100;
+const REFRESHED_USER_LABELS: usize = 20;
+const USER_LABEL_LIST: u32 = 100;
+const USER_LABEL_IMPORT: usize = 25;
+
+/// Whether a Gmail label ID is one Hadal keeps on a message.
+fn kept_label(id: &str) -> bool {
+    SYSTEM_LABELS.contains(&id) || valid_user_label_id(id)
+}
+
+/// What the message list is filtered to: every message except spam, or one
+/// label (a system folder or one of the user's labels).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelFilter {
+    AllMail,
+    Label(String),
+}
+
+impl LabelFilter {
+    /// `ALL`, one of `SYSTEM_LABELS`, or a user label ID. Anything else is
+    /// refused.
+    pub fn parse(raw: &str) -> Option<Self> {
+        if raw == "ALL" {
+            Some(LabelFilter::AllMail)
+        } else if kept_label(raw) {
+            Some(LabelFilter::Label(raw.to_owned()))
+        } else {
+            None
+        }
+    }
+}
+
 /// Most attachments recorded for one message.
 const MAX_ATTACHMENTS: usize = 50;
 const MAX_FILENAME_CHARS: usize = 255;
@@ -126,7 +194,7 @@ pub async fn store_account(
     Ok(Stored::Linked)
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize)]
 pub struct Account {
     id: Uuid,
     email: String,
@@ -135,20 +203,95 @@ pub struct Account {
     #[serde(with = "time::serde::rfc3339::option")]
     last_import_at: Option<OffsetDateTime>,
     message_count: i64,
+    /// Messages per label ID, plus `ALL` (everything but spam). Mail imported
+    /// before labels were recorded counts as Inbox until the next import.
+    folder_counts: HashMap<String, i64>,
+    /// The mailbox's own Gmail labels, by name.
+    labels: Vec<LabelInfo>,
 }
 
-pub async fn list_accounts(pool: &PgPool, owner: Uuid) -> Result<Vec<Account>, AppError> {
-    Ok(sqlx::query_as::<_, Account>(
-        "SELECT a.id, a.email, a.created_at, a.last_import_at,
-                (SELECT count(*) FROM mail_messages m
-                  WHERE m.owner_id = $1 AND m.account_id = a.id) AS message_count
+#[derive(Serialize, Debug)]
+pub struct LabelInfo {
+    id: String,
+    name: String,
+    color: Option<String>,
+}
+
+fn label_aad(owner: Uuid, account: Uuid, label_id: &str) -> Vec<u8> {
+    let mut aad = b"mail_labels.name\0".to_vec();
+    aad.extend_from_slice(owner.as_bytes());
+    aad.extend_from_slice(account.as_bytes());
+    aad.extend_from_slice(label_id.as_bytes());
+    aad
+}
+
+pub async fn list_accounts(
+    pool: &PgPool,
+    cipher: &DataCipher,
+    owner: Uuid,
+) -> Result<Vec<Account>, AppError> {
+    let rows: Vec<(Uuid, String, OffsetDateTime, Option<OffsetDateTime>, i64)> = sqlx::query_as(
+        "SELECT a.id, a.email, a.created_at, a.last_import_at, count(m.id)
            FROM mail_accounts a
+           LEFT JOIN mail_messages m ON m.account_id = a.id AND m.owner_id = $1
           WHERE a.owner_id = $1
+          GROUP BY a.id
           ORDER BY a.created_at",
     )
     .bind(owner)
     .fetch_all(pool)
-    .await?)
+    .await?;
+    let counts: Vec<(Uuid, String, i64)> = sqlx::query_as(
+        "SELECT m.account_id, l, count(*)
+           FROM mail_messages m
+          CROSS JOIN LATERAL unnest(coalesce(m.labels, ARRAY['INBOX']::text[])) AS l
+          WHERE m.owner_id = $1
+          GROUP BY m.account_id, l",
+    )
+    .bind(owner)
+    .fetch_all(pool)
+    .await?;
+    let labels: Vec<(Uuid, String, Vec<u8>, Option<String>)> = sqlx::query_as(
+        "SELECT account_id, gmail_label_id, name_enc, color FROM mail_labels
+          WHERE owner_id = $1",
+    )
+    .bind(owner)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|(id, email, created_at, last_import_at, message_count)| {
+            let mut folder_counts: HashMap<String, i64> = counts
+                .iter()
+                .filter(|c| c.0 == id)
+                .map(|c| (c.1.clone(), c.2))
+                .collect();
+            let spam = folder_counts.get("SPAM").copied().unwrap_or(0);
+            folder_counts.insert("ALL".to_owned(), message_count - spam);
+            let mut mine = labels
+                .iter()
+                .filter(|l| l.0 == id)
+                .map(|(_, label_id, sealed, color)| {
+                    let name = cipher.decrypt(sealed, &label_aad(owner, id, label_id))?;
+                    Ok(LabelInfo {
+                        id: label_id.clone(),
+                        name: String::from_utf8_lossy(&name).into_owned(),
+                        color: color.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, AppError>>()?;
+            mine.sort_by_key(|l| l.name.to_lowercase());
+            Ok(Account {
+                id,
+                email,
+                created_at,
+                last_import_at,
+                message_count,
+                folder_counts,
+                labels: mine,
+            })
+        })
+        .collect()
 }
 
 /// Unlinks a mailbox and deletes its messages. Returns its refresh token so
@@ -243,6 +386,8 @@ pub struct MessageItem {
     #[serde(flatten)]
     summary: Summary,
     attachments: Vec<AttachmentInfo>,
+    /// Folder labels (INBOX, STARRED, SENT, DRAFT) the message is in.
+    labels: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -291,7 +436,15 @@ fn seal_attachments(
     cipher.encrypt(&plain, &message_aad("attachments", owner, id))
 }
 
-type ItemRow = (Uuid, Uuid, String, OffsetDateTime, Vec<u8>, Option<Vec<u8>>);
+type ItemRow = (
+    Uuid,
+    Uuid,
+    String,
+    OffsetDateTime,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    Option<Vec<String>>,
+);
 type DetailRow = (
     Uuid,
     String,
@@ -299,29 +452,54 @@ type DetailRow = (
     Vec<u8>,
     Vec<u8>,
     Option<Vec<u8>>,
+    Option<Vec<String>>,
 );
 
+/// Labels as stored; NULL (imported before labels were recorded) reads as Inbox.
+fn stored_labels(labels: Option<Vec<String>>) -> Vec<String> {
+    labels.unwrap_or_else(|| vec!["INBOX".to_owned()])
+}
+
 /// Newest imported messages across all of the user's mailboxes.
+///
+/// Optionally only one of the user's mailboxes, and only one folder. An
+/// `account` that isn't the caller's simply matches nothing.
 pub async fn list_messages(
     pool: &PgPool,
     cipher: &DataCipher,
     owner: Uuid,
+    account: Option<Uuid>,
+    filter: Option<LabelFilter>,
 ) -> Result<Vec<MessageItem>, AppError> {
+    let (label, all_mail) = match filter {
+        None => (None, false),
+        Some(LabelFilter::AllMail) => (None, true),
+        Some(LabelFilter::Label(l)) => (Some(l), false),
+    };
     let rows: Vec<ItemRow> = sqlx::query_as(
-        "SELECT m.id, m.account_id, a.email, m.received_at, m.summary_enc, m.attachments_enc
+        "SELECT m.id, m.account_id, a.email, m.received_at, m.summary_enc, m.attachments_enc,
+                m.labels
            FROM mail_messages m
            JOIN mail_accounts a ON a.id = m.account_id AND a.owner_id = m.owner_id
           WHERE m.owner_id = $1
+            AND ($3::uuid IS NULL OR m.account_id = $3)
+            AND ($4::text IS NULL
+                 OR $4 = ANY(m.labels)
+                 OR (m.labels IS NULL AND $4 = 'INBOX'))
+            AND (NOT $5 OR NOT ('SPAM' = ANY(coalesce(m.labels, '{}'))))
           ORDER BY m.received_at DESC
           LIMIT $2",
     )
     .bind(owner)
     .bind(LIST_LIMIT)
+    .bind(account)
+    .bind(label)
+    .bind(all_mail)
     .fetch_all(pool)
     .await?;
     rows.into_iter()
         .map(
-            |(id, account_id, account_email, received_at, sealed, attachments)| {
+            |(id, account_id, account_email, received_at, sealed, attachments, labels)| {
                 Ok(MessageItem {
                     id,
                     account_id,
@@ -334,6 +512,7 @@ pub async fn list_messages(
                         id,
                         attachments.as_deref(),
                     )?),
+                    labels: stored_labels(labels),
                 })
             },
         )
@@ -349,7 +528,7 @@ pub async fn get_message(
 ) -> Result<Option<MessageDetail>, AppError> {
     let row: Option<DetailRow> = sqlx::query_as(
         "SELECT m.account_id, a.email, m.received_at, m.summary_enc, m.body_enc,
-                m.attachments_enc
+                m.attachments_enc, m.labels
            FROM mail_messages m
            JOIN mail_accounts a ON a.id = m.account_id AND a.owner_id = m.owner_id
           WHERE m.id = $1 AND m.owner_id = $2",
@@ -358,7 +537,8 @@ pub async fn get_message(
     .bind(owner)
     .fetch_optional(pool)
     .await?;
-    let Some((account_id, account_email, received_at, summary, body, attachments)) = row else {
+    let Some((account_id, account_email, received_at, summary, body, attachments, labels)) = row
+    else {
         return Ok(None);
     };
     let body = cipher.decrypt(&body, &message_aad("body", owner, id))?;
@@ -375,6 +555,7 @@ pub async fn get_message(
                 id,
                 attachments.as_deref(),
             )?),
+            labels: stored_labels(labels),
         },
         body: String::from_utf8_lossy(&body).into_owned(),
     }))
@@ -429,6 +610,9 @@ pub async fn download_attachment(
             GoogleApiError::Revoked => {
                 AppError::Upstream("Google access was revoked or expired. Reconnect this mailbox.")
             }
+            ref e if e.is_rate_limited() => AppError::Upstream(
+                "Gmail is limiting requests right now. Wait a minute and try again.",
+            ),
             _ => AppError::Upstream("Could not get this attachment from Gmail. Try again."),
         }
     };
@@ -490,6 +674,9 @@ impl ImportFailure {
         match self {
             ImportFailure::Google(GoogleApiError::Revoked) => {
                 "Google access was revoked or expired. Reconnect this mailbox."
+            }
+            ImportFailure::Google(e) if e.is_rate_limited() => {
+                "Gmail is limiting requests right now. Wait a minute, then import again."
             }
             ImportFailure::Google(_) => "Could not reach Gmail. Try again.",
             ImportFailure::App(_) => "Import failed. Try again.",
@@ -639,12 +826,40 @@ async fn import_account(
 ) -> Result<(), ImportFailure> {
     let refresh = open_token(cipher, owner, &account.google_sub, &account.sealed_token)?;
     let access = google.refresh_access_token(&refresh).await?;
-    let ids = google.list_message_ids(&access, IMPORT_PER_MAILBOX).await?;
+    let user_labels = google.list_user_labels(&access, MAX_USER_LABELS).await?;
+    store_labels(pool, cipher, owner, account.id, &user_labels).await?;
 
-    // Already stored: skipped, unless stored before attachments were
-    // recorded, in which case it is fetched again to fill them in.
+    // The newest mail overall, plus the newest of each folder, so sent mail,
+    // drafts and spam show up even when they aren't among the newest overall.
+    // Category, Important and user-label lists only refresh labels.
+    let (mut ids, _) = google
+        .list_message_ids(&access, IMPORT_PER_MAILBOX, None)
+        .await?;
+    let lists = IMPORT_LISTS
+        .iter()
+        .map(|&(label, max, import)| (label.to_owned(), max, import))
+        .chain(
+            user_labels
+                .iter()
+                .take(REFRESHED_USER_LABELS)
+                .map(|l| (l.id.clone(), USER_LABEL_LIST, USER_LABEL_IMPORT)),
+        );
+    let mut folder_lists = Vec::new();
+    for (label, max, import) in lists {
+        let (listed, complete) = google.list_message_ids(&access, max, Some(&label)).await?;
+        for id in listed.iter().take(import) {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        folder_lists.push((label, listed, complete));
+    }
+
+    // Already stored: skipped, unless stored before attachments or labels
+    // were recorded, in which case it is fetched again to fill them in.
     let known: Vec<(String, Uuid, bool)> = sqlx::query_as(
-        "SELECT gmail_id, id, attachments_enc IS NOT NULL FROM mail_messages
+        "SELECT gmail_id, id, attachments_enc IS NOT NULL AND labels IS NOT NULL
+           FROM mail_messages
           WHERE owner_id = $1 AND account_id = $2 AND gmail_id = ANY($3)",
     )
     .bind(owner)
@@ -693,11 +908,102 @@ async fn import_account(
             continue;
         };
         if let Some(&existing) = backfill.get(&parsed.gmail_id) {
-            fill_attachments(pool, cipher, owner, existing, &parsed.attachments).await?;
+            fill_details(pool, cipher, owner, existing, &parsed).await?;
         } else if store_message(pool, cipher, owner, account.id, &parsed).await? {
             imported.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    // Starring, sending or archiving in Gmail changes labels on mail we
+    // already have: bring those up to date from the folder lists.
+    for (label, listed, complete) in folder_lists {
+        refresh_label(pool, owner, account.id, &label, &listed, complete).await?;
+    }
+    Ok(())
+}
+
+/// Stores the mailbox's own labels as Gmail has them now: names encrypted,
+/// labels deleted in Gmail removed here too.
+async fn store_labels(
+    pool: &PgPool,
+    cipher: &DataCipher,
+    owner: Uuid,
+    account_id: Uuid,
+    labels: &[UserLabel],
+) -> Result<(), AppError> {
+    let ids: Vec<&str> = labels.iter().map(|l| l.id.as_str()).collect();
+    sqlx::query(
+        "DELETE FROM mail_labels
+          WHERE owner_id = $1 AND account_id = $2 AND NOT (gmail_label_id = ANY($3))",
+    )
+    .bind(owner)
+    .bind(account_id)
+    .bind(&ids)
+    .execute(pool)
+    .await?;
+    for label in labels {
+        let sealed = cipher.encrypt(
+            label.name.as_bytes(),
+            &label_aad(owner, account_id, &label.id),
+        )?;
+        sqlx::query(
+            "INSERT INTO mail_labels (account_id, owner_id, gmail_label_id, name_enc, color)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (account_id, gmail_label_id) DO UPDATE SET
+                 name_enc = EXCLUDED.name_enc,
+                 color = EXCLUDED.color
+             WHERE mail_labels.owner_id = EXCLUDED.owner_id",
+        )
+        .bind(account_id)
+        .bind(owner)
+        .bind(&label.id)
+        .bind(sealed)
+        .bind(&label.color)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Adds `label` to stored messages Gmail listed in it, and removes
+/// it from stored messages Gmail did not list. Gmail lists newest first, so
+/// a message newer than the oldest listed one that we hold is known not to
+/// be in the folder; if the list was complete, every unlisted one is.
+async fn refresh_label(
+    pool: &PgPool,
+    owner: Uuid,
+    account_id: Uuid,
+    label: &str,
+    listed: &[String],
+    complete: bool,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE mail_messages SET labels = array_append(labels, $4)
+          WHERE owner_id = $1 AND account_id = $2 AND gmail_id = ANY($3)
+            AND labels IS NOT NULL AND NOT ($4 = ANY(labels))",
+    )
+    .bind(owner)
+    .bind(account_id)
+    .bind(listed)
+    .bind(label)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE mail_messages SET labels = array_remove(labels, $4)
+          WHERE owner_id = $1 AND account_id = $2
+            AND labels IS NOT NULL AND $4 = ANY(labels)
+            AND NOT (gmail_id = ANY($3))
+            AND ($5 OR received_at > (
+                SELECT min(received_at) FROM mail_messages
+                 WHERE owner_id = $1 AND account_id = $2 AND gmail_id = ANY($3)))",
+    )
+    .bind(owner)
+    .bind(account_id)
+    .bind(listed)
+    .bind(label)
+    .bind(complete)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -718,8 +1024,8 @@ async fn store_message(
     let result = sqlx::query(
         "INSERT INTO mail_messages
              (id, owner_id, account_id, gmail_id, received_at, summary_enc, body_enc,
-              attachments_enc)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+              attachments_enc, labels)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          ON CONFLICT (account_id, gmail_id) DO NOTHING",
     )
     .bind(id)
@@ -730,28 +1036,32 @@ async fn store_message(
     .bind(summary)
     .bind(body)
     .bind(attachments)
+    .bind(&msg.labels)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
 }
 
-/// Records the attachments of a message imported before they were recorded.
-/// Sealed under the existing row's ID, which the ciphertext is bound to.
-async fn fill_attachments(
+/// Records the attachments and labels of a message imported before they
+/// were recorded. Sealed under the existing row's ID, which the ciphertext is
+/// bound to.
+async fn fill_details(
     pool: &PgPool,
     cipher: &DataCipher,
     owner: Uuid,
     id: Uuid,
-    attachments: &[StoredAttachment],
+    msg: &Parsed,
 ) -> Result<(), AppError> {
-    let sealed = seal_attachments(cipher, owner, id, attachments)?;
+    let sealed = seal_attachments(cipher, owner, id, &msg.attachments)?;
     sqlx::query(
-        "UPDATE mail_messages SET attachments_enc = $3
-          WHERE id = $1 AND owner_id = $2 AND attachments_enc IS NULL",
+        "UPDATE mail_messages SET attachments_enc = $3, labels = $4
+          WHERE id = $1 AND owner_id = $2
+            AND (attachments_enc IS NULL OR labels IS NULL)",
     )
     .bind(id)
     .bind(owner)
     .bind(sealed)
+    .bind(&msg.labels)
     .execute(pool)
     .await?;
     Ok(())
@@ -766,6 +1076,8 @@ pub struct Parsed {
     pub summary: Summary,
     pub body: String,
     pub attachments: Vec<StoredAttachment>,
+    /// Which of our folders' labels the message carries.
+    pub labels: Vec<String>,
 }
 
 /// Reads a `format=full` Gmail message. `None` if it is malformed.
@@ -815,6 +1127,19 @@ pub fn parse_message(msg: &Value) -> Option<Parsed> {
         summary,
         body: cap_body(body),
         attachments,
+        labels: msg
+            .get("labelIds")
+            .and_then(Value::as_array)
+            .map(|ids| {
+                let mut kept: Vec<String> = Vec::new();
+                for id in ids.iter().filter_map(Value::as_str) {
+                    if kept_label(id) && !kept.iter().any(|k| k == id) {
+                        kept.push(id.to_owned());
+                    }
+                }
+                kept
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -1091,6 +1416,7 @@ pub(crate) mod tests {
         json!({
             "id": id,
             "threadId": id,
+            "labelIds": ["INBOX", "UNREAD"],
             "internalDate": "1764000000000",
             "snippet": "Hi Ada &amp; team, it&#39;s ready",
             "payload": {
@@ -1130,6 +1456,10 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(p.body, "Line one\nLine two");
+        assert_eq!(p.labels, ["INBOX"], "only labels Hadal shows are kept");
+        let mut msg = gmail_message("abc", "s", "t");
+        msg["labelIds"] = json!(["Label_3", "UNREAD", "SPAM", "Label_3", "Label_../x", "CHAT"]);
+        assert_eq!(parse_message(&msg).unwrap().labels, ["Label_3", "SPAM"]);
     }
 
     #[test]
