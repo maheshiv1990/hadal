@@ -391,7 +391,7 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
 function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
   const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
   const [messages, { refetch: refetchMessages }] = createResource(api.listMessages)
-  /** The mailbox being shown, or null for all of them. */
+  /** The mailbox the user picked; null (or one since disconnected) means the first. */
   const [mailbox, setMailbox] = createSignal<string | null>(null)
   const [openId, setOpenId] = createSignal<string | null>(null)
   const [detail] = createResource(openId, api.getMessage)
@@ -415,9 +415,15 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
     }
   })
 
-  const selectedAccount = () => accounts()?.find((a) => a.id === mailbox())
-  const visible = () => (messages() ?? []).filter((m) => !mailbox() || m.account_id === mailbox())
-  const manyAccounts = () => (accounts()?.length ?? 0) > 1
+  /** The mailbox being shown: the one picked, or the first one. */
+  const selectedAccount = () => {
+    const list = accounts() ?? []
+    return list.find((a) => a.id === mailbox()) ?? list[0]
+  }
+  const visible = () => {
+    const id = selectedAccount()?.id
+    return id ? (messages() ?? []).filter((m) => m.account_id === id) : []
+  }
 
   const showMailbox = (id: string | null) => {
     setMailbox(id)
@@ -480,21 +486,12 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
     <section class="inbox">
       <aside class="inbox-side">
         <nav class="mailboxes" aria-label="Mailboxes">
-          <button
-            class="mailbox"
-            classList={{ active: mailbox() === null }}
-            aria-current={mailbox() === null ? 'true' : undefined}
-            onClick={() => showMailbox(null)}
-          >
-            <span class="mailbox-name">All inboxes</span>
-            <span class="count">{messages()?.length ?? ''}</span>
-          </button>
           <For each={accounts()}>
             {(account) => (
               <button
                 class="mailbox"
-                classList={{ active: mailbox() === account.id }}
-                aria-current={mailbox() === account.id ? 'true' : undefined}
+                classList={{ active: selectedAccount()?.id === account.id }}
+                aria-current={selectedAccount()?.id === account.id ? 'true' : undefined}
                 title={account.email}
                 onClick={() => showMailbox(account.id)}
               >
@@ -537,15 +534,16 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
               ← Back
             </button>
           </Show>
-          <span class="muted">
-            <Show when={selectedAccount()} fallback={visible().length ? plural(visible().length, 'message', 'messages') : ''}>
-              {(account) =>
-                account().last_import_at
-                  ? `Imported ${formatDate(account().last_import_at!)}`
-                  : 'Not imported yet'
-              }
-            </Show>
-          </span>
+          <Show when={selectedAccount()}>
+            {(account) => (
+              <span
+                class="muted toolbar-status"
+                title={account().last_import_at ? formatDate(account().last_import_at!) : undefined}
+              >
+                {account().last_import_at ? `Imported ${listDate(account().last_import_at!)}` : 'Not imported yet'}
+              </span>
+            )}
+          </Show>
         </div>
 
         <Show when={props.linkResult === 'linked'}>
@@ -590,11 +588,6 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
                               {senderName(m.from)}
                             </span>
                             <span class="m-text">
-                              <Show when={manyAccounts() && mailbox() === null}>
-                                <span class="m-tag" title={m.account_email}>
-                                  {m.account_email.split('@')[0]}
-                                </span>
-                              </Show>
                               <span class="m-subject">{m.subject || '(no subject)'}</span>
                               <Show when={m.snippet}>
                                 <span class="m-snippet"> - {m.snippet}</span>
