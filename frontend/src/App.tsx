@@ -1,4 +1,4 @@
-import { createEffect, createResource, createSignal, For, Show } from 'solid-js'
+import { createEffect, createResource, createSignal, For, Match, onCleanup, Show, Switch } from 'solid-js'
 import {
   api,
   GMAIL_CONNECT_PATH,
@@ -10,7 +10,28 @@ import {
   type Me,
 } from './api'
 
-type AuthView = 'signin' | 'register'
+/** What a signed-out visitor sees: the welcome page until they pick an action in the header. */
+type AuthView = 'home' | 'signin' | 'register'
+
+/** Each signed-out view has its own URL; nginx serves index.html for all of them. */
+const VIEW_PATHS: Record<AuthView, string> = {
+  home: '/',
+  signin: '/auth/signin',
+  register: '/auth/register',
+}
+
+const viewFromPath = (path: string): AuthView =>
+  path === VIEW_PATHS.signin ? 'signin' : path === VIEW_PATHS.register ? 'register' : 'home'
+
+function Welcome() {
+  return (
+    <section class="welcome">
+      <img src="/hadal-icon.png" alt="" width="96" height="96" />
+      <h1>Welcome to Hadal</h1>
+      <p class="muted">Email in one private space.</p>
+    </section>
+  )
+}
 
 /** Result of a Gmail link, from the `?mail=` flag the server redirects with. */
 type LinkResult = 'linked' | 'failed' | null
@@ -130,6 +151,13 @@ function Register(props: { onSignedIn: (me: Me) => void; onCancel: () => void })
   return (
     <section class="signin">
       <h2>Create an account</h2>
+      {/* Google sign-in creates the account on first use, so sign-up uses the same flow. */}
+      <a class="button" href={LOGIN_PATH}>
+        Sign up with Google
+      </a>
+
+      <p class="muted divider">or register with email</p>
+
       <form onSubmit={submit} class="auth-form">
         <div class="row">
           <label>
@@ -557,16 +585,43 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
 
 function App() {
   const [me, { mutate }] = createResource<Me | null>(api.me)
-  const [view, setView] = createSignal<AuthView>('signin')
+  const query = new URLSearchParams(window.location.search)
+  // A failed Google sign-in comes back to /?login=failed; show the sign-in page with the error.
+  const loginFailed = query.get('login') === 'failed'
+  const [view, setView] = createSignal<AuthView>(loginFailed ? 'signin' : viewFromPath(window.location.pathname))
   const [changing, setChanging] = createSignal(false)
   const [notice, setNotice] = createSignal<string | null>(null)
-  const query = new URLSearchParams(window.location.search)
-  const loginFailed = query.get('login') === 'failed'
   const mailFlag = query.get('mail')
   const linkResult: LinkResult = mailFlag === 'linked' || mailFlag === 'failed' ? mailFlag : null
   if (loginFailed || mailFlag !== null) {
     // Drop the flag so a reload doesn't show the message again.
-    window.history.replaceState(null, '', window.location.pathname)
+    window.history.replaceState(null, '', VIEW_PATHS[view()])
+  }
+
+  /** Show a view and put its URL in the address bar (a new history entry unless `replace`). */
+  const navigate = (next: AuthView, replace = false) => {
+    if (window.location.pathname !== VIEW_PATHS[next]) {
+      if (replace) window.history.replaceState(null, '', VIEW_PATHS[next])
+      else window.history.pushState(null, '', VIEW_PATHS[next])
+    }
+    setView(next)
+  }
+
+  // Back/forward buttons.
+  const onPopState = () => setView(viewFromPath(window.location.pathname))
+  window.addEventListener('popstate', onPopState)
+  onCleanup(() => window.removeEventListener('popstate', onPopState))
+
+  // Signed in on /auth/signin or /auth/register: those pages don't apply, go home.
+  createEffect(() => {
+    if (me() && view() !== 'home') navigate('home', true)
+  })
+
+  /** Click handler for in-app links; leaves new-tab/modified clicks to the browser. */
+  const linkTo = (next: AuthView) => (e: MouseEvent) => {
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+    e.preventDefault()
+    navigate(next)
   }
 
   const signOut = async () => {
@@ -574,17 +629,44 @@ function App() {
       await api.logout()
     } finally {
       mutate(null)
-      setView('signin')
+      navigate('home')
       setChanging(false)
       setNotice(null)
     }
   }
 
   return (
-    <main>
-      <header class="bar">
-        <h1>Hadal</h1>
-        <Show when={me()}>
+    <>
+      <header class="site-header">
+        <div class="site-header-inner">
+        <a class="brand" href={VIEW_PATHS.home} onClick={linkTo('home')} aria-label="Hadal home">
+          <img class="brand-mark" src="/hadal-icon.png" alt="" width="32" height="32" />
+          Hadal
+        </a>
+        <Show
+          when={me()}
+          fallback={
+            <Show when={!me.loading && !me.error}>
+              <nav class="auth-nav" aria-label="Account">
+                <a
+                  href={VIEW_PATHS.signin}
+                  aria-current={view() === 'signin' ? 'page' : undefined}
+                  onClick={linkTo('signin')}
+                >
+                  Sign in
+                </a>
+                <a
+                  class="primary"
+                  href={VIEW_PATHS.register}
+                  aria-current={view() === 'register' ? 'page' : undefined}
+                  onClick={linkTo('register')}
+                >
+                  Register
+                </a>
+              </nav>
+            </Show>
+          }
+        >
           {(user) => (
             <div class="user">
               <span>
@@ -604,21 +686,26 @@ function App() {
             </div>
           )}
         </Show>
+        </div>
       </header>
 
+      <main>
       <Show when={!me.error} fallback={<p class="error">Could not reach the server.</p>}>
         <Show when={!me.loading} fallback={<p class="muted">Loading…</p>}>
           <Show
             when={me()}
             fallback={
-              <Show
-                when={view() === 'register'}
-                fallback={
-                  <SignIn failed={loginFailed} onSignedIn={mutate} onRegister={() => setView('register')} />
-                }
-              >
-                <Register onSignedIn={mutate} onCancel={() => setView('signin')} />
-              </Show>
+              <Switch>
+                <Match when={view() === 'signin'}>
+                  <SignIn failed={loginFailed} onSignedIn={mutate} onRegister={() => navigate('register')} />
+                </Match>
+                <Match when={view() === 'register'}>
+                  <Register onSignedIn={mutate} onCancel={() => navigate('signin')} />
+                </Match>
+                <Match when={view() === 'home'}>
+                  <Welcome />
+                </Match>
+              </Switch>
             }
           >
             <Show when={notice()}>
@@ -639,7 +726,8 @@ function App() {
           </Show>
         </Show>
       </Show>
-    </main>
+      </main>
+    </>
   )
 }
 
