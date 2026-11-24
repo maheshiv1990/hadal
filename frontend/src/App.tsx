@@ -13,18 +13,22 @@ import {
   type Me,
 } from './api'
 
-/** What a signed-out visitor sees: the welcome page until they pick an action in the header. */
-type AuthView = 'home' | 'signin' | 'register'
+/**
+ * The page being shown. Signed out: the welcome page until they pick an
+ * action in the header. Signed in: the mail (`home`) or Settings.
+ */
+type AuthView = 'home' | 'signin' | 'register' | 'settings'
 
-/** Each signed-out view has its own URL; nginx serves index.html for all of them. */
+/** Each view has its own URL; nginx serves index.html for all of them. */
 const VIEW_PATHS: Record<AuthView, string> = {
   home: '/',
   signin: '/auth/signin',
   register: '/auth/register',
+  settings: '/settings',
 }
 
 const viewFromPath = (path: string): AuthView =>
-  path === VIEW_PATHS.signin ? 'signin' : path === VIEW_PATHS.register ? 'register' : 'home'
+  (Object.keys(VIEW_PATHS) as AuthView[]).find((v) => VIEW_PATHS[v] === path) ?? 'home'
 
 function Welcome() {
   return (
@@ -236,7 +240,8 @@ function Register(props: { onSignedIn: (me: Me) => void; onCancel: () => void })
   )
 }
 
-function ChangePassword(props: { onDone: (me: Me) => void; onCancel: () => void }) {
+/** The change-password form (for accounts that have a Hadal password). */
+function ChangePassword(props: { onDone: (me: Me) => void }) {
   const [current, setCurrent] = createSignal('')
   const [next, setNext] = createSignal('')
   const [confirm, setConfirm] = createSignal('')
@@ -251,7 +256,11 @@ function ChangePassword(props: { onDone: (me: Me) => void; onCancel: () => void 
     setError(null)
     setBusy(true)
     try {
-      props.onDone(await api.changePassword(current(), next()))
+      const me = await api.changePassword(current(), next())
+      setCurrent('')
+      setNext('')
+      setConfirm('')
+      props.onDone(me)
     } catch (err) {
       setError((err as Error).message)
     } finally {
@@ -260,56 +269,165 @@ function ChangePassword(props: { onDone: (me: Me) => void; onCancel: () => void 
   }
 
   return (
-    <section class="signin panel">
-      <h2>Change password</h2>
-      <form onSubmit={submit} class="auth-form">
-        <label>
-          Current password
-          <input
-            type="password"
-            autocomplete="current-password"
-            value={current()}
-            onInput={(e) => setCurrent(e.currentTarget.value)}
-            maxLength={MAX_PASSWORD_LENGTH}
-            required
+    <form onSubmit={submit} class="auth-form">
+      <label>
+        Current password
+        <input
+          type="password"
+          autocomplete="current-password"
+          value={current()}
+          onInput={(e) => setCurrent(e.currentTarget.value)}
+          maxLength={MAX_PASSWORD_LENGTH}
+          required
+        />
+      </label>
+      <label>
+        New password
+        <input
+          type="password"
+          autocomplete="new-password"
+          value={next()}
+          onInput={(e) => setNext(e.currentTarget.value)}
+          minLength={MIN_PASSWORD_LENGTH}
+          maxLength={MAX_PASSWORD_LENGTH}
+          required
+        />
+        <span class="hint muted">At least {MIN_PASSWORD_LENGTH} characters. A passphrase works well.</span>
+      </label>
+      <label>
+        Confirm new password
+        <input
+          type="password"
+          autocomplete="new-password"
+          value={confirm()}
+          onInput={(e) => setConfirm(e.currentTarget.value)}
+          maxLength={MAX_PASSWORD_LENGTH}
+          required
+        />
+      </label>
+      <Show when={error()}>
+        <p class="error" role="alert">{error()}</p>
+      </Show>
+      <button type="submit" disabled={busy()}>
+        {busy() ? 'Saving…' : 'Change password'}
+      </button>
+    </form>
+  )
+}
+
+/** Settings: the user's name, and their password if they have one. */
+function Settings(props: {
+  me: Me
+  onUpdated: (me: Me) => void
+  onSignedOut: () => void
+  backLink: (e: MouseEvent) => void
+}) {
+  const [first, setFirst] = createSignal(props.me.first_name ?? '')
+  const [last, setLast] = createSignal(props.me.last_name ?? '')
+  const [error, setError] = createSignal<string | null>(null)
+  const [saved, setSaved] = createSignal(false)
+  const [busy, setBusy] = createSignal(false)
+  const [passwordChanged, setPasswordChanged] = createSignal(false)
+  const unchanged = () =>
+    first().trim() === (props.me.first_name ?? '') && last().trim() === (props.me.last_name ?? '')
+
+  const saveProfile = async (e: SubmitEvent) => {
+    e.preventDefault()
+    setError(null)
+    setSaved(false)
+    setBusy(true)
+    try {
+      const me = await api.updateProfile(first(), last())
+      props.onUpdated(me)
+      setFirst(me.first_name ?? '')
+      setLast(me.last_name ?? '')
+      setSaved(true)
+    } catch (err) {
+      if (err instanceof UnauthorizedError) props.onSignedOut()
+      else setError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div class="settings">
+      <a class="back-link" href="/" onClick={props.backLink}>
+        ← Back to mail
+      </a>
+      <h1>Settings</h1>
+
+      <section class="panel settings-card" aria-labelledby="profile-heading">
+        <h2 id="profile-heading">Profile</h2>
+        <form onSubmit={saveProfile} class="auth-form">
+          <div class="row">
+            <label>
+              First name
+              <input
+                autocomplete="given-name"
+                value={first()}
+                onInput={(e) => {
+                  setFirst(e.currentTarget.value)
+                  setSaved(false)
+                }}
+                maxLength={100}
+                required
+              />
+            </label>
+            <label>
+              Last name
+              <input
+                autocomplete="family-name"
+                value={last()}
+                onInput={(e) => {
+                  setLast(e.currentTarget.value)
+                  setSaved(false)
+                }}
+                maxLength={100}
+                required
+              />
+            </label>
+          </div>
+          <label>
+            Email
+            <input type="email" value={props.me.email} disabled />
+            <span class="hint muted">The email you sign in with. It can't be changed here.</span>
+          </label>
+          <Show when={error()}>
+            <p class="error" role="alert">{error()}</p>
+          </Show>
+          <Show when={saved()}>
+            <p class="notice" role="status">Profile saved.</p>
+          </Show>
+          <button type="submit" disabled={busy() || unchanged()}>
+            {busy() ? 'Saving…' : 'Save'}
+          </button>
+        </form>
+      </section>
+
+      <section class="panel settings-card" aria-labelledby="password-heading">
+        <h2 id="password-heading">Password</h2>
+        <Show
+          when={props.me.has_password}
+          fallback={
+            <p class="muted">
+              You sign in with Google, so there's no Hadal password to change. Your password is managed
+              in your Google Account.
+            </p>
+          }
+        >
+          <Show when={passwordChanged()}>
+            <p class="notice" role="status">Password changed. You were signed out everywhere else.</p>
+          </Show>
+          <ChangePassword
+            onDone={(me) => {
+              props.onUpdated(me)
+              setPasswordChanged(true)
+            }}
           />
-        </label>
-        <label>
-          New password
-          <input
-            type="password"
-            autocomplete="new-password"
-            value={next()}
-            onInput={(e) => setNext(e.currentTarget.value)}
-            minLength={MIN_PASSWORD_LENGTH}
-            maxLength={MAX_PASSWORD_LENGTH}
-            required
-          />
-        </label>
-        <label>
-          Confirm new password
-          <input
-            type="password"
-            autocomplete="new-password"
-            value={confirm()}
-            onInput={(e) => setConfirm(e.currentTarget.value)}
-            maxLength={MAX_PASSWORD_LENGTH}
-            required
-          />
-        </label>
-        <Show when={error()}>
-          <p class="error" role="alert">{error()}</p>
         </Show>
-        <div class="row">
-          <button type="submit" disabled={busy()}>
-            {busy() ? 'Saving…' : 'Change password'}
-          </button>
-          <button type="button" class="secondary plain" onClick={props.onCancel}>
-            Cancel
-          </button>
-        </div>
-      </form>
-    </section>
+      </section>
+    </div>
   )
 }
 
@@ -906,8 +1024,6 @@ function App() {
   // A failed Google sign-in comes back to /?login=failed; show the sign-in page with the error.
   const loginFailed = query.get('login') === 'failed'
   const [view, setView] = createSignal<AuthView>(loginFailed ? 'signin' : viewFromPath(window.location.pathname))
-  const [changing, setChanging] = createSignal(false)
-  const [notice, setNotice] = createSignal<string | null>(null)
   const mailFlag = query.get('mail')
   const linkResult: LinkResult = mailFlag === 'linked' || mailFlag === 'failed' ? mailFlag : null
   if (loginFailed || mailFlag !== null) {
@@ -929,9 +1045,11 @@ function App() {
   window.addEventListener('popstate', onPopState)
   onCleanup(() => window.removeEventListener('popstate', onPopState))
 
-  // Signed in on /auth/signin or /auth/register: those pages don't apply, go home.
+  // Signed in on /auth/signin or /auth/register: those pages don't apply, go
+  // home. Signed out on /settings: sign in first.
   createEffect(() => {
-    if (me() && view() !== 'home') navigate('home', true)
+    if (me() && (view() === 'signin' || view() === 'register')) navigate('home', true)
+    if (!me.loading && !me.error && me() === null && view() === 'settings') navigate('signin', true)
   })
 
   /** Click handler for in-app links; leaves new-tab/modified clicks to the browser. */
@@ -947,8 +1065,6 @@ function App() {
     } finally {
       mutate(null)
       navigate('home')
-      setChanging(false)
-      setNotice(null)
     }
   }
 
@@ -992,11 +1108,14 @@ function App() {
                 </Show>
                 <span class="muted">{user().email}</span>
               </span>
-              <Show when={user().has_password}>
-                <button class="secondary plain" onClick={() => setChanging(!changing())}>
-                  Change password
-                </button>
-              </Show>
+              <a
+                class="header-link"
+                href={VIEW_PATHS.settings}
+                aria-current={view() === 'settings' ? 'page' : undefined}
+                onClick={linkTo('settings')}
+              >
+                Settings
+              </a>
               <button class="secondary" onClick={signOut}>
                 Sign out
               </button>
@@ -1025,20 +1144,21 @@ function App() {
               </Switch>
             }
           >
-            <Show when={notice()}>
-              <p class="notice" role="status">{notice()}</p>
+            <Show
+              when={view() === 'settings' && me()}
+              fallback={
+                <Mail onSignedOut={() => mutate(null)} linkResult={linkResult} primaryEmail={me()?.email ?? ''} />
+              }
+            >
+              {(user) => (
+                <Settings
+                  me={user()}
+                  onUpdated={mutate}
+                  onSignedOut={() => mutate(null)}
+                  backLink={linkTo('home')}
+                />
+              )}
             </Show>
-            <Show when={changing()}>
-              <ChangePassword
-                onCancel={() => setChanging(false)}
-                onDone={(m) => {
-                  mutate(m)
-                  setChanging(false)
-                  setNotice('Password changed. You were signed out everywhere else.')
-                }}
-              />
-            </Show>
-            <Mail onSignedOut={() => mutate(null)} linkResult={linkResult} primaryEmail={me()?.email ?? ''} />
           </Show>
         </Show>
       </Show>

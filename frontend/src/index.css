@@ -281,3 +281,19 @@ button.chip.more { padding: 0.2rem 0.6rem; color: var(--muted); }
   .m-chips { padding-left: 0.75rem; }
   .reader-meta { flex-direction: column; }
 }
+
+/* Settings */
+.settings { max-width: 640px; }
+.settings h1 { margin: 0.5rem 0 1.25rem; font-size: 1.5rem; }
+.settings-card { padding: 1.25rem; }
+.settings-card h2 { margin: 0 0 1rem; font-size: 1.1rem; }
+.settings-card .auth-form { max-width: none; gap: 0.75rem; }
+.settings-card input:disabled { color: var(--muted); background: color-mix(in srgb, var(--fg) 4%, transparent); }
+.settings-card .notice { margin: 0; }
+a.back-link { color: var(--accent); text-decoration: none; font-size: 0.9rem; }
+a.back-link:hover { text-decoration: underline; }
+a.header-link {
+  padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: 6px;
+  color: inherit; text-decoration: none;
+}
+a.header-link[aria-current='page'] { border-color: var(--accent); color: var(--accent); }

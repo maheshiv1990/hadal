@@ -121,8 +121,8 @@
       "id": "2.4.1",
       "title": "A full valid session or re-authentication is required before sensitive transactions or account changes",
       "status": "verified",
-      "evidence": ["test:api_routes_require_a_session", "test:users_cannot_reach_each_others_mail", "test:logout_rejects_cross_site_forms"],
-      "notes": "Every state-changing endpoint sits behind require_session. There are no account-change functions; the Google account is managed at Google."
+      "evidence": ["test:api_routes_require_a_session", "test:users_cannot_reach_each_others_mail", "test:logout_rejects_cross_site_forms", "test:users_can_rename_themselves_and_google_sign_in_keeps_it", "test:password_change_needs_a_session_and_the_current_password"],
+      "notes": "Every state-changing endpoint sits behind require_session. The account changes Hadal offers are both signed-in, JSON-only POSTs: renaming (POST /api/auth/profile, only first and last name) and changing the password (POST /api/auth/password, which also requires the current password and signs out other sessions). The Google account itself is managed at Google."
     },
     {
       "id": "3.1.1",
@@ -135,8 +135,8 @@
       "id": "3.1.2",
       "title": "User and data attributes used by access controls cannot be manipulated by end users",
       "status": "verified",
-      "evidence": ["lint:permissive-deserialize", "test:unknown_fields_are_rejected", "test:registration_validates_input", "test:folders_follow_gmail_labels"],
-      "notes": "Every request body struct uses deny_unknown_fields, so server-controlled fields such as id, created_at and (later) owner_id cannot be mass-assigned. Registration rejects extra fields such as id, password_hash and google_sub. Query strings are typed the same way: the message list accepts only account (a UUID) and label (ALL, one of ten Gmail system labels, or a Label_<id> user label ID), and anything else is a 400."
+      "evidence": ["lint:permissive-deserialize", "test:unknown_fields_are_rejected", "test:registration_validates_input", "test:folders_follow_gmail_labels", "test:users_can_rename_themselves_and_google_sign_in_keeps_it"],
+      "notes": "Every request body struct uses deny_unknown_fields, so server-controlled fields such as id, created_at and (later) owner_id cannot be mass-assigned. Registration rejects extra fields such as id, password_hash and google_sub; the profile update takes only first_name and last_name (not email or any flag). Query strings are typed the same way: the message list accepts only account (a UUID) and label (ALL, one of ten Gmail system labels, or a Label_<id> user label ID), and anything else is a 400."
     },
     {
       "id": "3.1.3",

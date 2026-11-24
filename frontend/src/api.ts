@@ -170,6 +170,12 @@ export const api = {
     }
   },
   /** Changes the password. The server signs out every other session. */
+  /** Renames the signed-in user. From then on Google sign-in keeps this name. */
+  updateProfile: (first_name: string, last_name: string) =>
+    request<Me>('/auth/profile', {
+      method: 'POST',
+      body: JSON.stringify({ first_name, last_name }),
+    }),
   changePassword: (current_password: string, new_password: string) =>
     request<Me>('/auth/password', {
       method: 'POST',
