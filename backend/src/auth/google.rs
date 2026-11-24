@@ -1,6 +1,7 @@
-//! Google sign-in: OpenID Connect Authorization Code flow with PKCE
-//! (CASA 3.2.1). This is the only module that makes outbound HTTP requests,
-//! and only to Google's fixed token endpoint (lint:outbound-http, CASA 5.1.5).
+//! Google sign-in, Gmail linking and the Gmail API: OAuth 2.0 Authorization
+//! Code flow with PKCE (CASA 3.2.1). This is the only module that makes
+//! outbound HTTP requests, and only to Google's fixed endpoints below
+//! (lint:outbound-http, CASA 5.1.5). Nothing from a request picks a host.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,18 +16,41 @@ use crate::config::{OAuthConfig, Secret};
 
 const AUTHORIZE_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+const REVOKE_ENDPOINT: &str = "https://oauth2.googleapis.com/revoke";
+/// Gmail API for the mailbox the access token belongs to. Ends in `/` so
+/// `Url::join` stays under it.
+const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1/users/me/";
 /// Google's issuer. ID tokens may carry either form (Google OIDC docs).
 pub const ISSUER: &str = "https://accounts.google.com";
 const ISSUER_SHORT: &str = "accounts.google.com";
+/// Read-only Gmail access (restricted scope). Requested only when a signed-in
+/// user links a mailbox, never at sign-in.
+pub const GMAIL_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
 /// Sign-in only needs identity and the user's name (`profile` gives
-/// `given_name` / `family_name`). Restricted scopes are requested separately.
-const SCOPES: &str = "openid email profile";
+/// `given_name` / `family_name`).
+const SIGN_IN_SCOPES: &str = "openid email profile";
+/// Linking needs the mailbox's identity (to tell linked accounts apart) and
+/// read-only mail.
+const LINK_SCOPES: &str = "openid email https://www.googleapis.com/auth/gmail.readonly";
 /// Same bound as names entered at registration (users.first_name/last_name).
 const MAX_NAME_CHARS: usize = 100;
-/// Largest token-endpoint response we will read.
+/// Largest token or list response we will read.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+/// Largest single message we will read. `format=full` carries bodies but not
+/// attachment data, so real mail stays far below this.
+const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Gmail's `maxResults` ceiling for one list page.
+const MAX_LIST_RESULTS: u32 = 500;
 /// Tolerated clock difference with Google when checking `exp`/`iat`.
 const CLOCK_SKEW_SECS: i64 = 60;
+
+/// Why a Google authorization was started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Purpose {
+    SignIn,
+    /// A signed-in user is linking a Gmail mailbox (offline, read-only).
+    LinkGmail,
+}
 
 /// The Google user an ID token vouches for.
 #[derive(Debug, Clone)]
@@ -38,6 +62,93 @@ pub struct Identity {
     /// accounts, and a user may have only one.
     pub first_name: Option<String>,
     pub last_name: Option<String>,
+}
+
+/// What a redeemed authorization code gave us.
+pub struct Grant {
+    pub identity: Identity,
+    /// Present only for offline (linking) authorizations. Sign-in drops it.
+    pub refresh_token: Option<Secret>,
+    /// Scopes the user actually granted; they can untick some.
+    scopes: Vec<String>,
+}
+
+impl Grant {
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|s| s == scope)
+    }
+}
+
+/// A failed Gmail API or token-refresh call. Never carries a token.
+#[derive(Debug)]
+pub enum GoogleApiError {
+    Unreachable(String),
+    Status(u16),
+    /// The user revoked our access, or the grant expired: relink needed.
+    Revoked,
+    Malformed,
+}
+
+impl std::fmt::Display for GoogleApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GoogleApiError::Unreachable(e) => write!(f, "Google unreachable: {e}"),
+            GoogleApiError::Status(s) => write!(f, "Google returned HTTP {s}"),
+            GoogleApiError::Revoked => f.write_str("Google access was revoked or expired"),
+            GoogleApiError::Malformed => f.write_str("malformed Google response"),
+        }
+    }
+}
+
+/// Reading a response body failed.
+enum BodyError {
+    Unreachable(String),
+    TooLarge,
+    Malformed,
+}
+
+impl From<BodyError> for LoginRejected {
+    fn from(e: BodyError) -> Self {
+        match e {
+            BodyError::Unreachable(e) => LoginRejected::ProviderUnreachable(e),
+            BodyError::TooLarge | BodyError::Malformed => LoginRejected::MalformedProviderResponse,
+        }
+    }
+}
+
+impl From<BodyError> for GoogleApiError {
+    fn from(e: BodyError) -> Self {
+        match e {
+            BodyError::Unreachable(e) => GoogleApiError::Unreachable(e),
+            BodyError::TooLarge | BodyError::Malformed => GoogleApiError::Malformed,
+        }
+    }
+}
+
+fn unreachable(e: reqwest::Error) -> GoogleApiError {
+    GoogleApiError::Unreachable(e.without_url().to_string())
+}
+
+/// Reads at most `max` bytes of JSON. Parsed as a `Value`, not a struct:
+/// Google's responses carry fields we ignore.
+async fn read_json(resp: reqwest::Response, max: usize) -> Result<Value, BodyError> {
+    if resp.content_length().is_some_and(|n| n > max as u64) {
+        return Err(BodyError::TooLarge);
+    }
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| BodyError::Unreachable(e.without_url().to_string()))?;
+    if body.len() > max {
+        return Err(BodyError::TooLarge);
+    }
+    serde_json::from_slice(&body).map_err(|_| BodyError::Malformed)
+}
+
+/// Gmail message IDs are short hex strings. Anything else is refused before
+/// it goes into a URL path.
+pub fn valid_gmail_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// Cleans an optional name claim. A missing, non-string or blank value is
@@ -75,6 +186,8 @@ pub struct GoogleClient {
     redirect_uri: Url,
     authorize_endpoint: Url,
     token_endpoint: Url,
+    revoke_endpoint: Url,
+    gmail_api: Url,
 }
 
 impl GoogleClient {
@@ -83,20 +196,32 @@ impl GoogleClient {
             cfg,
             Url::parse(AUTHORIZE_ENDPOINT)?,
             Url::parse(TOKEN_ENDPOINT)?,
+            Url::parse(REVOKE_ENDPOINT)?,
+            Url::parse(GMAIL_API)?,
             true,
         )
     }
 
-    /// Points the client at a local fake token endpoint (plain http).
+    /// Points the client at a local fake Google (plain http) serving
+    /// `/token`, `/revoke` and `/gmail/v1/users/me/`.
     #[cfg(test)]
-    pub fn for_test(cfg: &OAuthConfig, token_endpoint: Url) -> anyhow::Result<Self> {
-        Self::build(cfg, Url::parse(AUTHORIZE_ENDPOINT)?, token_endpoint, false)
+    pub fn for_test(cfg: &OAuthConfig, base: Url) -> anyhow::Result<Self> {
+        Self::build(
+            cfg,
+            Url::parse(AUTHORIZE_ENDPOINT)?,
+            base.join("token")?,
+            base.join("revoke")?,
+            base.join("gmail/v1/users/me/")?,
+            false,
+        )
     }
 
     fn build(
         cfg: &OAuthConfig,
         authorize_endpoint: Url,
         token_endpoint: Url,
+        revoke_endpoint: Url,
+        gmail_api: Url,
         https_only: bool,
     ) -> anyhow::Result<Self> {
         // rustls with the Mozilla root set: certificate and hostname checks are
@@ -113,8 +238,8 @@ impl GoogleClient {
         let http = reqwest::Client::builder()
             .tls_backend_preconfigured(tls)
             .https_only(https_only)
-            // A redirect from the token endpoint is never legitimate; following
-            // one would resend the code and client credentials elsewhere.
+            // A redirect from Google's API is never legitimate; following one
+            // would resend the code, credentials or bearer token elsewhere.
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .connect_timeout(Duration::from_secs(5))
@@ -128,34 +253,55 @@ impl GoogleClient {
             redirect_uri: cfg.redirect_uri.clone(),
             authorize_endpoint,
             token_endpoint,
+            revoke_endpoint,
+            gmail_api,
         })
     }
 
-    /// Where to send the browser to start sign-in.
-    pub fn authorize_url(&self, state: &str, code_challenge: &str, nonce: &str) -> AuthorizeUrl {
+    /// Where to send the browser to start an authorization.
+    pub fn authorize_url(
+        &self,
+        purpose: Purpose,
+        state: &str,
+        code_challenge: &str,
+        nonce: &str,
+    ) -> AuthorizeUrl {
         let mut url = self.authorize_endpoint.clone();
-        url.query_pairs_mut()
-            .append_pair("response_type", "code")
-            .append_pair("client_id", &self.client_id)
-            .append_pair("redirect_uri", self.redirect_uri.as_str())
-            .append_pair("scope", SCOPES)
-            .append_pair("state", state)
-            .append_pair("nonce", nonce)
-            .append_pair("code_challenge", code_challenge)
-            .append_pair("code_challenge_method", "S256")
-            .append_pair("prompt", "select_account");
+        {
+            let mut q = url.query_pairs_mut();
+            q.append_pair("response_type", "code")
+                .append_pair("client_id", &self.client_id)
+                .append_pair("redirect_uri", self.redirect_uri.as_str())
+                .append_pair("state", state)
+                .append_pair("nonce", nonce)
+                .append_pair("code_challenge", code_challenge)
+                .append_pair("code_challenge_method", "S256");
+            match purpose {
+                Purpose::SignIn => {
+                    q.append_pair("scope", SIGN_IN_SCOPES)
+                        .append_pair("prompt", "select_account");
+                }
+                Purpose::LinkGmail => {
+                    // `offline` + `consent` makes Google issue a refresh
+                    // token every time, even for a mailbox linked before.
+                    q.append_pair("scope", LINK_SCOPES)
+                        .append_pair("access_type", "offline")
+                        .append_pair("prompt", "consent select_account");
+                }
+            }
+        }
         AuthorizeUrl(url.into())
     }
 
-    /// Redeems the authorization code (with the PKCE verifier) for an ID token
-    /// and returns the identity it proves. Google's access and refresh tokens
-    /// are discarded: sign-in doesn't need them, so they are never stored.
+    /// Redeems the authorization code (with the PKCE verifier) and checks the
+    /// ID token. The access token is discarded; the refresh token is returned
+    /// only if Google issued one (offline linking).
     pub async fn exchange_code(
         &self,
         code: &str,
         code_verifier: &str,
         expected_nonce: &str,
-    ) -> Result<Identity, LoginRejected> {
+    ) -> Result<Grant, LoginRejected> {
         let form = [
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -176,34 +322,153 @@ impl GoogleClient {
         if !status.is_success() {
             return Err(LoginRejected::ProviderStatus(status.as_u16()));
         }
-        if resp
-            .content_length()
-            .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
-        {
-            return Err(LoginRejected::MalformedProviderResponse);
-        }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| LoginRejected::ProviderUnreachable(e.without_url().to_string()))?;
-        if body.len() > MAX_RESPONSE_BYTES {
-            return Err(LoginRejected::MalformedProviderResponse);
-        }
-        // Parsed as a Value, not a struct: Google's response carries fields we
-        // ignore, and only the ID token is read.
-        let json: Value =
-            serde_json::from_slice(&body).map_err(|_| LoginRejected::MalformedProviderResponse)?;
+        let json = read_json(resp, MAX_RESPONSE_BYTES).await?;
         let id_token = json
             .get("id_token")
             .and_then(Value::as_str)
             .ok_or(LoginRejected::MalformedProviderResponse)?;
 
-        validate_id_token(
+        let identity = validate_id_token(
             id_token,
             &self.client_id,
             expected_nonce,
             time::OffsetDateTime::now_utc().unix_timestamp(),
-        )
+        )?;
+        let refresh_token = json
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty() && t.len() <= 2048)
+            .map(Secret::new);
+        let scopes = json
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .split_ascii_whitespace()
+            .map(str::to_owned)
+            .collect();
+        Ok(Grant {
+            identity,
+            refresh_token,
+            scopes,
+        })
+    }
+
+    /// Trades a stored refresh token for a short-lived access token. The
+    /// access token is only ever held in memory for one import.
+    pub async fn refresh_access_token(&self, refresh: &Secret) -> Result<Secret, GoogleApiError> {
+        let form = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh.expose()),
+            ("client_id", &self.client_id),
+            ("client_secret", self.client_secret.expose()),
+        ];
+        let resp = self
+            .http
+            .post(self.token_endpoint.clone())
+            .form(&form)
+            .send()
+            .await
+            .map_err(unreachable)?;
+        let status = resp.status();
+        // RFC 6749 §5.2: a dead grant is 400 `invalid_grant`.
+        if status.as_u16() == 400 || status.as_u16() == 401 {
+            return Err(GoogleApiError::Revoked);
+        }
+        if !status.is_success() {
+            return Err(GoogleApiError::Status(status.as_u16()));
+        }
+        let json = read_json(resp, MAX_RESPONSE_BYTES).await?;
+        json.get("access_token")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(Secret::new)
+            .ok_or(GoogleApiError::Malformed)
+    }
+
+    async fn gmail_get(
+        &self,
+        url: Url,
+        access: &Secret,
+        max: usize,
+    ) -> Result<Value, GoogleApiError> {
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(access.expose())
+            .send()
+            .await
+            .map_err(unreachable)?;
+        let status = resp.status();
+        if status.as_u16() == 401 {
+            return Err(GoogleApiError::Revoked);
+        }
+        if !status.is_success() {
+            return Err(GoogleApiError::Status(status.as_u16()));
+        }
+        Ok(read_json(resp, max).await?)
+    }
+
+    /// IDs of the newest `max` messages in the mailbox (Gmail excludes spam
+    /// and trash by default).
+    pub async fn list_message_ids(
+        &self,
+        access: &Secret,
+        max: u32,
+    ) -> Result<Vec<String>, GoogleApiError> {
+        let mut url = self
+            .gmail_api
+            .join("messages")
+            .map_err(|_| GoogleApiError::Malformed)?;
+        url.query_pairs_mut()
+            .append_pair("maxResults", &max.clamp(1, MAX_LIST_RESULTS).to_string());
+        let json = self.gmail_get(url, access, MAX_RESPONSE_BYTES).await?;
+        let Some(list) = json.get("messages") else {
+            // An empty mailbox has no `messages` key at all.
+            return Ok(Vec::new());
+        };
+        let list = list.as_array().ok_or(GoogleApiError::Malformed)?;
+        Ok(list
+            .iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_str))
+            .filter(|id| valid_gmail_id(id))
+            .take(max as usize)
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// One message with headers and body parts (`format=full`).
+    pub async fn get_message(&self, access: &Secret, id: &str) -> Result<Value, GoogleApiError> {
+        if !valid_gmail_id(id) {
+            return Err(GoogleApiError::Malformed);
+        }
+        let mut url = self
+            .gmail_api
+            .join("messages/")
+            .map_err(|_| GoogleApiError::Malformed)?;
+        url.path_segments_mut()
+            .map_err(|_| GoogleApiError::Malformed)?
+            .pop_if_empty()
+            .push(id);
+        url.query_pairs_mut().append_pair("format", "full");
+        self.gmail_get(url, access, MAX_MESSAGE_BYTES).await
+    }
+
+    /// Tells Google to revoke a refresh token (when a mailbox is unlinked).
+    pub async fn revoke(&self, refresh: &Secret) -> Result<(), GoogleApiError> {
+        let resp = self
+            .http
+            .post(self.revoke_endpoint.clone())
+            .form(&[("token", refresh.expose())])
+            .send()
+            .await
+            .map_err(unreachable)?;
+        let status = resp.status();
+        // 400 means Google already considers it invalid: nothing to revoke.
+        if status.is_success() || status.as_u16() == 400 {
+            Ok(())
+        } else {
+            Err(GoogleApiError::Status(status.as_u16()))
+        }
     }
 }
 
@@ -407,20 +672,54 @@ pub(crate) mod tests {
     fn authorize_url_uses_code_flow_with_pkce_and_fixed_redirect() {
         // CASA 3.2.1 (code + S256 PKCE) and 3.2.2 (state, fixed redirect_uri).
         let client = GoogleClient::new(&test_config().oauth).unwrap();
-        let url = Url::parse(client.authorize_url("st", "ch", "nn").as_str()).unwrap();
+        for purpose in [Purpose::SignIn, Purpose::LinkGmail] {
+            let url = Url::parse(client.authorize_url(purpose, "st", "ch", "nn").as_str()).unwrap();
+            assert_eq!(
+                url.origin().ascii_serialization(),
+                "https://accounts.google.com"
+            );
+            let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+            assert_eq!(q["response_type"], "code");
+            assert_eq!(q["code_challenge_method"], "S256");
+            assert_eq!(q["code_challenge"], "ch");
+            assert_eq!(q["state"], "st");
+            assert_eq!(q["nonce"], "nn");
+            assert_eq!(q["redirect_uri"], "http://localhost:8000/api/auth/callback");
+            assert!(!q.contains_key("client_secret"));
+        }
+    }
+
+    #[test]
+    fn gmail_scope_is_requested_only_when_linking() {
+        // Least privilege: sign-in never asks for mail; linking asks for
+        // read-only mail and nothing broader.
+        let client = GoogleClient::new(&test_config().oauth).unwrap();
+        let query = |purpose| -> std::collections::HashMap<String, String> {
+            Url::parse(client.authorize_url(purpose, "st", "ch", "nn").as_str())
+                .unwrap()
+                .query_pairs()
+                .into_owned()
+                .collect()
+        };
+        let sign_in = query(Purpose::SignIn);
+        assert_eq!(sign_in["scope"], "openid email profile");
+        assert!(!sign_in.contains_key("access_type"));
+        let link = query(Purpose::LinkGmail);
         assert_eq!(
-            url.origin().ascii_serialization(),
-            "https://accounts.google.com"
+            link["scope"],
+            "openid email https://www.googleapis.com/auth/gmail.readonly"
         );
-        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-        assert_eq!(q["response_type"], "code");
-        assert_eq!(q["code_challenge_method"], "S256");
-        assert_eq!(q["code_challenge"], "ch");
-        assert_eq!(q["state"], "st");
-        assert_eq!(q["nonce"], "nn");
-        assert_eq!(q["redirect_uri"], "http://localhost:8000/api/auth/callback");
-        assert_eq!(q["scope"], "openid email profile");
-        assert!(!q.contains_key("client_secret"));
+        assert_eq!(link["access_type"], "offline");
+        assert_eq!(link["prompt"], "consent select_account");
+    }
+
+    #[test]
+    fn gmail_ids_are_checked_before_use_in_a_url() {
+        // CASA 5.1.5: nothing but a plain ID reaches the Gmail URL path.
+        assert!(valid_gmail_id("18c2f0a9b3d4e5f6"));
+        for bad in ["", "../../labels", "a/b", "a?b", "a%2Fb", &"a".repeat(65)] {
+            assert!(!valid_gmail_id(bad), "accepted {bad:?}");
+        }
     }
 
     #[actix_web::test]
@@ -429,7 +728,7 @@ pub(crate) mod tests {
         let cfg = test_config().oauth;
         let mut client = GoogleClient::new(&cfg).unwrap();
         client.token_endpoint = Url::parse("http://127.0.0.1:9/token").unwrap();
-        let err = client.exchange_code("c", "v", "n").await.unwrap_err();
+        let err = client.exchange_code("c", "v", "n").await.err().unwrap();
         assert!(
             matches!(err, LoginRejected::ProviderUnreachable(_)),
             "{err:?}"

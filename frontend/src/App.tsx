@@ -1,14 +1,19 @@
 import { createEffect, createResource, createSignal, For, Show } from 'solid-js'
 import {
   api,
+  GMAIL_CONNECT_PATH,
   LOGIN_PATH,
   MAX_PASSWORD_LENGTH,
   MIN_PASSWORD_LENGTH,
   UnauthorizedError,
+  type MailAccount,
   type Me,
 } from './api'
 
 type AuthView = 'signin' | 'register'
+
+/** Result of a Gmail link, from the `?mail=` flag the server redirects with. */
+type LinkResult = 'linked' | 'failed' | null
 
 function SignIn(props: { failed: boolean; onSignedIn: (me: Me) => void; onRegister: () => void }) {
   const [email, setEmail] = createSignal('')
@@ -374,14 +379,193 @@ function Notes(props: { onSignedOut: () => void }) {
   )
 }
 
+const formatDate = (iso: string) => new Date(iso).toLocaleString()
+
+const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`
+
+/**
+ * Linked Gmail mailboxes and their imported mail. Bodies are plain text from
+ * the server and are only ever shown as text (CASA 5.1.7).
+ */
+function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
+  const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
+  const [messages, { refetch: refetchMessages }] = createResource(api.listMessages)
+  const [openId, setOpenId] = createSignal<string | null>(null)
+  const [detail] = createResource(openId, api.getMessage)
+  const [importing, setImporting] = createSignal(false)
+  const [status, setStatus] = createSignal<string | null>(null)
+  const [problems, setProblems] = createSignal<string[]>([])
+  const [error, setError] = createSignal<string | null>(null)
+
+  const handle = (err: unknown) => {
+    if (err instanceof UnauthorizedError) props.onSignedOut()
+    else setError((err as Error).message)
+  }
+
+  createEffect(() => {
+    if (
+      accounts.error instanceof UnauthorizedError ||
+      messages.error instanceof UnauthorizedError ||
+      detail.error instanceof UnauthorizedError
+    ) {
+      props.onSignedOut()
+    }
+  })
+
+  const importAll = async () => {
+    setError(null)
+    setStatus(null)
+    setProblems([])
+    setImporting(true)
+    try {
+      const res = await api.importMail()
+      const ok = res.accounts.filter((a) => !a.error).length
+      setStatus(
+        `Imported ${plural(res.imported, 'new message', 'new messages')} from ${plural(ok, 'mailbox', 'mailboxes')}.`,
+      )
+      setProblems(res.accounts.filter((a) => a.error).map((a) => `${a.email}: ${a.error}`))
+      await Promise.all([refetchAccounts(), refetchMessages()])
+    } catch (err) {
+      handle(err)
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  const disconnect = async (account: MailAccount) => {
+    if (!window.confirm(`Disconnect ${account.email}? Its imported mail will be deleted from Hadal.`)) {
+      return
+    }
+    setError(null)
+    try {
+      await api.disconnectMailAccount(account.id)
+      setOpenId(null)
+      await Promise.all([refetchAccounts(), refetchMessages()])
+    } catch (err) {
+      handle(err)
+    }
+  }
+
+  const toggle = (id: string) => setOpenId(openId() === id ? null : id)
+
+  return (
+    <section class="panel mail">
+      <div class="mail-head">
+        <h2>Email</h2>
+        <div class="mail-actions">
+          <a class="button outline" href={GMAIL_CONNECT_PATH}>
+            Connect Gmail
+          </a>
+          <button onClick={importAll} disabled={importing() || !accounts()?.length}>
+            {importing() ? 'Importing…' : 'Import all'}
+          </button>
+        </div>
+      </div>
+
+      <Show when={props.linkResult === 'linked'}>
+        <p class="notice" role="status">Gmail connected. Use “Import all” to fetch its mail.</p>
+      </Show>
+      <Show when={props.linkResult === 'failed'}>
+        <p class="error" role="alert">
+          Gmail wasn't connected. Allow read access to your mail on Google's screen and try again.
+        </p>
+      </Show>
+
+      <Show when={!accounts.error} fallback={<p class="error">Could not load mailboxes.</p>}>
+        <Show
+          when={accounts()?.length}
+          fallback={
+            <Show when={!accounts.loading}>
+              <p class="muted">No mailboxes connected. Connect a Gmail account to import its newest 100 messages.</p>
+            </Show>
+          }
+        >
+          <ul class="mail-accounts">
+            <For each={accounts()}>
+              {(account) => (
+                <li>
+                  <div>
+                    <strong>{account.email}</strong>
+                    <span class="muted">
+                      {' · '}
+                      {plural(account.message_count, 'message', 'messages')}
+                      {account.last_import_at ? ` · imported ${formatDate(account.last_import_at)}` : ' · not imported yet'}
+                    </span>
+                  </div>
+                  <button class="secondary" onClick={() => disconnect(account)} aria-label={`Disconnect ${account.email}`}>
+                    Disconnect
+                  </button>
+                </li>
+              )}
+            </For>
+          </ul>
+        </Show>
+      </Show>
+
+      <Show when={status()}>
+        <p class="notice" role="status">{status()}</p>
+      </Show>
+      <For each={problems()}>{(p) => <p class="error" role="alert">{p}</p>}</For>
+      <Show when={error()}>
+        <p class="error" role="alert">{error()}</p>
+      </Show>
+
+      <Show when={!messages.error} fallback={<p class="error">Could not load messages.</p>}>
+        <Show when={messages()?.length}>
+          <ul class="messages">
+            <For each={messages()}>
+              {(m) => (
+                <li classList={{ open: openId() === m.id }}>
+                  <button class="message-row" onClick={() => toggle(m.id)} aria-expanded={openId() === m.id}>
+                    <span class="message-top">
+                      <strong>{m.subject || '(no subject)'}</strong>
+                      <time class="muted">{formatDate(m.received_at)}</time>
+                    </span>
+                    <span class="muted">
+                      {m.from}
+                      <Show when={(accounts()?.length ?? 0) > 1}> → {m.account_email}</Show>
+                    </span>
+                    <span class="snippet">{m.snippet}</span>
+                  </button>
+                  <Show when={openId() === m.id}>
+                    <Show
+                      when={!detail.error}
+                      fallback={<p class="error">Could not open this message.</p>}
+                    >
+                      <Show
+                        when={!detail.loading && detail()?.id === m.id ? detail() : undefined}
+                        fallback={<p class="muted">Loading…</p>}
+                      >
+                        {(d) => (
+                          <div class="message-body">
+                            <p class="muted">To: {d().to || '(none)'}</p>
+                            <pre>{d().body || '(This message has no text.)'}</pre>
+                          </div>
+                        )}
+                      </Show>
+                    </Show>
+                  </Show>
+                </li>
+              )}
+            </For>
+          </ul>
+        </Show>
+      </Show>
+    </section>
+  )
+}
+
 function App() {
   const [me, { mutate }] = createResource<Me | null>(api.me)
   const [view, setView] = createSignal<AuthView>('signin')
   const [changing, setChanging] = createSignal(false)
   const [notice, setNotice] = createSignal<string | null>(null)
-  const loginFailed = new URLSearchParams(window.location.search).get('login') === 'failed'
-  if (loginFailed) {
-    // Drop the flag so a reload doesn't show the error again.
+  const query = new URLSearchParams(window.location.search)
+  const loginFailed = query.get('login') === 'failed'
+  const mailFlag = query.get('mail')
+  const linkResult: LinkResult = mailFlag === 'linked' || mailFlag === 'failed' ? mailFlag : null
+  if (loginFailed || mailFlag !== null) {
+    // Drop the flag so a reload doesn't show the message again.
     window.history.replaceState(null, '', window.location.pathname)
   }
 
@@ -450,6 +634,7 @@ function App() {
                 }}
               />
             </Show>
+            <Mail onSignedOut={() => mutate(null)} linkResult={linkResult} />
             <Notes onSignedOut={() => mutate(null)} />
           </Show>
         </Show>

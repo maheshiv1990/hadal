@@ -158,7 +158,8 @@ RULES: list[Rule] = [
          "Build cookies only with auth::cookies::SetCookie (fixed Secure/HttpOnly/SameSite).",
          exclude=["backend/src/auth/cookies.rs"]),
     Rule("notes-owner-scope", ["3.1.4", "3.1.1"], RS, None,
-         "SQL touching `notes` must be scoped by owner_id (IDOR).", custom="owner_scope"),
+         "SQL touching user data (`notes`, `mail_accounts`, `mail_messages`) must be scoped by owner_id (IDOR).",
+         custom="owner_scope"),
     Rule("outbound-http", ["5.1.5"], RS,
          r"\breqwest::(Client|ClientBuilder|get|blocking|Request|RequestBuilder)\b|\b(awc|ureq|isahc|surf|hyper_util)::",
          "Outbound HTTP is confined to auth/google.rs (fixed Google endpoint; SSRF).",
@@ -327,7 +328,8 @@ def lint_file(rel: str, text: str | None = None) -> list[Finding]:
         elif rule.custom == "owner_scope":
             for m in re.finditer(r'"(?:[^"\\]|\\.)*"', text, re.S):
                 lit = m.group(0)
-                if re.search(r"(?i)\b(from|update|into|join)\s+notes\b", lit) and "owner_id" not in lit:
+                if re.search(r"(?i)\b(from|update|into|join)\s+(notes|mail_accounts|mail_messages)\b", lit) \
+                        and "owner_id" not in lit:
                     add(rule, m.start())
         elif rule.custom == "cookie_flags":
             for m in re.finditer(r"\bCookie(?:Builder)?::(?:build|new)\s*\((?:(?!;).)*;", text, re.S):

@@ -42,6 +42,8 @@ services:
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?set GOOGLE_CLIENT_ID in .env}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:?set GOOGLE_CLIENT_SECRET in .env}
       OAUTH_REDIRECT_URI: ${OAUTH_REDIRECT_URI:-https://localhost:${HTTPS_PORT:-8000}/api/auth/callback}
+      # Encrypts Gmail refresh tokens and imported mail (CASA 6.7.1).
+      DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?set DATA_ENCRYPTION_KEY in .env (openssl rand -base64 32)}
       SESSION_IDLE_SECS: ${SESSION_IDLE_SECS:-1800}
       SESSION_ABSOLUTE_SECS: ${SESSION_ABSOLUTE_SECS:-43200}
     volumes:

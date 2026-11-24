@@ -1,6 +1,8 @@
 mod auth;
 mod config;
+mod crypto;
 mod error;
+mod mail;
 mod routes;
 mod security;
 #[cfg(test)]
@@ -100,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
 
     let google = auth::google::GoogleClient::new(&config.oauth)
         .context("failed to build the Google sign-in client")?;
+    let cipher = crypto::DataCipher::from_base64(config.data_encryption_key.expose())?;
 
     tracing::info!(host = %config.host, port = config.port, "starting server");
 
@@ -108,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
     let auth_limiter = web::Data::new(auth_limiter);
     let account_limiter = web::Data::new(account_limiter);
     let google = web::Data::new(google);
+    let cipher = web::Data::new(cipher);
     let session_config = web::Data::new(config.session.clone());
     HttpServer::new(move || {
         App::new()
@@ -116,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
             .app_data(auth_limiter.clone())
             .app_data(account_limiter.clone())
             .app_data(google.clone())
+            .app_data(cipher.clone())
             .app_data(session_config.clone())
             // Order: last `wrap` runs first. Headers wrap everything, including 429s.
             .wrap(middleware::from_fn(security::rate_limit))
