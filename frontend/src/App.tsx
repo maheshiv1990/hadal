@@ -4,6 +4,7 @@ import {
   downloadAttachment,
   GMAIL_CONNECT_PATH,
   LOGIN_PATH,
+  PAGE_SIZE,
   UnauthorizedError,
   type FolderLabel,
   type MailAccount,
@@ -459,15 +460,17 @@ function Mail(props: {
     const account = selectedAccount()
     return account && !isPrimary(account) ? account : undefined
   }
-  // The open folder of the selected mailbox, fetched from the server.
+  /** Page of the list being shown, counted from 0; back to 0 on a new folder. */
+  const [page, setPage] = createSignal(0)
+  // The shown page of the selected mailbox's open folder, fetched from the server.
   const [messages, { refetch: refetchMessages }] = createResource(
     () => {
       const id = selectedAccount()?.id
-      return id ? `${id}|${folder()}` : false
+      return id ? `${id}|${folder()}|${page()}` : false
     },
     (key) => {
-      const [account, label] = key.split('|')
-      return api.listMessages(account, label as FolderLabel)
+      const [account, label, n] = key.split('|')
+      return api.listMessages(account, label as FolderLabel, Number(n))
     },
   )
   const visible = () => messages() ?? []
@@ -486,12 +489,26 @@ function Mail(props: {
   const showMailbox = (id: string | null) => {
     setMailbox(id)
     setOpenId(null)
+    setPage(0)
     // A user label belongs to one mailbox; another one starts at its Inbox.
     if (folder().startsWith('Label_')) setFolder('INBOX')
   }
   const showFolder = (label: FolderLabel) => {
     setFolder(label)
     setOpenId(null)
+    setPage(0)
+  }
+
+  /** Messages in the open folder, for "1–50 of N" and the page buttons. */
+  const total = () => countOf(folder())
+  const firstShown = () => page() * PAGE_SIZE + 1
+  const lastShown = () => page() * PAGE_SIZE + visible().length
+  const hasNext = () => (page() + 1) * PAGE_SIZE < total()
+  /** Page buttons only when the folder doesn't fit on one page. */
+  const paged = () => page() > 0 || total() > PAGE_SIZE
+  const turnPage = (to: number) => {
+    setPage(to)
+    document.querySelector('.inbox-main')?.scrollIntoView({ block: 'nearest' })
   }
 
   /** True while an import refreshes the list: the list stays up meanwhile. */
@@ -668,21 +685,51 @@ function Mail(props: {
       </aside>
 
       <div class="inbox-main">
-        {/* Only when there's something in it: Back, or Disconnect for a non-primary mailbox. */}
-        <Show when={openId() || disconnectable()}>
+        {/* Only when there's something in it: Back, Disconnect for a
+            non-primary mailbox, or the page buttons. */}
+        <Show when={openId() || disconnectable() || paged()}>
           <div class="inbox-toolbar">
             <Show
               when={openId()}
               fallback={
-                <div class="toolbar-group">
-                  <Show when={disconnectable()}>
-                    {(account) => (
-                      <button class="ghost danger" onClick={() => disconnect(account())}>
-                        Disconnect
+                <>
+                  <div class="toolbar-group">
+                    <Show when={disconnectable()}>
+                      {(account) => (
+                        <button class="ghost danger" onClick={() => disconnect(account())}>
+                          Disconnect
+                        </button>
+                      )}
+                    </Show>
+                  </div>
+                  <Show when={paged()}>
+                    <nav class="toolbar-group pager" aria-label="Pages">
+                      <span class="muted toolbar-status">
+                        {visible().length
+                          ? `${firstShown()}–${lastShown()} of ${total().toLocaleString()}`
+                          : `${total().toLocaleString()} messages`}
+                      </span>
+                      <button
+                        class="ghost"
+                        onClick={() => turnPage(page() - 1)}
+                        disabled={page() === 0}
+                        aria-label="Newer messages"
+                        title="Newer"
+                      >
+                        ‹ Previous
                       </button>
-                    )}
+                      <button
+                        class="ghost"
+                        onClick={() => turnPage(page() + 1)}
+                        disabled={!hasNext()}
+                        aria-label="Older messages"
+                        title="Older"
+                      >
+                        Next ›
+                      </button>
+                    </nav>
                   </Show>
-                </div>
+                </>
               }
             >
               <button class="ghost" onClick={() => setOpenId(null)} aria-label="Back to the list">

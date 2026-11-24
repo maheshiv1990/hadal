@@ -129,8 +129,11 @@ const MAX_FILENAME_CHARS: usize = 255;
 const MAX_MIME_CHARS: usize = 255;
 /// Gmail's own limit on attachment size.
 pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
-/// Most messages returned by one list call.
-pub const LIST_LIMIT: i64 = 200;
+/// Messages per page of the message list.
+pub const PAGE_SIZE: i64 = 50;
+/// Highest page number accepted (a million messages in), so a request
+/// can't ask Postgres to skip an absurd number of rows.
+pub const MAX_PAGE: u32 = 20_000;
 
 /// Gmail encodes bodies as base64url, sometimes with padding.
 const GMAIL_BASE64: GeneralPurpose = GeneralPurpose::new(
@@ -492,7 +495,8 @@ fn stored_labels(labels: Option<Vec<String>>) -> Vec<String> {
     labels.unwrap_or_else(|| vec!["INBOX".to_owned()])
 }
 
-/// Newest imported messages across all of the user's mailboxes.
+/// One page (`PAGE_SIZE`, newest first, `page` counted from 0) of the
+/// imported messages across all of the user's mailboxes.
 ///
 /// Optionally only one of the user's mailboxes, and only one folder. An
 /// `account` that isn't the caller's simply matches nothing.
@@ -502,7 +506,9 @@ pub async fn list_messages(
     owner: Uuid,
     account: Option<Uuid>,
     filter: Option<LabelFilter>,
+    page: u32,
 ) -> Result<Vec<MessageItem>, AppError> {
+    let offset = i64::from(page.min(MAX_PAGE)) * PAGE_SIZE;
     let (label, all_mail) = match filter {
         None => (None, false),
         Some(LabelFilter::AllMail) => (None, true),
@@ -519,14 +525,16 @@ pub async fn list_messages(
                  OR $4 = ANY(m.labels)
                  OR (m.labels IS NULL AND $4 = 'INBOX'))
             AND (NOT $5 OR NOT ('SPAM' = ANY(coalesce(m.labels, '{}'))))
-          ORDER BY m.received_at DESC
-          LIMIT $2",
+          -- id breaks ties, so a message can't appear on two pages.
+          ORDER BY m.received_at DESC, m.id DESC
+          LIMIT $2 OFFSET $6",
     )
     .bind(owner)
-    .bind(LIST_LIMIT)
+    .bind(PAGE_SIZE)
     .bind(account)
     .bind(label)
     .bind(all_mail)
+    .bind(offset)
     .fetch_all(pool)
     .await?;
     rows.into_iter()

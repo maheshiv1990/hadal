@@ -64,6 +64,9 @@ export interface MailMessageDetail extends MailMessage {
   body: string
 }
 
+/** Messages per page of the list (the backend's `mail::PAGE_SIZE`). */
+export const PAGE_SIZE = 50
+
 export interface MailImportResult {
   imported: number
   accounts: {
@@ -159,8 +162,10 @@ export const api = {
     request<void>(`/mail/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   // JSON body so a cross-site form can't start an import (CASA 3.1.5).
   importMail: () => request<MailImportResult>('/mail/import', { method: 'POST', body: '{}' }),
-  /** The newest messages of one mailbox's folder. */
-  listMessages: (account: string, label: FolderLabel) =>
-    request<MailMessage[]>(`/mail/messages?${new URLSearchParams({ account, label })}`),
+  /** One page (`PAGE_SIZE`, newest first, counted from 0) of a mailbox's folder. */
+  listMessages: (account: string, label: FolderLabel, page: number) =>
+    request<MailMessage[]>(
+      `/mail/messages?${new URLSearchParams({ account, label, page: String(page) })}`,
+    ),
   getMessage: (id: string) => request<MailMessageDetail>(`/mail/messages/${encodeURIComponent(id)}`),
 }

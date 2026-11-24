@@ -330,6 +330,7 @@ mod tests {
             "label=ALL&label=INBOX".to_owned(),
             "label=ALL&label=ALL".to_owned(),
             format!("account={account}&account={account}"),
+            "page=0&page=1".to_owned(),
         ] {
             let uri = format!("/api/mail/messages?{query}");
             let (status, body) = json_body(test::call_service(&app, get(&uri)).await).await;
@@ -1117,6 +1118,30 @@ mod tests {
             "each message fetched once"
         );
 
+        // The list comes 50 at a time; together the pages hold every
+        // message exactly once.
+        let mut seen = std::collections::HashSet::new();
+        for page in 0..13 {
+            let uri = format!("/api/mail/messages?label=ALL&page={page}");
+            let (status, list) =
+                json_body(test::call_service(&app, req!("GET", &uri, &session)).await).await;
+            assert_eq!(status, 200);
+            let list = list.as_array().unwrap();
+            assert_eq!(list.len(), if page < 12 { 50 } else { 20 }, "page {page}");
+            for m in list {
+                assert!(
+                    seen.insert(m["id"].as_str().unwrap().to_owned()),
+                    "repeated"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 620);
+        let (_, past_the_end) = json_body(
+            test::call_service(&app, req!("GET", "/api/mail/messages?page=13", &session)).await,
+        )
+        .await;
+        assert_eq!(past_the_end, json!([]));
+
         // Nothing new: nothing fetched, and the walk isn't repeated.
         let (_, body) = import().await;
         assert_eq!(body["imported"], 0);
@@ -1538,6 +1563,9 @@ mod tests {
             "/api/mail/messages?label=Label_..%2Fx",
             "/api/mail/messages?folder=INBOX",
             "/api/mail/messages?account=not-a-uuid",
+            "/api/mail/messages?page=-1",
+            "/api/mail/messages?page=x",
+            "/api/mail/messages?page=20001",
         ] {
             let resp = test::call_service(&app, req!("GET", uri, &session)).await;
             assert_eq!(resp.status(), 400, "{uri}");
