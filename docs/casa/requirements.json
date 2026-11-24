@@ -25,7 +25,7 @@
       "title": "Passwords are stored in a form resistant to offline attacks",
       "status": "verified",
       "evidence": ["test:hashes_are_salted_argon2id_and_verify", "test:registration_signs_in_and_stores_only_an_argon2id_hash", "test:password_policy_is_length_based", "test:password_login_does_not_reveal_which_emails_exist"],
-      "notes": "Email + password accounts are off unless PASSWORD_AUTH_ENABLED=true (the default and the production setting are off); while off, /api/auth/register, /api/auth/password-login and /api/auth/password don't exist and return 404 before any handler runs (test:password_accounts_are_off_unless_enabled). The controls below still apply, and are tested, if they are switched on. Passwords are hashed with Argon2id (m=19 MiB, t=2, p=1, OWASP's minimum, pinned in auth/password.rs) with a 128-bit random salt per password, as a PHC string. The users table only accepts '$argon2id$' values. Hashing runs on a blocking thread. Policy: 12-128 characters, no composition rules (ASVS 2.1). Unknown emails still cost one verification, so timing doesn't reveal accounts. Not yet: breached-password check (ASVS 2.1.7)."
+      "notes": "Email + password accounts are off unless PASSWORD_AUTH_ENABLED=true (the default and the production setting are off); while off, /api/auth/register, /api/auth/password-login and /api/auth/password don't exist and return 404 before any handler runs (test:password_accounts_are_off_unless_enabled). The controls below still apply, and are tested, if they are switched on. Passwords are hashed with Argon2id (m=19 MiB, t=2, p=1, OWASP's minimum, pinned in auth/password.rs) with a 128-bit random salt per password, as a PHC string. The users table only accepts '$argon2id$' values. Hashing runs on a blocking thread. Policy: 12-128 characters, no composition rules (ASVS 2.1). Unknown emails still cost one verification, so timing doesn't reveal accounts. Caveat: in the production configuration (PASSWORD_AUTH_ENABLED=false) Hadal stores no passwords at all, since sign-in is Google-only; this item is verified for the opt-in password path, which must not be enabled in production without re-reviewing it. The Argon2id cost is OWASP's floor, not tuned to the production host. Not yet: breached-password check (ASVS 2.1.7)."
     },
     {
       "id": "1.2.1",
@@ -217,14 +217,19 @@
       "id": "5.1.1",
       "title": "Protect against HTTP parameter pollution",
       "status": "verified",
-      "evidence": ["test:duplicate_json_keys_are_rejected", "lint:raw-query-string"]
+      "evidence": [
+        "test:duplicate_json_keys_are_rejected",
+        "test:duplicate_query_params_are_rejected",
+        "lint:raw-query-string"
+      ],
+      "notes": "JSON bodies: serde rejects a repeated key with 400 (duplicate_json_keys_are_rejected). Query strings are parsed only through typed web::Query<T> (lint:raw-query-string forbids reading query_string() by hand), so a repeated parameter fails deserialization and the QueryConfig handler answers 400 \"invalid query string\" instead of letting the first or last value win (duplicate_query_params_are_rejected, on /api/mail/messages)."
     },
     {
       "id": "5.1.2",
       "title": "URL redirects and forwards are limited to allowlisted URLs",
       "status": "verified",
       "evidence": ["lint:open-redirect", "tool:check-tls", "file:nginx/default.conf.template"],
-      "notes": "Every redirect has a fixed target. Backend: only through auth::redirect(), to Google's authorization endpoint (an AuthorizeUrl only GoogleClient can build) or constant same-origin paths; nothing comes from the request. nginx: HTTP->HTTPS redirects go to CANONICAL_HOST (hadalspace.com in production), never the request's Host header. Requests for any other host name hit default servers that close the connection (port 80) or answer 421 Misdirected Request (port 443, with the same hardened TLS settings, so clients that send no SNI still work), so the edge can't be used as an open redirect or serve the app under someone else's name. check-tls.sh checks this on the running stack in CI."
+      "notes": "Every redirect has a fixed target. Backend: only through auth::redirect(), to Google's authorization endpoint (an AuthorizeUrl only GoogleClient can build) or constant same-origin paths; nothing comes from the request. nginx: both HTTP->HTTPS redirects (port 80, and plain HTTP sent to the TLS port via error_page 497) go to CANONICAL_HOST (hadalspace.com in production), never the request's Host header. Requests for any other host name hit default servers that close the connection (port 80, 444) or answer 421 Misdirected Request (port 443, with the same hardened TLS settings, so clients that send no SNI still work), whether the foreign name came in the SNI or only in the Host header. So the edge can't be used as an open redirect or serve the app under someone else's name. check-tls.sh checks this on the running stack in CI: no redirect to a foreign Host on port 80, 421 for a foreign SNI, and no app response for a foreign Host with the right SNI."
     },
     {
       "id": "5.1.3",

@@ -158,7 +158,7 @@ RULES: list[Rule] = [
          "Build cookies only with auth::cookies::SetCookie (fixed Secure/HttpOnly/SameSite).",
          exclude=["backend/src/auth/cookies.rs"]),
     Rule("notes-owner-scope", ["3.1.4", "3.1.1"], RS, None,
-         "SQL touching user data (`notes`, `mail_accounts`, `mail_messages`) must be scoped by owner_id (IDOR).",
+         "SQL touching user data (`notes`, `mail_accounts`, `mail_messages`, `mail_labels`) must be scoped by owner_id (IDOR).",
          custom="owner_scope"),
     Rule("outbound-http", ["5.1.5"], RS,
          r"\breqwest::(Client|ClientBuilder|get|blocking|Request|RequestBuilder)\b|\b(awc|ureq|isahc|surf|hyper_util)::",
@@ -328,7 +328,7 @@ def lint_file(rel: str, text: str | None = None) -> list[Finding]:
         elif rule.custom == "owner_scope":
             for m in re.finditer(r'"(?:[^"\\]|\\.)*"', text, re.S):
                 lit = m.group(0)
-                if re.search(r"(?i)\b(from|update|into|join)\s+(notes|mail_accounts|mail_messages)\b", lit) \
+                if re.search(r"(?i)\b(from|update|into|join)\s+(notes|mail_accounts|mail_messages|mail_labels)\b", lit) \
                         and "owner_id" not in lit:
                     add(rule, m.start())
         elif rule.custom == "cookie_flags":
@@ -392,11 +392,21 @@ def cmd_hook() -> int:
     return 2
 
 
+# A test attribute (`#[test]`, `#[actix_web::test]`, `#[tokio::test(...)]`), then any
+# further attributes or doc comments, then the function it marks.
+TEST_FN = re.compile(
+    r"#\[(?:\w+::)*test(?:\([^)]*\))?\]"
+    r"(?:\s*(?:#\[[^\]]*\]|///[^\n]*|//[^\n]*))*"
+    r"\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)"
+)
+
+
 def test_fn_names() -> set[str]:
+    """Names of functions marked as tests. A helper or production fn is not evidence."""
     names: set[str] = set()
     for rel in git_files():
         if rel.startswith("backend/src/") and rel.endswith(".rs"):
-            names |= set(re.findall(r"\bfn\s+(\w+)", (ROOT / rel).read_text(encoding="utf-8")))
+            names |= set(TEST_FN.findall((ROOT / rel).read_text(encoding="utf-8")))
     return names
 
 
@@ -424,7 +434,7 @@ def cmd_requirements() -> int:
         for ev in r.get("evidence", []):
             kind, _, ref = ev.partition(":")
             if kind == "test" and ref not in fns:
-                errors.append(f"{r['id']}: evidence test '{ref}' does not exist in backend/src")
+                errors.append(f"{r['id']}: evidence test '{ref}' is not a #[test] fn in backend/src")
             elif kind == "lint" and ref not in RULE_IDS:
                 errors.append(f"{r['id']}: evidence lint rule '{ref}' does not exist")
             elif kind == "tool" and ref not in TOOLS:

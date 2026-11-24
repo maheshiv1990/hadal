@@ -56,6 +56,9 @@ CASES = {
     "notes-owner-scope-mail": ("x.rs",
         'sqlx::query("SELECT body_enc FROM mail_messages WHERE id = $1").bind(id)',
         'sqlx::query("SELECT body_enc FROM mail_messages WHERE id = $1 AND owner_id = $2")'),
+    "notes-owner-scope-labels": ("x.rs",
+        'sqlx::query("DELETE FROM mail_labels WHERE account_id = $1").bind(id)',
+        'sqlx::query("DELETE FROM mail_labels WHERE owner_id = $1 AND account_id = $2")'),
     "notes-owner-scope-multiline": ("x.rs",
         'sqlx::query_as::<_, Note>(\n    "SELECT id, title\n     FROM notes ORDER BY created_at",\n)',
         'sqlx::query_as::<_, Note>(\n    "SELECT id, title FROM notes\n     WHERE owner_id = $1",\n)'),
@@ -72,6 +75,7 @@ CASES = {
 ALIASES = {"sql-string-building-var": "sql-string-building", "sql-string-building-ident": "sql-string-building",
            "notes-owner-scope-multiline": "notes-owner-scope",
            "notes-owner-scope-mail": "notes-owner-scope",
+           "notes-owner-scope-labels": "notes-owner-scope",
            "directory-listing-template": "directory-listing"}
 
 
@@ -134,6 +138,20 @@ class RuleSelfTest(unittest.TestCase):
         self.assertIn("outbound-http", rules_hit("backend/src/routes/notes.rs", http))
         self.assertEqual(rules_hit("backend/src/auth/cookies.rs", cookie), set())
         self.assertIn("set-cookie-outside-helper", rules_hit("backend/src/auth/mod.rs", cookie))
+
+    def test_test_fn_pattern_matches_only_marked_tests(self):
+        # Only functions under a test attribute count as `test:` evidence.
+        src = (
+            "fn helper() {}\n"
+            "pub async fn handler() {}\n"
+            "#[test]\nfn plain() {}\n"
+            "#[actix_web::test]\nasync fn web() {}\n"
+            "#[tokio::test(flavor = \"multi_thread\")]\nasync fn tokio_flavored() {}\n"
+            "#[test]\n#[ignore]\n/// doc\n// note\nfn with_attrs() {}\n"
+            "#[cfg(test)]\nfn cfg_only() {}\n"
+        )
+        self.assertEqual(set(cc.TEST_FN.findall(src)),
+                         {"plain", "web", "tokio_flavored", "with_attrs"})
 
     def test_spec_ids_complete(self):
         self.assertEqual(len(cc.SPEC_IDS), 55)
