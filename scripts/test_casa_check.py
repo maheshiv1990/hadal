@@ -47,13 +47,26 @@ CASES = {
     "permissive-deserialize": ("x.rs",
         "#[derive(Deserialize)]\npub struct NewNote { title: String }",
         "#[derive(Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct NewNote { title: String }"),
+    "set-cookie-outside-helper": ("x.rs",
+        'resp.append_header((header::SET_COOKIE, format!("sid={v}")));',
+        'SetCookie::new(SESSION_COOKIE, &v, 60, SameSite::Strict).apply(&mut resp);'),
+    "notes-owner-scope": ("x.rs",
+        'sqlx::query("DELETE FROM notes WHERE id = $1").bind(id)',
+        'sqlx::query("DELETE FROM notes WHERE id = $1 AND owner_id = $2").bind(id).bind(uid)'),
+    "notes-owner-scope-multiline": ("x.rs",
+        'sqlx::query_as::<_, Note>(\n    "SELECT id, title\n     FROM notes ORDER BY created_at",\n)',
+        'sqlx::query_as::<_, Note>(\n    "SELECT id, title FROM notes\n     WHERE owner_id = $1",\n)'),
+    "outbound-http": ("x.rs",
+        "let c = reqwest::Client::new(); c.get(user_url).send().await?;",
+        "let u: reqwest::Url = cfg.redirect_uri.clone();"),
     "cookie-flags": ("x.rs",
         'let c = Cookie::build("sid", v).secure(true).finish();',
         'let c = Cookie::build("sid", v).secure(true).http_only(true).same_site(SameSite::Lax).finish();'),
 }
 
 
-ALIASES = {"sql-string-building-var": "sql-string-building", "sql-string-building-ident": "sql-string-building"}
+ALIASES = {"sql-string-building-var": "sql-string-building", "sql-string-building-ident": "sql-string-building",
+           "notes-owner-scope-multiline": "notes-owner-scope"}
 
 
 def rules_hit(name: str, text: str) -> set[str]:
@@ -106,6 +119,15 @@ class RuleSelfTest(unittest.TestCase):
         out = cc.strip_rust_tests(src)
         self.assertEqual(out.count("\n"), src.count("\n"))
         self.assertEqual(out.splitlines()[5], "fn b() {}")
+
+    def test_confined_rules_allow_only_their_module(self):
+        # outbound-http / set-cookie-outside-helper exempt exactly one file each.
+        http = "let c = reqwest::Client::builder().build()?;"
+        cookie = "resp.append_header((header::SET_COOKIE, v));"
+        self.assertEqual(rules_hit("backend/src/auth/google.rs", http), set())
+        self.assertIn("outbound-http", rules_hit("backend/src/routes/notes.rs", http))
+        self.assertEqual(rules_hit("backend/src/auth/cookies.rs", cookie), set())
+        self.assertIn("set-cookie-outside-helper", rules_hit("backend/src/auth/mod.rs", cookie))
 
     def test_spec_ids_complete(self):
         self.assertEqual(len(cc.SPEC_IDS), 55)

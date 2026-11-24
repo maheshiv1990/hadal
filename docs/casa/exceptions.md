@@ -6,7 +6,12 @@ The pre-commit Claude review rejects suppressions that aren't justified here.
 
 ## Active suppressions
 
-`casa-allow`: _none._
+`casa-allow`:
+
+| Location | Rule | Why it is safe |
+| --- | --- | --- |
+| `backend/src/auth/mod.rs`, `redirect()` (`Location` header) | `open-redirect` | The only redirect helper. Its target is a closed enum: Google's authorization endpoint (an `AuthorizeUrl`, which only `GoogleClient::authorize_url` can construct from a constant base URL), `/`, or `/?login=failed`. No part of the request picks the target. |
+| `backend/src/auth/mod.rs`, `CallbackParams` | `permissive-deserialize` | Google's redirect adds query params we don't use (`scope`, `authuser`, `prompt`, `hd`), so unknown fields must be tolerated. The struct is read-only input to the sign-in check and is never persisted, so mass assignment can't happen. Duplicate params are still rejected. |
 
 Scanner ignores:
 
@@ -22,6 +27,9 @@ Scanner ignores:
 | `licenses.private.ignore = true` | Our own crate is `publish = false` and proprietary. |
 | actix-web built with `default-features = false, features = ["macros"]` | Drops `cookie 0.16` (RUSTSEC-2026-0594) and `h2 0.3` (RUSTSEC-2026-0258). HTTP/2 belongs at the TLS-terminating proxy. |
 | `chrono` replaced by `time` | RUSTSEC-2026-0543 (chrono unmaintained). |
+| `reqwest` with `default-features = false, features = ["rustls-no-provider", "json", "form"]` | Only for the sign-in code exchange. Default features would add aws-lc-rs, HTTP/2 and system proxy support, none of which we need. TLS is a rustls `ClientConfig` on the `ring` provider (already used by sqlx) with `webpki-roots`. |
+| `webpki-roots` (CDLA-Permissive-2.0) | Mozilla's CA set, compiled in, so the container's trust store can't weaken verification of Google's certificate. |
+| `argon2` 0.6 with `default-features = false, features = ["alloc", "password-hash", "zeroize"]` | RustCrypto, MIT/Apache-2.0. Salts come from the `getrandom` 0.3 we already use, so the crate's own `getrandom` feature is off. |
 | No advisory ignores | `[advisories] ignore = []`; keep it that way. |
 
 ## Architecture notes the assessor will ask about
@@ -32,6 +40,38 @@ Scanner ignores:
   header. Publishing port 8080 directly while this is true would let clients
   spoof their IP to dodge the limit. Tests cover both modes.
 - **Backend to Postgres is plaintext** on the private compose network (pending 4.1.2).
+- **ID token signature is not checked (OIDC Core 1.0 §3.1.3.7, step 6).** The
+  backend receives the ID token directly from Google's token endpoint, over a
+  TLS connection it opened and verified, in exchange for a single-use code bound
+  to a PKCE verifier. The spec allows TLS server validation in place of the JWS
+  signature in that case. Every claim is still validated (iss, aud/azp, exp, iat,
+  nonce, email_verified). If ID tokens are ever accepted from any other source
+  (the browser, another service), signature verification against Google's JWKS
+  becomes mandatory.
+- **Google tokens are not stored.** Sign-in requests only `openid email`, and
+  Google's access and refresh tokens are dropped after the exchange. When
+  restricted scopes are added, their tokens need encrypted storage and revocation
+  on logout (reopen 2.2.1, 6.7.1).
+- **The auth migration deleted existing notes.** Notes created before sign-in
+  existed had no owner and were readable by everyone, so
+  `20261124000000_auth.sql` removes them instead of assigning them to a user.
+- **Sign-in state lives in the database.** `/api/auth/login` writes one
+  `oauth_logins` row per attempt (10-minute expiry, purged every 5 minutes) and
+  is limited to 10 per minute per IP.
+- **Email + password accounts are separate from Google accounts.** Registration
+  emails are not verified, so linking accounts by address would let anyone
+  take over a Google user's notes by registering their address first. A
+  password account and a Google account with the same email are different
+  users (`password_and_google_accounts_stay_separate`).
+- **Registration says when an email is taken.** `POST /api/auth/register`
+  returns 409 for an address that already has a password account, which tells
+  a caller the account exists. Hiding it needs email verification (reply "check
+  your inbox" either way), which doesn't exist yet. Until then it's bounded by
+  the per-IP auth limit. Sign-in itself doesn't reveal accounts: one message,
+  and the same Argon2 work for unknown emails.
+- **Not yet built for password accounts:** email verification, password reset
+  and change (2.2.2 stays pending until they exist and revoke other sessions),
+  and a breached-password check.
 
 ## Gate limitations
 
@@ -49,6 +89,10 @@ Scanner ignores:
     when the `claude` CLI is unavailable. It prints `SKIPPED`, but the commit
     leaves no trace. Re-run `scripts/claude-review.sh` on that change before
     pushing.
+- **DB-backed tests need Postgres.** `scripts/verify.sh` starts a throwaway
+  container (`scripts/test-db.sh`, port 55432, data on tmpfs) unless
+  `TEST_DATABASE_URL` is set. CI uses a service container. The tests fail rather
+  than skip when no database is available.
 - Semgrep runs in CI only unless installed locally (`pipx install semgrep`).
 - DAST (OWASP ZAP baseline) runs in CI against the docker-compose stack.
   Warnings are reported as an artifact. Only FAIL-level alerts break the build.

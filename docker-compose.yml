@@ -29,6 +29,13 @@ services:
       # X-Real-IP, so the rate limiter may key on it. Never publish 8080
       # directly while this is true.
       TRUST_PROXY_HEADERS: "true"
+      # Google OAuth client (Web application). The backend refuses to start
+      # without them. Production: inject from a secrets manager (CASA 6.7.1).
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:?set GOOGLE_CLIENT_ID in .env}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:?set GOOGLE_CLIENT_SECRET in .env}
+      OAUTH_REDIRECT_URI: ${OAUTH_REDIRECT_URI:-http://localhost:8000/api/auth/callback}
+      SESSION_IDLE_SECS: ${SESSION_IDLE_SECS:-1800}
+      SESSION_ABSOLUTE_SECS: ${SESSION_ABSOLUTE_SECS:-43200}
     depends_on:
       db:
         condition: service_healthy

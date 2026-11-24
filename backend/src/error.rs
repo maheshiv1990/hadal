@@ -4,6 +4,15 @@ use serde::Serialize;
 #[derive(Debug)]
 pub enum AppError {
     NotFound,
+    /// No valid session. Deliberately the same body for "no cookie",
+    /// "unknown token" and "expired", so callers learn nothing extra.
+    Unauthorized,
+    /// Wrong email or password. One message for both, so a failed sign-in
+    /// doesn't say whether the account exists.
+    InvalidCredentials,
+    /// Too many attempts for one account (CASA 1.1.1).
+    TooManyRequests,
+    Conflict(&'static str),
     BadRequest(String),
     Internal(anyhow::Error),
 }
@@ -17,6 +26,10 @@ impl std::fmt::Display for AppError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AppError::NotFound => write!(f, "not found"),
+            AppError::Unauthorized => write!(f, "authentication required"),
+            AppError::InvalidCredentials => write!(f, "invalid email or password"),
+            AppError::TooManyRequests => write!(f, "too many requests"),
+            AppError::Conflict(msg) => write!(f, "{msg}"),
             AppError::BadRequest(msg) => write!(f, "{msg}"),
             AppError::Internal(_) => write!(f, "internal server error"),
         }
@@ -27,6 +40,9 @@ impl ResponseError for AppError {
     fn status_code(&self) -> StatusCode {
         match self {
             AppError::NotFound => StatusCode::NOT_FOUND,
+            AppError::Unauthorized | AppError::InvalidCredentials => StatusCode::UNAUTHORIZED,
+            AppError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+            AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }

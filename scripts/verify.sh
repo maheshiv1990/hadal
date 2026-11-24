@@ -56,7 +56,19 @@ frontend_deps() {
   [[ -d frontend/node_modules ]] || (cd frontend && npm ci --no-audit --no-fund --ignore-scripts)
 }
 
+# DB-backed tests (sign-in, sessions, IDOR) need Postgres. CI provides one via
+# TEST_DATABASE_URL; locally a throwaway container is started. If neither is
+# possible the gate fails: those tests are never skipped.
+ensure_test_db() {
+  [[ -n "${TEST_DATABASE_URL:-}" ]] && return 0
+  local out
+  out="$(scripts/test-db.sh start)" || return 1
+  eval "$out"
+  export TEST_DATABASE_URL
+}
+
 # ---- quick ----------------------------------------------------------------
+step "backend: test database"        ensure_test_db
 step "casa: checker self-tests"      python3 -m unittest -q scripts/test_casa_check.py
 step "casa: static rules"            python3 scripts/casa_check.py lint
 step "casa: requirement register"    python3 scripts/casa_check.py requirements

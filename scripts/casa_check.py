@@ -153,6 +153,16 @@ RULES: list[Rule] = [
          custom="permissive_deserialize"),
     Rule("cookie-flags", ["2.3.1", "2.3.2", "3.1.5"], RS, None,
          "Cookies must set .secure(true), .http_only(true) and .same_site(...).", custom="cookie_flags"),
+    Rule("set-cookie-outside-helper", ["2.3.1", "2.3.2", "3.1.5"], RS,
+         r"(?i)(\bSET_COOKIE\b|\"set-cookie\")",
+         "Build cookies only with auth::cookies::SetCookie (fixed Secure/HttpOnly/SameSite).",
+         exclude=["backend/src/auth/cookies.rs"]),
+    Rule("notes-owner-scope", ["3.1.4", "3.1.1"], RS, None,
+         "SQL touching `notes` must be scoped by owner_id (IDOR).", custom="owner_scope"),
+    Rule("outbound-http", ["5.1.5"], RS,
+         r"\breqwest::(Client|ClientBuilder|get|blocking|Request|RequestBuilder)\b|\b(awc|ureq|isahc|surf|hyper_util)::",
+         "Outbound HTTP is confined to auth/google.rs (fixed Google endpoint; SSRF).",
+         exclude=["backend/src/auth/google.rs"]),
     Rule("env-file-tracked", ["6.7.1"], [], None,
          ".env files must never be committed.", custom="env_tracked"),
 ]
@@ -272,6 +282,8 @@ def read(rel: str) -> str:
 
 def matches_files(rule: Rule, rel: str) -> bool:
     name = os.path.basename(rel)
+    if any(fnmatch.fnmatch(rel, g) for g in rule.exclude):
+        return False
     return any(fnmatch.fnmatch(name, g) for g in rule.files)
 
 
@@ -311,6 +323,11 @@ def lint_file(rel: str, text: str | None = None) -> list[Finding]:
                 text,
             ):
                 if "deny_unknown_fields" not in m.group(1):
+                    add(rule, m.start())
+        elif rule.custom == "owner_scope":
+            for m in re.finditer(r'"(?:[^"\\]|\\.)*"', text, re.S):
+                lit = m.group(0)
+                if re.search(r"(?i)\b(from|update|into|join)\s+notes\b", lit) and "owner_id" not in lit:
                     add(rule, m.start())
         elif rule.custom == "cookie_flags":
             for m in re.finditer(r"\bCookie(?:Builder)?::(?:build|new)\s*\((?:(?!;).)*;", text, re.S):
