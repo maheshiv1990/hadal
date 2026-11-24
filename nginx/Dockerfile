@@ -19,7 +19,8 @@ COPY --chmod=0755 nginx/reload-certs.sh /docker-entrypoint.d/40-reload-certs.sh
 # Settings for default.conf.template. Defaults are production-safe (2-year
 # HSTS, standard ports); docker-compose.yml (local) and
 # docker-compose.prod.yml (hadalspace.com) set the rest.
-ENV SERVER_NAME=_ \
+ENV SERVER_NAME="localhost 127.0.0.1" \
+    CANONICAL_HOST=localhost \
     SSL_CERTIFICATE=/etc/nginx/certs/cert.pem \
     SSL_CERTIFICATE_KEY=/etc/nginx/certs/key.pem \
     HTTPS_REDIRECT_PORT_SUFFIX= \
