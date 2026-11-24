@@ -581,9 +581,13 @@ function App() {
   }
 
   return (
-    <main>
-      <header class="bar">
-        <h1>Hadal</h1>
+    <>
+      <header class="site-header">
+        <div class="site-header-inner">
+        <a class="brand" href="/" aria-label="Hadal home">
+          <span class="brand-mark" aria-hidden="true">◆</span>
+          Hadal
+        </a>
         <Show when={me()}>
           {(user) => (
             <div class="user">
@@ -604,8 +608,10 @@ function App() {
             </div>
           )}
         </Show>
+        </div>
       </header>
 
+      <main>
       <Show when={!me.error} fallback={<p class="error">Could not reach the server.</p>}>
         <Show when={!me.loading} fallback={<p class="muted">Loading…</p>}>
           <Show
@@ -639,7 +645,8 @@ function App() {
           </Show>
         </Show>
       </Show>
-    </main>
+      </main>
+    </>
   )
 }
 
