@@ -13,18 +13,12 @@ import {
 /** What a signed-out visitor sees: the welcome page until they pick an action in the header. */
 type AuthView = 'home' | 'signin' | 'register'
 
-function Welcome(props: { onSignIn: () => void; onRegister: () => void }) {
+function Welcome() {
   return (
     <section class="welcome">
       <img src="/hadal-icon.png" alt="" width="96" height="96" />
       <h1>Welcome to Hadal</h1>
-      <p class="muted">Your notes and email in one private place.</p>
-      <div class="row">
-        <button onClick={props.onSignIn}>Sign in</button>
-        <button class="secondary plain" onClick={props.onRegister}>
-          Register
-        </button>
-      </div>
+      <p class="muted">Email in one private space.</p>
     </section>
   )
 }
@@ -673,7 +667,7 @@ function App() {
                   <Register onSignedIn={mutate} onCancel={() => setView('signin')} />
                 </Match>
                 <Match when={view() === 'home'}>
-                  <Welcome onSignIn={() => setView('signin')} onRegister={() => setView('register')} />
+                  <Welcome />
                 </Match>
               </Switch>
             }
