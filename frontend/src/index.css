@@ -101,3 +101,28 @@ button.link {
 .panel { padding: 1rem; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 1.5rem; }
 button.secondary.plain { color: inherit; }
 .notice { color: var(--accent); }
+
+/* Email */
+.mail h2 { margin: 0; font-size: 1.125rem; }
+.mail-head { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+.mail-actions { display: flex; gap: 0.5rem; align-items: center; }
+a.button.outline { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+.mail-accounts, .messages { list-style: none; padding: 0; margin: 0 0 1rem; }
+.mail-accounts li { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; padding: 0.5rem 0; border-bottom: 1px solid var(--border); }
+.messages li { border-bottom: 1px solid var(--border); }
+.message-row {
+  display: flex; flex-direction: column; align-items: stretch; gap: 0.15rem;
+  width: 100%; text-align: left; padding: 0.6rem 0.25rem;
+  background: transparent; color: inherit; border: 0; border-radius: 0; font-weight: normal;
+}
+.message-row:hover, .messages li.open .message-row { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.message-top { display: flex; justify-content: space-between; gap: 0.75rem; }
+.message-top strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.message-top time { flex-shrink: 0; }
+.snippet { font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.message-body { padding: 0 0.25rem 0.75rem; }
+.message-body p { margin: 0.25rem 0 0.5rem; }
+.message-body pre {
+  margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+  font: inherit; font-size: 0.9rem; max-height: 60vh; overflow: auto;
+}

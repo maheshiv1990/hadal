@@ -14,6 +14,44 @@ export interface Me {
   has_password: boolean
 }
 
+/** A linked Gmail mailbox. */
+export interface MailAccount {
+  id: string
+  email: string
+  created_at: string
+  last_import_at: string | null
+  message_count: number
+}
+
+/** An imported message, without its body. */
+export interface MailMessage {
+  id: string
+  account_id: string
+  account_email: string
+  received_at: string
+  from: string
+  to: string
+  subject: string
+  snippet: string
+}
+
+/** A message with its body. The body is plain text: never render it as HTML. */
+export interface MailMessageDetail extends MailMessage {
+  body: string
+}
+
+export interface MailImportResult {
+  imported: number
+  accounts: {
+    id: string
+    email: string
+    imported: number
+    skipped: number
+    /** A user-facing reason this mailbox failed, or null. */
+    error: string | null
+  }[]
+}
+
 /** The session is missing or expired: the user has to sign in again. */
 export class UnauthorizedError extends Error {}
 
@@ -38,6 +76,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 /** Starts Google sign-in. A plain link: the server redirects to Google. */
 export const LOGIN_PATH = '/api/auth/login'
+
+/** Links a Gmail mailbox. A plain link: the server redirects to Google. */
+export const GMAIL_CONNECT_PATH = '/api/auth/gmail/connect'
 
 /** Must match the backend's password policy (auth/password.rs). */
 export const MIN_PASSWORD_LENGTH = 12
@@ -87,4 +128,12 @@ export const api = {
   createNote: (title: string, body: string) =>
     request<Note>('/notes', { method: 'POST', body: JSON.stringify({ title, body }) }),
   deleteNote: (id: string) => request<void>(`/notes/${id}`, { method: 'DELETE' }),
+  listMailAccounts: () => request<MailAccount[]>('/mail/accounts'),
+  /** Unlinks a mailbox, deletes its imported mail and revokes Google access. */
+  disconnectMailAccount: (id: string) =>
+    request<void>(`/mail/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  // JSON body so a cross-site form can't start an import (CASA 3.1.5).
+  importMail: () => request<MailImportResult>('/mail/import', { method: 'POST', body: '{}' }),
+  listMessages: () => request<MailMessage[]>('/mail/messages'),
+  getMessage: (id: string) => request<MailMessageDetail>(`/mail/messages/${encodeURIComponent(id)}`),
 }

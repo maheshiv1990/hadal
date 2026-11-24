@@ -43,6 +43,24 @@ stack: TLS versions and suites, the redirect, HSTS, and TLS to Postgres.
 3. Put the client ID and secret in `.env` as `GOOGLE_CLIENT_ID` and
    `GOOGLE_CLIENT_SECRET`. The backend refuses to start without them.
 
+### Importing Gmail
+
+Signed-in users (Google or password accounts) can link one or more Gmail
+mailboxes on the home page and import the newest 100 messages from each with
+**Import all**. Later imports fetch only messages not imported yet.
+
+1. In the same Cloud project, enable the **Gmail API** (APIs & Services → Library).
+2. On the OAuth consent screen, add the scope
+   `https://www.googleapis.com/auth/gmail.readonly`. It is a *restricted*
+   scope: until the app is verified (which needs the CASA assessment), only the
+   consent screen's test users can link a mailbox.
+3. Set `DATA_ENCRYPTION_KEY` in `.env` (`openssl rand -base64 32`). It
+   encrypts refresh tokens and imported mail at rest; if it changes, stored mail
+   can't be read and mailboxes must be relinked.
+
+Linking reuses the sign-in redirect URI, so there's nothing new to register.
+Unlinking a mailbox deletes its imported mail and revokes the grant at Google.
+
 Session cookies are `Secure` and `__Host-` prefixed. For Vite dev on
 `http://localhost:5173` browsers still accept them, because localhost counts
 as a secure context. Everywhere else you need HTTPS.

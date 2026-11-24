@@ -57,6 +57,9 @@ pub struct Config {
     pub trust_proxy_headers: bool,
     pub oauth: OAuthConfig,
     pub session: SessionConfig,
+    /// Base64 AES-256 key for Google refresh tokens and imported mail
+    /// (`crypto::DataCipher`).
+    pub data_encryption_key: Secret,
 }
 
 // Hand-written so the connection string (which carries the DB password) can
@@ -78,6 +81,7 @@ impl std::fmt::Debug for Config {
             .field("trust_proxy_headers", &self.trust_proxy_headers)
             .field("oauth", &self.oauth)
             .field("session", &self.session)
+            .field("data_encryption_key", &self.data_encryption_key)
             .finish()
     }
 }
@@ -125,6 +129,7 @@ impl Config {
             trust_proxy_headers: env_or("TRUST_PROXY_HEADERS", "false")?,
             oauth,
             session,
+            data_encryption_key: Secret::new(required("DATA_ENCRYPTION_KEY")?),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -134,6 +139,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_redirect_uri(&self.oauth.redirect_uri)?;
         validate_database_tls(self.database_url.expose())?;
+        crate::crypto::DataCipher::from_base64(self.data_encryption_key.expose())?;
         let s = &self.session;
         if s.idle_secs == 0 || s.absolute_secs == 0 {
             bail!("session lifetimes must be non-zero");
@@ -210,13 +216,15 @@ pub(crate) mod tests {
                 idle_secs: 1800,
                 absolute_secs: 43200,
             },
+            data_encryption_key: Secret::new(crate::crypto::tests::test_key()),
         }
     }
 
     #[test]
     fn debug_output_redacts_secrets() {
         let out = format!("{:?}", test_config());
-        for secret in ["s3cret-pw", "oauth-s3cret-value"] {
+        let key = crate::crypto::tests::test_key();
+        for secret in ["s3cret-pw", "oauth-s3cret-value", key.as_str()] {
             assert!(!out.contains(secret), "secret leaked into Debug: {out}");
         }
         assert!(out.contains("<redacted>"));
@@ -270,6 +278,14 @@ pub(crate) mod tests {
         // The error never contains the URL (it holds the password).
         let err = validate_database_tls("postgres://u:pw-in-url@db/hadal").unwrap_err();
         assert!(!err.to_string().contains("pw-in-url"));
+    }
+
+    #[test]
+    fn data_encryption_key_must_be_a_valid_aes_256_key() {
+        let mut cfg = test_config();
+        cfg.data_encryption_key = Secret::new("too-short");
+        let err = cfg.validate().unwrap_err();
+        assert!(!err.to_string().contains("too-short"), "key echoed: {err}");
     }
 
     #[test]

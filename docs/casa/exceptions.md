@@ -27,7 +27,8 @@ Scanner ignores:
 | `licenses.private.ignore = true` | Our own crate is `publish = false` and proprietary. |
 | actix-web built with `default-features = false, features = ["macros"]` | Drops `cookie 0.16` (RUSTSEC-2026-0594) and `h2 0.3` (RUSTSEC-2026-0258). HTTP/2 belongs at the TLS-terminating proxy. |
 | `chrono` replaced by `time` | RUSTSEC-2026-0543 (chrono unmaintained). |
-| `reqwest` with `default-features = false, features = ["rustls-no-provider", "json", "form"]` | Only for the sign-in code exchange. Default features would add aws-lc-rs, HTTP/2 and system proxy support, none of which we need. TLS is a rustls `ClientConfig` on the `ring` provider (already used by sqlx) with `webpki-roots`. |
+| `reqwest` with `default-features = false, features = ["rustls-no-provider", "json", "form"]` | Only for calls to Google's fixed endpoints in `auth/google.rs`: code exchange, token refresh and revocation, and the read-only Gmail API. Default features would add aws-lc-rs, HTTP/2 and system proxy support, none of which we need. TLS is a rustls `ClientConfig` on the `ring` provider (already used by sqlx) with `webpki-roots`. |
+| `ring` as a direct dependency (`default-features = false, features = ["alloc"]`) | AES-256-GCM for refresh tokens and imported mail (`backend/src/crypto.rs`). Already in the tree as the rustls crypto provider, so it adds no new crate. ISC/Apache-2.0-style license. |
 | `webpki-roots` (CDLA-Permissive-2.0) | Mozilla's CA set, compiled in, so the container's trust store can't weaken verification of Google's certificate. |
 | `argon2` 0.6 with `default-features = false, features = ["alloc", "password-hash", "zeroize"]` | RustCrypto, MIT/Apache-2.0. Salts come from the `getrandom` 0.3 we already use, so the crate's own `getrandom` feature is off. |
 | No advisory ignores | `[advisories] ignore = []`; keep it that way. |
