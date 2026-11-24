@@ -77,7 +77,7 @@ fn dummy_hash() -> Result<&'static str, AppError> {
     Ok(DUMMY.get_or_init(|| h))
 }
 
-fn clean_name(field: &str, raw: &str) -> Result<String, AppError> {
+pub(crate) fn clean_name(field: &str, raw: &str) -> Result<String, AppError> {
     let name = raw.trim();
     let len = name.chars().count();
     if len == 0 || len > MAX_NAME_CHARS || name.chars().any(char::is_control) {

@@ -142,7 +142,21 @@ button.secondary.plain { color: inherit; }
 main.wide, .site-header-inner.wide { max-width: 1200px; }
 a.button.outline { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
 .inbox { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 1.25rem; align-items: start; }
-.inbox-side { display: flex; flex-direction: column; gap: 0.75rem; position: sticky; top: 5rem; }
+.inbox-side {
+  display: flex; flex-direction: column; gap: 0.75rem;
+  position: sticky; top: 5rem; height: calc(100vh - 6.5rem);
+}
+/* Accounts, folders and labels scroll; Settings stays at the bottom. */
+.side-scroll {
+  display: flex; flex-direction: column; gap: 0.75rem;
+  flex: 1; min-height: 0; overflow-y: auto; scrollbar-width: thin;
+}
+a.side-settings {
+  display: flex; align-items: center; gap: 0.75rem;
+  padding: 0.55rem 0.75rem; border-top: 1px solid var(--border);
+  color: inherit; text-decoration: none; font-size: 0.9rem;
+}
+a.side-settings:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); border-radius: 0 0 8px 8px; }
 a.add-account {
   padding: 0.4rem 0.75rem; border-radius: 0 999px 999px 0;
   color: var(--accent); font-size: 0.9rem; font-weight: 600; text-decoration: none;
@@ -270,7 +284,9 @@ button.chip.more { padding: 0.2rem 0.6rem; color: var(--muted); }
 
 @media (max-width: 760px) {
   .inbox { grid-template-columns: minmax(0, 1fr); }
-  .inbox-side { position: static; }
+  .inbox-side { position: static; height: auto; }
+  .side-scroll { overflow: visible; }
+  a.side-settings { border-top: 0; padding: 0.4rem 0.75rem; }
   .mailboxes, .folders { flex-direction: row; align-items: center; overflow-x: auto; scrollbar-width: none; }
   .side-heading { display: none; }
   .labels-heading { display: none; }
@@ -281,3 +297,32 @@ button.chip.more { padding: 0.2rem 0.6rem; color: var(--muted); }
   .m-chips { padding-left: 0.75rem; }
   .reader-meta { flex-direction: column; }
 }
+
+/* Settings */
+.settings { max-width: 640px; }
+.settings h1 { margin: 0.5rem 0 1.25rem; font-size: 1.5rem; }
+.settings-card { padding: 1.25rem; }
+.settings-card h2 { margin: 0 0 1rem; font-size: 1.1rem; }
+.settings-card .auth-form { max-width: none; gap: 0.75rem; }
+.settings-card input:disabled { color: var(--muted); background: color-mix(in srgb, var(--fg) 4%, transparent); }
+.settings-card .notice { margin: 0; }
+a.back-link { color: var(--accent); text-decoration: none; font-size: 0.9rem; }
+a.back-link:hover { text-decoration: underline; }
+a.header-link {
+  padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: 6px;
+  color: inherit; text-decoration: none;
+}
+a.header-link[aria-current='page'] { border-color: var(--accent); color: var(--accent); }
+.connected-accounts { list-style: none; margin: 0 0 0.75rem; padding: 0; }
+.connected-accounts li {
+  display: flex; justify-content: space-between; align-items: center; gap: 1rem;
+  padding: 0.65rem 0; border-bottom: 1px solid var(--border);
+}
+.connected-accounts li:first-child { padding-top: 0; }
+.connected-info { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }
+.connected-email { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.connected-info .muted { font-size: 0.8rem; }
+.settings-card a.add-account { display: inline-block; padding: 0.3rem 0; }
+.sign-in-account { font-size: 0.8rem; white-space: nowrap; }
+.settings-card p.muted { margin: 0 0 0.75rem; }
+.settings-card button.sign-out { color: var(--danger); border-color: var(--border); }

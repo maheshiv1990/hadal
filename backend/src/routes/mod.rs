@@ -116,6 +116,7 @@ mod tests {
         let id = "00000000-0000-0000-0000-000000000000";
         for (method, uri) in [
             ("GET", "/api/auth/me".to_owned()),
+            ("POST", "/api/auth/profile".to_owned()),
             ("GET", "/api/auth/gmail/connect".to_owned()),
             ("GET", "/api/mail/accounts".to_owned()),
             ("DELETE", format!("/api/mail/accounts/{id}")),
@@ -1509,6 +1510,46 @@ mod tests {
         );
     }
 
+    #[actix_web::test]
+    async fn the_sign_in_account_cannot_be_disconnected() {
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (user_id, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        *fake.messages.lock().unwrap() = vec![gmail_message("p1", "keep", "me")];
+        test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
+        // The user signs in with this mailbox's address (any letter case).
+        sqlx::query("UPDATE users SET email = $2 WHERE id = $1")
+            .bind(user_id)
+            .bind(format!("{sub}@EXAMPLE.com"))
+            .execute(pool.get_ref())
+            .await
+            .unwrap();
+        let (_, accounts) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/accounts", &session)).await)
+                .await;
+        let uri = format!("/api/mail/accounts/{}", accounts[0]["id"].as_str().unwrap());
+
+        let (status, body) =
+            json_body(test::call_service(&app, req!("DELETE", &uri, &session)).await).await;
+        assert_eq!(
+            (status, body),
+            (
+                409,
+                json!({ "error": "This is the account you sign in with, so it can't be disconnected." })
+            )
+        );
+        assert!(fake.revoked.lock().unwrap().is_empty(), "access kept");
+        let (_, accounts) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/accounts", &session)).await)
+                .await;
+        assert_eq!(accounts[0]["message_count"], 1, "mail kept");
+    }
+
     // ---- email + password accounts --------------------------------------
 
     const PASSPHRASE: &str = "correct horse battery staple";
@@ -1620,6 +1661,83 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), 200);
+    }
+
+    #[actix_web::test]
+    async fn users_can_rename_themselves_and_google_sign_in_keeps_it() {
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let sub = format!("google-{}", uuid::Uuid::new_v4());
+        *fake.sub.lock().unwrap() = sub.clone();
+        let google = start_fake_google(fake.clone()).await;
+        let app = test_app!(pool, google);
+        let google_sign_in = || async {
+            let (login_cookie, q) = read_login(
+                test::call_service(&app, login_request().to_request()).await,
+                &fake,
+            );
+            let resp =
+                test::call_service(&app, callback(&q["state"], &login_cookie).to_request()).await;
+            assert_eq!(location(&resp), "/");
+            cookie_pair(&resp, SESSION_COOKIE).unwrap()
+        };
+        let rename = |cookie: &str, body: Value| {
+            post_json("/api/auth/profile", body)
+                .insert_header(("cookie", cookie.to_owned()))
+                .to_request()
+        };
+
+        // Google gives the name at first sign-in.
+        let session = google_sign_in().await;
+        let (status, me) = json_body(
+            test::call_service(
+                &app,
+                rename(
+                    &session,
+                    json!({ "first_name": "  Grace ", "last_name": "Hopper" }),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            (&me["first_name"], &me["last_name"]),
+            (&json!("Grace"), &json!("Hopper"))
+        );
+
+        // Signing in with Google again doesn't put Google's name back.
+        let session = google_sign_in().await;
+        let req = test::TestRequest::get()
+            .uri("/api/auth/me")
+            .insert_header(("cookie", session.as_str()))
+            .to_request();
+        let (_, me) = json_body(test::call_service(&app, req).await).await;
+        assert_eq!(
+            (&me["first_name"], &me["last_name"]),
+            (&json!("Grace"), &json!("Hopper"))
+        );
+
+        // Validated like registration; only the two names can be set (CASA
+        // 3.1.2), and only as JSON (3.1.5).
+        for body in [
+            json!({ "first_name": "", "last_name": "Hopper" }),
+            json!({ "first_name": "Grace", "last_name": "x".repeat(101) }),
+            json!({ "first_name": "Gr\u{7}ace", "last_name": "Hopper" }),
+            json!({ "first_name": "Grace" }),
+            json!({ "first_name": "Grace", "last_name": "Hopper", "email": "evil@example.com" }),
+            json!({ "first_name": "Grace", "last_name": "Hopper", "name_set_by_user": false }),
+        ] {
+            let resp = test::call_service(&app, rename(&session, body.clone())).await;
+            assert_eq!(resp.status(), 400, "{body}");
+        }
+        let form = test::TestRequest::post()
+            .uri("/api/auth/profile")
+            .insert_header(("content-type", "application/x-www-form-urlencoded"))
+            .insert_header(("cookie", session.as_str()))
+            .set_payload("first_name=Evil&last_name=Name")
+            .to_request();
+        assert_eq!(test::call_service(&app, form).await.status(), 400);
     }
 
     #[actix_web::test]

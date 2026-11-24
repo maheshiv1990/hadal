@@ -13,18 +13,22 @@ import {
   type Me,
 } from './api'
 
-/** What a signed-out visitor sees: the welcome page until they pick an action in the header. */
-type AuthView = 'home' | 'signin' | 'register'
+/**
+ * The page being shown. Signed out: the welcome page until they pick an
+ * action in the header. Signed in: the mail (`home`) or Settings.
+ */
+type AuthView = 'home' | 'signin' | 'register' | 'settings'
 
-/** Each signed-out view has its own URL; nginx serves index.html for all of them. */
+/** Each view has its own URL; nginx serves index.html for all of them. */
 const VIEW_PATHS: Record<AuthView, string> = {
   home: '/',
   signin: '/auth/signin',
   register: '/auth/register',
+  settings: '/settings',
 }
 
 const viewFromPath = (path: string): AuthView =>
-  path === VIEW_PATHS.signin ? 'signin' : path === VIEW_PATHS.register ? 'register' : 'home'
+  (Object.keys(VIEW_PATHS) as AuthView[]).find((v) => VIEW_PATHS[v] === path) ?? 'home'
 
 function Welcome() {
   return (
@@ -236,7 +240,8 @@ function Register(props: { onSignedIn: (me: Me) => void; onCancel: () => void })
   )
 }
 
-function ChangePassword(props: { onDone: (me: Me) => void; onCancel: () => void }) {
+/** The change-password form (for accounts that have a Hadal password). */
+function ChangePassword(props: { onDone: (me: Me) => void }) {
   const [current, setCurrent] = createSignal('')
   const [next, setNext] = createSignal('')
   const [confirm, setConfirm] = createSignal('')
@@ -251,7 +256,11 @@ function ChangePassword(props: { onDone: (me: Me) => void; onCancel: () => void 
     setError(null)
     setBusy(true)
     try {
-      props.onDone(await api.changePassword(current(), next()))
+      const me = await api.changePassword(current(), next())
+      setCurrent('')
+      setNext('')
+      setConfirm('')
+      props.onDone(me)
     } catch (err) {
       setError((err as Error).message)
     } finally {
@@ -260,56 +269,247 @@ function ChangePassword(props: { onDone: (me: Me) => void; onCancel: () => void 
   }
 
   return (
-    <section class="signin panel">
-      <h2>Change password</h2>
-      <form onSubmit={submit} class="auth-form">
-        <label>
-          Current password
-          <input
-            type="password"
-            autocomplete="current-password"
-            value={current()}
-            onInput={(e) => setCurrent(e.currentTarget.value)}
-            maxLength={MAX_PASSWORD_LENGTH}
-            required
-          />
-        </label>
-        <label>
-          New password
-          <input
-            type="password"
-            autocomplete="new-password"
-            value={next()}
-            onInput={(e) => setNext(e.currentTarget.value)}
-            minLength={MIN_PASSWORD_LENGTH}
-            maxLength={MAX_PASSWORD_LENGTH}
-            required
-          />
-        </label>
-        <label>
-          Confirm new password
-          <input
-            type="password"
-            autocomplete="new-password"
-            value={confirm()}
-            onInput={(e) => setConfirm(e.currentTarget.value)}
-            maxLength={MAX_PASSWORD_LENGTH}
-            required
-          />
-        </label>
-        <Show when={error()}>
-          <p class="error" role="alert">{error()}</p>
+    <form onSubmit={submit} class="auth-form">
+      <label>
+        Current password
+        <input
+          type="password"
+          autocomplete="current-password"
+          value={current()}
+          onInput={(e) => setCurrent(e.currentTarget.value)}
+          maxLength={MAX_PASSWORD_LENGTH}
+          required
+        />
+      </label>
+      <label>
+        New password
+        <input
+          type="password"
+          autocomplete="new-password"
+          value={next()}
+          onInput={(e) => setNext(e.currentTarget.value)}
+          minLength={MIN_PASSWORD_LENGTH}
+          maxLength={MAX_PASSWORD_LENGTH}
+          required
+        />
+        <span class="hint muted">At least {MIN_PASSWORD_LENGTH} characters. A passphrase works well.</span>
+      </label>
+      <label>
+        Confirm new password
+        <input
+          type="password"
+          autocomplete="new-password"
+          value={confirm()}
+          onInput={(e) => setConfirm(e.currentTarget.value)}
+          maxLength={MAX_PASSWORD_LENGTH}
+          required
+        />
+      </label>
+      <Show when={error()}>
+        <p class="error" role="alert">{error()}</p>
+      </Show>
+      <button type="submit" disabled={busy()}>
+        {busy() ? 'Saving…' : 'Change password'}
+      </button>
+    </form>
+  )
+}
+
+/** Settings: the user's name, and their password if they have one. */
+function Settings(props: {
+  me: Me
+  onUpdated: (me: Me) => void
+  onSignedOut: () => void
+  /** Ends this session (the Sign out button). */
+  onSignOut: () => void
+  backLink: (e: MouseEvent) => void
+}) {
+  const [first, setFirst] = createSignal(props.me.first_name ?? '')
+  const [last, setLast] = createSignal(props.me.last_name ?? '')
+  const [error, setError] = createSignal<string | null>(null)
+  const [saved, setSaved] = createSignal(false)
+  const [busy, setBusy] = createSignal(false)
+  const [passwordChanged, setPasswordChanged] = createSignal(false)
+  const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
+  const [accountError, setAccountError] = createSignal<string | null>(null)
+  createEffect(() => {
+    if (accounts.error instanceof UnauthorizedError) props.onSignedOut()
+  })
+  const disconnect = async (account: MailAccount) => {
+    if (!window.confirm(`Disconnect ${account.email}? Its imported mail will be deleted from Hadal.`)) {
+      return
+    }
+    setAccountError(null)
+    try {
+      await api.disconnectMailAccount(account.id)
+      await refetchAccounts()
+    } catch (err) {
+      if (err instanceof UnauthorizedError) props.onSignedOut()
+      else setAccountError((err as Error).message)
+    }
+  }
+  const unchanged = () =>
+    first().trim() === (props.me.first_name ?? '') && last().trim() === (props.me.last_name ?? '')
+
+  const saveProfile = async (e: SubmitEvent) => {
+    e.preventDefault()
+    setError(null)
+    setSaved(false)
+    setBusy(true)
+    try {
+      const me = await api.updateProfile(first(), last())
+      props.onUpdated(me)
+      setFirst(me.first_name ?? '')
+      setLast(me.last_name ?? '')
+      setSaved(true)
+    } catch (err) {
+      if (err instanceof UnauthorizedError) props.onSignedOut()
+      else setError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div class="settings">
+      <a class="back-link" href="/" onClick={props.backLink}>
+        ← Back to mail
+      </a>
+      <h1>Settings</h1>
+
+      <section class="panel settings-card" aria-labelledby="profile-heading">
+        <h2 id="profile-heading">Profile</h2>
+        <form onSubmit={saveProfile} class="auth-form">
+          <div class="row">
+            <label>
+              First name
+              <input
+                autocomplete="given-name"
+                value={first()}
+                onInput={(e) => {
+                  setFirst(e.currentTarget.value)
+                  setSaved(false)
+                }}
+                maxLength={100}
+                required
+              />
+            </label>
+            <label>
+              Last name
+              <input
+                autocomplete="family-name"
+                value={last()}
+                onInput={(e) => {
+                  setLast(e.currentTarget.value)
+                  setSaved(false)
+                }}
+                maxLength={100}
+                required
+              />
+            </label>
+          </div>
+          <label>
+            Email
+            <input type="email" value={props.me.email} disabled />
+            <span class="hint muted">The email you sign in with. It can't be changed here.</span>
+          </label>
+          <Show when={error()}>
+            <p class="error" role="alert">{error()}</p>
+          </Show>
+          <Show when={saved()}>
+            <p class="notice" role="status">Profile saved.</p>
+          </Show>
+          <button type="submit" disabled={busy() || unchanged()}>
+            {busy() ? 'Saving…' : 'Save'}
+          </button>
+        </form>
+      </section>
+
+      <section class="panel settings-card" aria-labelledby="accounts-heading">
+        <h2 id="accounts-heading">Connected accounts</h2>
+        <Show when={!accounts.error} fallback={<p class="error">Could not load your connected accounts.</p>}>
+          <Show when={!accounts.loading} fallback={<p class="muted">Loading…</p>}>
+            <Show
+              when={accounts()?.length}
+              fallback={<p class="muted">No Gmail accounts connected yet.</p>}
+            >
+              <ul class="connected-accounts">
+                <For each={accounts()}>
+                  {(account) => (
+                    <li>
+                      <span class="connected-info">
+                        <span class="connected-email">{account.email}</span>
+                        <span class="muted">
+                          {plural(account.message_count, 'message', 'messages')}
+                          {' · connected '}
+                          {readerDate(account.created_at)}
+                          {account.last_import_at
+                            ? ` · imported ${listDate(account.last_import_at)}`
+                            : ' · not imported yet'}
+                        </span>
+                      </span>
+                      <Show
+                        when={account.email.toLowerCase() !== props.me.email.toLowerCase()}
+                        fallback={
+                          <span class="muted sign-in-account" title="The account you sign in with can't be disconnected">
+                            Sign-in account
+                          </span>
+                        }
+                      >
+                        <button
+                          class="ghost danger"
+                          onClick={() => disconnect(account)}
+                          aria-label={`Disconnect ${account.email}`}
+                        >
+                          Disconnect
+                        </button>
+                      </Show>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Show>
+            <Show when={accountError()}>
+              <p class="error" role="alert">{accountError()}</p>
+            </Show>
+            <a class="add-account" href={GMAIL_CONNECT_PATH}>
+              {accounts()?.length ? '+ Add another account' : '+ Add an account'}
+            </a>
+          </Show>
         </Show>
-        <div class="row">
-          <button type="submit" disabled={busy()}>
-            {busy() ? 'Saving…' : 'Change password'}
-          </button>
-          <button type="button" class="secondary plain" onClick={props.onCancel}>
-            Cancel
-          </button>
-        </div>
-      </form>
-    </section>
+      </section>
+
+      <section class="panel settings-card" aria-labelledby="password-heading">
+        <h2 id="password-heading">Password</h2>
+        <Show
+          when={props.me.has_password}
+          fallback={
+            <p class="muted">
+              You sign in with Google, so there's no Hadal password to change. Your password is managed
+              in your Google Account.
+            </p>
+          }
+        >
+          <Show when={passwordChanged()}>
+            <p class="notice" role="status">Password changed. You were signed out everywhere else.</p>
+          </Show>
+          <ChangePassword
+            onDone={(me) => {
+              props.onUpdated(me)
+              setPasswordChanged(true)
+            }}
+          />
+        </Show>
+      </section>
+
+      <section class="panel settings-card" aria-labelledby="signout-heading">
+        <h2 id="signout-heading">Sign out</h2>
+        <p class="muted">Sign out of Hadal on this device.</p>
+        <button class="secondary sign-out" onClick={props.onSignOut}>
+          Sign out
+        </button>
+      </section>
+    </div>
   )
 }
 
@@ -467,7 +667,13 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
  * mailboxes on the left, one row per message, and a reading view. Bodies are
  * plain text from the server and are only ever shown as text (CASA 5.1.7).
  */
-function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryEmail: string }) {
+function Mail(props: {
+  onSignedOut: () => void
+  linkResult: LinkResult
+  primaryEmail: string
+  /** Opens Settings (an in-app link). */
+  settingsLink: (e: MouseEvent) => void
+}) {
   const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
   /** The mailbox the user picked; null (or one since disconnected) means the primary one. */
   const [mailbox, setMailbox] = createSignal<string | null>(null)
@@ -597,87 +803,96 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
   return (
     <section class="inbox">
       <aside class="inbox-side">
-        <div class="side-block">
-          <h2 class="side-heading">Accounts</h2>
-          <nav class="mailboxes" aria-label="Accounts">
-            <For each={orderedAccounts()}>
-              {(account) => (
-                <button
-                  class="mailbox"
-                  classList={{ active: selectedAccount()?.id === account.id }}
-                  aria-current={selectedAccount()?.id === account.id ? 'true' : undefined}
-                  title={account.email}
-                  onClick={() => showMailbox(account.id)}
-                >
-                  <span class="mailbox-label">
-                    <span class="mailbox-name">{account.email}</span>
-                  </span>
-                  <span class="count">{account.message_count}</span>
-                </button>
-              )}
-            </For>
-            <a class="add-account" href={GMAIL_CONNECT_PATH}>
-              {accounts()?.length ? '+ Add another account' : '+ Add an account'}
-            </a>
-          </nav>
-        </div>
-        <nav class="folders" aria-label="Folders">
-          <For each={showMore() ? [...FOLDERS, ...MORE_FOLDERS] : FOLDERS}>
-            {(f) => (
-              <button
-                class="mailbox folder"
-                classList={{ active: folder() === f.label }}
-                aria-current={folder() === f.label ? 'true' : undefined}
-                onClick={() => showFolder(f.label)}
-              >
-                <span class="folder-label">
-                  <FolderIcon label={f.label} />
-                  {f.name}
-                </span>
-                <Show when={countOf(f.label) > 0}>
-                  <span class="count">{countOf(f.label)}</span>
-                </Show>
-              </button>
-            )}
-          </For>
-          <button
-            class="mailbox folder more-toggle"
-            aria-expanded={showMore()}
-            onClick={() => setMoreOpen(!showMore())}
-            disabled={MORE_FOLDERS.some((f) => f.label === folder())}
-          >
-            <span class="folder-label">
-              <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d={showMore() ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'} />
-              </svg>
-              {showMore() ? 'Less' : 'More'}
-            </span>
-          </button>
-        </nav>
-        <Show when={selectedAccount()?.labels.length}>
-          <h2 class="side-heading labels-heading">Labels</h2>
-          <nav class="folders labels" aria-label="Labels">
-            <For each={selectedAccount()?.labels}>
-              {(l) => (
+        <div class="side-scroll">
+          <div class="side-block">
+            <h2 class="side-heading">Accounts</h2>
+            <nav class="mailboxes" aria-label="Accounts">
+              <For each={orderedAccounts()}>
+                {(account) => (
+                  <button
+                    class="mailbox"
+                    classList={{ active: selectedAccount()?.id === account.id }}
+                    aria-current={selectedAccount()?.id === account.id ? 'true' : undefined}
+                    title={account.email}
+                    onClick={() => showMailbox(account.id)}
+                  >
+                    <span class="mailbox-label">
+                      <span class="mailbox-name">{account.email}</span>
+                    </span>
+                    <span class="count">{account.message_count}</span>
+                  </button>
+                )}
+              </For>
+              <a class="add-account" href={GMAIL_CONNECT_PATH}>
+                {accounts()?.length ? '+ Add another account' : '+ Add an account'}
+              </a>
+            </nav>
+          </div>
+          <nav class="folders" aria-label="Folders">
+            <For each={showMore() ? [...FOLDERS, ...MORE_FOLDERS] : FOLDERS}>
+              {(f) => (
                 <button
                   class="mailbox folder"
-                  classList={{ active: folder() === l.id }}
-                  aria-current={folder() === l.id ? 'true' : undefined}
-                  title={l.name}
-                  onClick={() => showFolder(l.id)}
+                  classList={{ active: folder() === f.label }}
+                  aria-current={folder() === f.label ? 'true' : undefined}
+                  onClick={() => showFolder(f.label)}
                 >
                   <span class="folder-label">
-                    <LabelIcon color={l.color} />
-                    <span class="mailbox-name">{l.name}</span>
+                    <FolderIcon label={f.label} />
+                    {f.name}
                   </span>
-                  <Show when={countOf(l.id) > 0}>
-                    <span class="count">{countOf(l.id)}</span>
+                  <Show when={countOf(f.label) > 0}>
+                    <span class="count">{countOf(f.label)}</span>
                   </Show>
                 </button>
               )}
             </For>
+            <button
+              class="mailbox folder more-toggle"
+              aria-expanded={showMore()}
+              onClick={() => setMoreOpen(!showMore())}
+              disabled={MORE_FOLDERS.some((f) => f.label === folder())}
+            >
+              <span class="folder-label">
+                <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d={showMore() ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'} />
+                </svg>
+                {showMore() ? 'Less' : 'More'}
+              </span>
+            </button>
           </nav>
-        </Show>
+          <Show when={selectedAccount()?.labels.length}>
+            <h2 class="side-heading labels-heading">Labels</h2>
+            <nav class="folders labels" aria-label="Labels">
+              <For each={selectedAccount()?.labels}>
+                {(l) => (
+                  <button
+                    class="mailbox folder"
+                    classList={{ active: folder() === l.id }}
+                    aria-current={folder() === l.id ? 'true' : undefined}
+                    title={l.name}
+                    onClick={() => showFolder(l.id)}
+                  >
+                    <span class="folder-label">
+                      <LabelIcon color={l.color} />
+                      <span class="mailbox-name">{l.name}</span>
+                    </span>
+                    <Show when={countOf(l.id) > 0}>
+                      <span class="count">{countOf(l.id)}</span>
+                    </Show>
+                  </button>
+                )}
+              </For>
+            </nav>
+          </Show>
+        </div>
+        <a class="side-settings" href="/settings" onClick={props.settingsLink}>
+          <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" />
+          </svg>
+          Settings
+        </a>
       </aside>
 
       <div class="inbox-main">
@@ -694,7 +909,7 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                 >
                   {importing() ? 'Importing…' : '↻ Import'}
                 </button>
-                <Show when={selectedAccount()}>
+                <Show when={selectedAccount() && !isPrimary(selectedAccount()!) && selectedAccount()}>
                   {(account) => (
                     <button class="ghost danger" onClick={() => disconnect(account())}>
                       Disconnect
@@ -906,8 +1121,6 @@ function App() {
   // A failed Google sign-in comes back to /?login=failed; show the sign-in page with the error.
   const loginFailed = query.get('login') === 'failed'
   const [view, setView] = createSignal<AuthView>(loginFailed ? 'signin' : viewFromPath(window.location.pathname))
-  const [changing, setChanging] = createSignal(false)
-  const [notice, setNotice] = createSignal<string | null>(null)
   const mailFlag = query.get('mail')
   const linkResult: LinkResult = mailFlag === 'linked' || mailFlag === 'failed' ? mailFlag : null
   if (loginFailed || mailFlag !== null) {
@@ -929,9 +1142,11 @@ function App() {
   window.addEventListener('popstate', onPopState)
   onCleanup(() => window.removeEventListener('popstate', onPopState))
 
-  // Signed in on /auth/signin or /auth/register: those pages don't apply, go home.
+  // Signed in on /auth/signin or /auth/register: those pages don't apply, go
+  // home. Signed out on /settings: sign in first.
   createEffect(() => {
-    if (me() && view() !== 'home') navigate('home', true)
+    if (me() && (view() === 'signin' || view() === 'register')) navigate('home', true)
+    if (!me.loading && !me.error && me() === null && view() === 'settings') navigate('signin', true)
   })
 
   /** Click handler for in-app links; leaves new-tab/modified clicks to the browser. */
@@ -947,8 +1162,6 @@ function App() {
     } finally {
       mutate(null)
       navigate('home')
-      setChanging(false)
-      setNotice(null)
     }
   }
 
@@ -986,20 +1199,8 @@ function App() {
         >
           {(user) => (
             <div class="user">
-              <span>
-                <Show when={[user().first_name, user().last_name].filter(Boolean).join(' ')}>
-                  {(name) => <strong>{name()} </strong>}
-                </Show>
-                <span class="muted">{user().email}</span>
-              </span>
-              <Show when={user().has_password}>
-                <button class="secondary plain" onClick={() => setChanging(!changing())}>
-                  Change password
-                </button>
-              </Show>
-              <button class="secondary" onClick={signOut}>
-                Sign out
-              </button>
+              {/* Just the name; the email only for an account without one. */}
+              <strong>{[user().first_name, user().last_name].filter(Boolean).join(' ') || user().email}</strong>
             </div>
           )}
         </Show>
@@ -1025,20 +1226,27 @@ function App() {
               </Switch>
             }
           >
-            <Show when={notice()}>
-              <p class="notice" role="status">{notice()}</p>
+            <Show
+              when={view() === 'settings' && me()}
+              fallback={
+                <Mail
+                  onSignedOut={() => mutate(null)}
+                  linkResult={linkResult}
+                  primaryEmail={me()?.email ?? ''}
+                  settingsLink={linkTo('settings')}
+                />
+              }
+            >
+              {(user) => (
+                <Settings
+                  me={user()}
+                  onUpdated={mutate}
+                  onSignedOut={() => mutate(null)}
+                  onSignOut={signOut}
+                  backLink={linkTo('home')}
+                />
+              )}
             </Show>
-            <Show when={changing()}>
-              <ChangePassword
-                onCancel={() => setChanging(false)}
-                onDone={(m) => {
-                  mutate(m)
-                  setChanging(false)
-                  setNotice('Password changed. You were signed out everywhere else.')
-                }}
-              />
-            </Show>
-            <Mail onSignedOut={() => mutate(null)} linkResult={linkResult} primaryEmail={me()?.email ?? ''} />
           </Show>
         </Show>
       </Show>

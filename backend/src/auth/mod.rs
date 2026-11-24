@@ -164,6 +164,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                     .wrap(from_fn(require_session))
                     .route(web::get().to(me)),
             )
+            .service(
+                web::resource("/profile")
+                    .wrap(from_fn(require_session))
+                    .route(web::post().to(update_profile)),
+            )
             .service(web::resource("/logout").route(web::post().to(logout))),
     );
 }
@@ -385,9 +390,12 @@ async fn complete_login(
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (google_sub) DO UPDATE SET
              email = EXCLUDED.email,
-             -- Google is the source of truth, but a name it stops sending is kept.
-             first_name = COALESCE(EXCLUDED.first_name, users.first_name),
-             last_name = COALESCE(EXCLUDED.last_name, users.last_name),
+             -- Google is the source of the name until the user sets one in
+             -- Settings; a name Google stops sending is kept either way.
+             first_name = CASE WHEN users.name_set_by_user THEN users.first_name
+                               ELSE COALESCE(EXCLUDED.first_name, users.first_name) END,
+             last_name = CASE WHEN users.name_set_by_user THEN users.last_name
+                              ELSE COALESCE(EXCLUDED.last_name, users.last_name) END,
              last_login_at = now()
          RETURNING id",
     )
@@ -473,6 +481,36 @@ async fn profile(pool: &PgPool, user_id: Uuid) -> Result<serde_json::Value, AppE
 }
 
 async fn me(user: AuthUser, pool: web::Data<PgPool>) -> Result<HttpResponse, AppError> {
+    Ok(HttpResponse::Ok().json(profile(&pool, user.user_id).await?))
+}
+
+/// The signed-in user's new name. JSON only, so a cross-site form can't send
+/// it (CASA 3.1.5); nothing else about the account can be set here (3.1.2).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileUpdate {
+    first_name: String,
+    last_name: String,
+}
+
+/// Renames the signed-in user. Validated like registration; from then on,
+/// Google sign-in keeps this name instead of Google's.
+async fn update_profile(
+    user: AuthUser,
+    pool: web::Data<PgPool>,
+    body: web::Json<ProfileUpdate>,
+) -> Result<HttpResponse, AppError> {
+    let first_name = password::clean_name("first name", &body.first_name)?;
+    let last_name = password::clean_name("last name", &body.last_name)?;
+    sqlx::query(
+        "UPDATE users SET first_name = $2, last_name = $3, name_set_by_user = true
+          WHERE id = $1",
+    )
+    .bind(user.user_id)
+    .bind(&first_name)
+    .bind(&last_name)
+    .execute(pool.get_ref())
+    .await?;
     Ok(HttpResponse::Ok().json(profile(&pool, user.user_id).await?))
 }
 

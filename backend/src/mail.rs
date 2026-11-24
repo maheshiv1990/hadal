@@ -294,28 +294,53 @@ pub async fn list_accounts(
         .collect()
 }
 
-/// Unlinks a mailbox and deletes its messages. Returns its refresh token so
-/// the caller can revoke it at Google. `None` if it isn't the caller's.
+pub enum Unlinked {
+    /// Removed with its mail. Carries its refresh token (if it still
+    /// decrypts) so the caller can revoke it at Google.
+    Removed(Option<Secret>),
+    /// The mailbox for the email the user signs in with: never unlinked.
+    SignInAccount,
+    /// Not one of the caller's mailboxes.
+    NotFound,
+}
+
+/// Unlinks one of the caller's mailboxes and deletes its messages and labels
+/// (by cascade), unless it is the mailbox for their sign-in email.
 pub async fn delete_account(
     pool: &PgPool,
     cipher: &DataCipher,
     owner: Uuid,
     id: Uuid,
-) -> Result<Option<Secret>, AppError> {
+) -> Result<Unlinked, AppError> {
     let row: Option<(String, Vec<u8>)> = sqlx::query_as(
-        "DELETE FROM mail_accounts WHERE id = $1 AND owner_id = $2
-         RETURNING google_sub, refresh_token_enc",
+        "DELETE FROM mail_accounts a
+          WHERE a.id = $1 AND a.owner_id = $2
+            AND lower(a.email) <> (SELECT lower(u.email) FROM users u WHERE u.id = $2)
+         RETURNING a.google_sub, a.refresh_token_enc",
     )
     .bind(id)
     .bind(owner)
     .fetch_optional(pool)
     .await?;
-    let Some((sub, sealed)) = row else {
-        return Ok(None);
-    };
-    // The mailbox is already gone; a token that won't decrypt just can't be
-    // revoked from here.
-    Ok(open_token(cipher, owner, &sub, &sealed).ok())
+    if let Some((sub, sealed)) = row {
+        // The mailbox is already gone; a token that won't decrypt just can't
+        // be revoked from here.
+        return Ok(Unlinked::Removed(
+            open_token(cipher, owner, &sub, &sealed).ok(),
+        ));
+    }
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM mail_accounts WHERE id = $1 AND owner_id = $2)",
+    )
+    .bind(id)
+    .bind(owner)
+    .fetch_one(pool)
+    .await?;
+    Ok(if exists {
+        Unlinked::SignInAccount
+    } else {
+        Unlinked::NotFound
+    })
 }
 
 fn open_token(
