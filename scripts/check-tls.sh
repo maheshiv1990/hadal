@@ -50,12 +50,20 @@ evil=attacker.example
 out="$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' -H "Host: $evil" "http://$HOST:$HTTP_PORT/x")"
 [[ "$out" != *"$evil"* ]] && pass "plain HTTP for $evil isn't redirected there ($out)" \
   || fail "plain HTTP for $evil answered '$out'"
-if openssl s_client -connect "$HOST:$HTTPS_PORT" -servername "$evil" </dev/null 2>/dev/null \
-    | grep -q 'Cipher is [A-Z0-9]'; then
-  fail "TLS handshake accepted for $evil"
-else
-  pass "TLS handshake refused for $evil"
-fi
+# Foreign SNI and Host: refused with 421, not served.
+out="$(curl -sk -o /dev/null -w '%{http_code}' --connect-to "$evil:$HTTPS_PORT:$HOST:$HTTPS_PORT" "https://$evil:$HTTPS_PORT/api/health")"
+[[ "$out" == 421 ]] && pass "HTTPS for $evil refused (421)" || fail "HTTPS for $evil answered $out"
+# No SNI at all (as Java sends for localhost): same hardened TLS, and the
+# Host header picks the server.
+handshake_nosni() {
+  openssl s_client -connect "$HOST:$HTTPS_PORT" -noservername "$@" </dev/null 2>/dev/null | grep -q 'Cipher is [A-Z0-9]'
+}
+handshake_nosni -tls1_2 -cipher 'ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256' \
+  && pass "no-SNI handshake uses the hardened suites" || fail "no-SNI handshake failed"
+for c in AES128-SHA ECDHE-RSA-AES128-SHA DES-CBC3-SHA; do
+  if handshake_nosni -tls1_2 -cipher "$c:@SECLEVEL=0"; then fail "no-SNI weak suite $c accepted"; else pass "no-SNI weak suite $c refused"; fi
+done
+if handshake_nosni -tls1_1 -cipher 'DEFAULT:@SECLEVEL=0'; then fail "no-SNI TLS 1.1 accepted"; else pass "no-SNI TLS 1.1 refused"; fi
 # Right SNI, foreign Host header: the app must not answer for that name.
 out="$(curl -sk -o /dev/null -w '%{http_code}' -H "Host: $evil" "https://$HOST:$HTTPS_PORT/api/health")"
 [[ "$out" != 200 ]] && pass "HTTPS with Host $evil refused ($out)" || fail "HTTPS served the app for Host $evil"
