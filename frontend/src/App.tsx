@@ -312,15 +312,51 @@ function ChangePassword(props: { onDone: (me: Me) => void; onCancel: () => void 
 
 const formatDate = (iso: string) => new Date(iso).toLocaleString()
 
+/** Inbox-list date: the time for today, "Nov 23" for this year, otherwise a short date. */
+const listDate = (iso: string) => {
+  const d = new Date(iso)
+  const now = new Date()
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  }
+  if (d.getFullYear() === now.getFullYear()) {
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' })
+  }
+  return d.toLocaleDateString([], { year: '2-digit', month: 'numeric', day: 'numeric' })
+}
+
+/** `Ann Lee <ann@example.com>` → `Ann Lee`; a bare address is shown as it is. */
+const senderName = (from: string) => {
+  const named = from.match(/^\s*"?([^"<]*?)"?\s*<[^>]*>\s*$/)
+  return named?.[1] || from.replace(/[<>]/g, '').trim() || '(unknown sender)'
+}
+
+/** The bare address from a From/To header, or the header as it is if it has none. */
+const senderAddress = (from: string) => from.match(/<([^>]*)>/)?.[1] || from.trim()
+
+/** "Tue, Nov 24, 9:29 AM": the reading view's date. */
+const readerDate = (iso: string) =>
+  new Date(iso).toLocaleString([], {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    year: new Date(iso).getFullYear() === new Date().getFullYear() ? undefined : 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`
 
 /**
- * Linked Gmail mailboxes and their imported mail. Bodies are plain text from
- * the server and are only ever shown as text (CASA 5.1.7).
+ * Linked Gmail mailboxes and their imported mail, laid out as an inbox:
+ * mailboxes on the left, one row per message, and a reading view. Bodies are
+ * plain text from the server and are only ever shown as text (CASA 5.1.7).
  */
 function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
   const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
   const [messages, { refetch: refetchMessages }] = createResource(api.listMessages)
+  /** The mailbox being shown, or null for all of them. */
+  const [mailbox, setMailbox] = createSignal<string | null>(null)
   const [openId, setOpenId] = createSignal<string | null>(null)
   const [detail] = createResource(openId, api.getMessage)
   const [importing, setImporting] = createSignal(false)
@@ -342,6 +378,15 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
       props.onSignedOut()
     }
   })
+
+  const selectedAccount = () => accounts()?.find((a) => a.id === mailbox())
+  const visible = () => (messages() ?? []).filter((m) => !mailbox() || m.account_id === mailbox())
+  const manyAccounts = () => (accounts()?.length ?? 0) > 1
+
+  const showMailbox = (id: string | null) => {
+    setMailbox(id)
+    setOpenId(null)
+  }
 
   const importAll = async () => {
     setError(null)
@@ -370,118 +415,175 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
     setError(null)
     try {
       await api.disconnectMailAccount(account.id)
-      setOpenId(null)
+      showMailbox(null)
       await Promise.all([refetchAccounts(), refetchMessages()])
     } catch (err) {
       handle(err)
     }
   }
 
-  const toggle = (id: string) => setOpenId(openId() === id ? null : id)
-
   return (
-    <section class="panel mail">
-      <div class="mail-head">
-        <h2>Email</h2>
-        <div class="mail-actions">
-          <a class="button outline" href={GMAIL_CONNECT_PATH}>
-            Connect Gmail
-          </a>
-          <button onClick={importAll} disabled={importing() || !accounts()?.length}>
-            {importing() ? 'Importing…' : 'Import all'}
+    <section class="inbox">
+      <aside class="inbox-side">
+        <nav class="mailboxes" aria-label="Mailboxes">
+          <button
+            class="mailbox"
+            classList={{ active: mailbox() === null }}
+            aria-current={mailbox() === null ? 'true' : undefined}
+            onClick={() => showMailbox(null)}
+          >
+            <span class="mailbox-name">All inboxes</span>
+            <span class="count">{messages()?.length ?? ''}</span>
           </button>
-        </div>
-      </div>
+          <For each={accounts()}>
+            {(account) => (
+              <button
+                class="mailbox"
+                classList={{ active: mailbox() === account.id }}
+                aria-current={mailbox() === account.id ? 'true' : undefined}
+                title={account.email}
+                onClick={() => showMailbox(account.id)}
+              >
+                <span class="mailbox-name">{account.email}</span>
+                <span class="count">{account.message_count}</span>
+              </button>
+            )}
+          </For>
+          <a class="add-account" href={GMAIL_CONNECT_PATH}>
+            {accounts()?.length ? '+ Add another account' : '+ Add an account'}
+          </a>
+        </nav>
+      </aside>
 
-      <Show when={props.linkResult === 'linked'}>
-        <p class="notice" role="status">Gmail connected. Use “Import all” to fetch its mail.</p>
-      </Show>
-      <Show when={props.linkResult === 'failed'}>
-        <p class="error" role="alert">
-          Gmail wasn't connected. Allow read access to your mail on Google's screen and try again.
-        </p>
-      </Show>
-
-      <Show when={!accounts.error} fallback={<p class="error">Could not load mailboxes.</p>}>
-        <Show
-          when={accounts()?.length}
-          fallback={
-            <Show when={!accounts.loading}>
-              <p class="muted">No mailboxes connected. Connect a Gmail account to import its newest 100 messages.</p>
+      <div class="inbox-main">
+        <div class="inbox-toolbar">
+          <Show
+            when={openId()}
+            fallback={
+              <div class="toolbar-group">
+                <button
+                  class="ghost"
+                  onClick={importAll}
+                  disabled={importing() || !accounts()?.length}
+                  title="Import new mail from every connected mailbox"
+                >
+                  {importing() ? 'Importing…' : '↻ Import'}
+                </button>
+                <Show when={selectedAccount()}>
+                  {(account) => (
+                    <button class="ghost danger" onClick={() => disconnect(account())}>
+                      Disconnect
+                    </button>
+                  )}
+                </Show>
+              </div>
+            }
+          >
+            <button class="ghost" onClick={() => setOpenId(null)} aria-label="Back to the list">
+              ← Back
+            </button>
+          </Show>
+          <span class="muted">
+            <Show when={selectedAccount()} fallback={visible().length ? plural(visible().length, 'message', 'messages') : ''}>
+              {(account) =>
+                account().last_import_at
+                  ? `Imported ${formatDate(account().last_import_at!)}`
+                  : 'Not imported yet'
+              }
             </Show>
-          }
-        >
-          <ul class="mail-accounts">
-            <For each={accounts()}>
-              {(account) => (
-                <li>
-                  <div>
-                    <strong>{account.email}</strong>
-                    <span class="muted">
-                      {' · '}
-                      {plural(account.message_count, 'message', 'messages')}
-                      {account.last_import_at ? ` · imported ${formatDate(account.last_import_at)}` : ' · not imported yet'}
-                    </span>
-                  </div>
-                  <button class="secondary" onClick={() => disconnect(account)} aria-label={`Disconnect ${account.email}`}>
-                    Disconnect
-                  </button>
-                </li>
-              )}
-            </For>
-          </ul>
-        </Show>
-      </Show>
+          </span>
+        </div>
 
-      <Show when={status()}>
-        <p class="notice" role="status">{status()}</p>
-      </Show>
-      <For each={problems()}>{(p) => <p class="error" role="alert">{p}</p>}</For>
-      <Show when={error()}>
-        <p class="error" role="alert">{error()}</p>
-      </Show>
-
-      <Show when={!messages.error} fallback={<p class="error">Could not load messages.</p>}>
-        <Show when={messages()?.length}>
-          <ul class="messages">
-            <For each={messages()}>
-              {(m) => (
-                <li classList={{ open: openId() === m.id }}>
-                  <button class="message-row" onClick={() => toggle(m.id)} aria-expanded={openId() === m.id}>
-                    <span class="message-top">
-                      <strong>{m.subject || '(no subject)'}</strong>
-                      <time class="muted">{formatDate(m.received_at)}</time>
-                    </span>
-                    <span class="muted">
-                      {m.from}
-                      <Show when={(accounts()?.length ?? 0) > 1}> → {m.account_email}</Show>
-                    </span>
-                    <span class="snippet">{m.snippet}</span>
-                  </button>
-                  <Show when={openId() === m.id}>
-                    <Show
-                      when={!detail.error}
-                      fallback={<p class="error">Could not open this message.</p>}
-                    >
-                      <Show
-                        when={!detail.loading && detail()?.id === m.id ? detail() : undefined}
-                        fallback={<p class="muted">Loading…</p>}
-                      >
-                        {(d) => (
-                          <div class="message-body">
-                            <p class="muted">To: {d().to || '(none)'}</p>
-                            <pre>{d().body || '(This message has no text.)'}</pre>
-                          </div>
-                        )}
-                      </Show>
-                    </Show>
-                  </Show>
-                </li>
-              )}
-            </For>
-          </ul>
+        <Show when={props.linkResult === 'linked'}>
+          <p class="notice inbox-note" role="status">
+            Gmail connected. Use “Import” to fetch its mail.
+          </p>
         </Show>
-      </Show>
+        <Show when={props.linkResult === 'failed'}>
+          <p class="error inbox-note" role="alert">
+            Gmail wasn't connected. Allow read access to your mail on Google's screen and try again.
+          </p>
+        </Show>
+        <Show when={status()}>
+          <p class="notice inbox-note" role="status">{status()}</p>
+        </Show>
+        <For each={problems()}>{(p) => <p class="error inbox-note" role="alert">{p}</p>}</For>
+        <Show when={error()}>
+          <p class="error inbox-note" role="alert">{error()}</p>
+        </Show>
+
+        <Show when={!accounts.error && !messages.error} fallback={<p class="error inbox-empty">Could not load your mail.</p>}>
+          <Show when={!accounts.loading && !messages.loading} fallback={<p class="muted inbox-empty">Loading…</p>}>
+            <Show
+              when={openId()}
+              fallback={
+                <Show
+                  when={visible().length}
+                  fallback={
+                    <p class="muted inbox-empty">
+                      {accounts()?.length
+                        ? 'No messages yet. Use “Import” to fetch the newest 100 from each mailbox.'
+                        : 'No mailboxes connected. Connect a Gmail account to import its newest 100 messages.'}
+                    </p>
+                  }
+                >
+                  <ul class="message-list">
+                    <For each={visible()}>
+                      {(m) => (
+                        <li>
+                          <button class="message-row" onClick={() => setOpenId(m.id)}>
+                            <span class="m-from" title={m.from}>
+                              {senderName(m.from)}
+                            </span>
+                            <span class="m-text">
+                              <Show when={manyAccounts() && mailbox() === null}>
+                                <span class="m-tag" title={m.account_email}>
+                                  {m.account_email.split('@')[0]}
+                                </span>
+                              </Show>
+                              <span class="m-subject">{m.subject || '(no subject)'}</span>
+                              <Show when={m.snippet}>
+                                <span class="m-snippet"> - {m.snippet}</span>
+                              </Show>
+                            </span>
+                            <time class="m-date" datetime={m.received_at} title={formatDate(m.received_at)}>
+                              {listDate(m.received_at)}
+                            </time>
+                          </button>
+                        </li>
+                      )}
+                    </For>
+                  </ul>
+                </Show>
+              }
+            >
+              <Show when={!detail.error} fallback={<p class="error inbox-empty">Could not open this message.</p>}>
+                <Show
+                  when={!detail.loading && detail()?.id === openId() ? detail() : undefined}
+                  fallback={<p class="muted inbox-empty">Loading…</p>}
+                >
+                  {(d) => (
+                    <article class="reader">
+                      <h2>{d().subject || '(no subject)'}</h2>
+                      <div class="reader-meta">
+                        <div class="reader-people">
+                          <strong>{senderName(d().from)}</strong>{' '}
+                          <span class="muted">&lt;{senderAddress(d().from)}&gt;</span>
+                          <div class="muted">to {d().to || '(none)'}</div>
+                        </div>
+                        <time class="muted" datetime={d().received_at} title={formatDate(d().received_at)}>
+                          {readerDate(d().received_at)}
+                        </time>
+                      </div>
+                      <pre>{d().body || '(This message has no text.)'}</pre>
+                    </article>
+                  )}
+                </Show>
+              </Show>
+            </Show>
+          </Show>
+        </Show>
+      </div>
     </section>
   )
 }
@@ -541,7 +643,7 @@ function App() {
   return (
     <>
       <header class="site-header">
-        <div class="site-header-inner">
+        <div class="site-header-inner" classList={{ wide: !!me() }}>
         <a class="brand" href={VIEW_PATHS.home} onClick={linkTo('home')} aria-label="Hadal home">
           <img class="brand-mark" src="/hadal-icon.png" alt="" width="32" height="32" />
           Hadal
@@ -592,7 +694,7 @@ function App() {
         </div>
       </header>
 
-      <main>
+      <main classList={{ wide: !!me() }}>
       <Show when={!me.error} fallback={<p class="error">Could not reach the server.</p>}>
         <Show when={!me.loading} fallback={<p class="muted">Loading…</p>}>
           <Show
