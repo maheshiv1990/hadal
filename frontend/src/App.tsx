@@ -588,7 +588,30 @@ function App() {
           <span class="brand-mark" aria-hidden="true">◆</span>
           Hadal
         </a>
-        <Show when={me()}>
+        <Show
+          when={me()}
+          fallback={
+            <Show when={!me.loading && !me.error}>
+              <nav class="auth-nav" aria-label="Account">
+                <button
+                  class="secondary plain"
+                  classList={{ active: view() === 'signin' }}
+                  aria-pressed={view() === 'signin'}
+                  onClick={() => setView('signin')}
+                >
+                  Sign in
+                </button>
+                <button
+                  classList={{ active: view() === 'register' }}
+                  aria-pressed={view() === 'register'}
+                  onClick={() => setView('register')}
+                >
+                  Register
+                </button>
+              </nav>
+            </Show>
+          }
+        >
           {(user) => (
             <div class="user">
               <span>
