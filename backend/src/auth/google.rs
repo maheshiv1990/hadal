@@ -39,6 +39,12 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// Largest single message we will read. `format=full` carries bodies but not
 /// attachment data, so real mail stays far below this.
 const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Largest attachment response we will read: Gmail's 25 MB attachment limit
+/// as base64url inside JSON, plus room for the envelope.
+const MAX_ATTACHMENT_RESPONSE_BYTES: usize = 36 * 1024 * 1024;
+/// A large attachment can take longer than the client's default timeout, but
+/// must still finish before nginx gives up (`proxy_read_timeout 30s`).
+const ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(25);
 /// Gmail's `maxResults` ceiling for one list page.
 const MAX_LIST_RESULTS: u32 = 500;
 /// Tolerated clock difference with Google when checking `exp`/`iat`.
@@ -149,6 +155,15 @@ async fn read_json(resp: reqwest::Response, max: usize) -> Result<Value, BodyErr
 /// it goes into a URL path.
 pub fn valid_gmail_id(id: &str) -> bool {
     (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Gmail attachment IDs are long base64url strings. Anything else is refused
+/// before it goes into a URL path.
+pub fn valid_attachment_id(id: &str) -> bool {
+    (1..=2048).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Cleans an optional name claim. A missing, non-string or blank value is
@@ -391,13 +406,22 @@ impl GoogleClient {
         access: &Secret,
         max: usize,
     ) -> Result<Value, GoogleApiError> {
-        let resp = self
-            .http
-            .get(url)
-            .bearer_auth(access.expose())
-            .send()
-            .await
-            .map_err(unreachable)?;
+        self.gmail_get_within(url, access, max, None).await
+    }
+
+    /// `gmail_get` with a longer timeout than the client's default.
+    async fn gmail_get_within(
+        &self,
+        url: Url,
+        access: &Secret,
+        max: usize,
+        timeout: Option<Duration>,
+    ) -> Result<Value, GoogleApiError> {
+        let mut req = self.http.get(url).bearer_auth(access.expose());
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
+        let resp = req.send().await.map_err(unreachable)?;
         let status = resp.status();
         if status.as_u16() == 401 {
             return Err(GoogleApiError::Revoked);
@@ -451,6 +475,42 @@ impl GoogleClient {
             .push(id);
         url.query_pairs_mut().append_pair("format", "full");
         self.gmail_get(url, access, MAX_MESSAGE_BYTES).await
+    }
+
+    /// One attachment of a message, as Gmail's base64url `data` string. The
+    /// caller decodes it. Both IDs come from our own stored records, and are
+    /// checked again here before they go into the URL path.
+    pub async fn get_attachment(
+        &self,
+        access: &Secret,
+        message_id: &str,
+        attachment_id: &str,
+    ) -> Result<String, GoogleApiError> {
+        if !valid_gmail_id(message_id) || !valid_attachment_id(attachment_id) {
+            return Err(GoogleApiError::Malformed);
+        }
+        let mut url = self
+            .gmail_api
+            .join("messages/")
+            .map_err(|_| GoogleApiError::Malformed)?;
+        url.path_segments_mut()
+            .map_err(|_| GoogleApiError::Malformed)?
+            .pop_if_empty()
+            .push(message_id)
+            .push("attachments")
+            .push(attachment_id);
+        let json = self
+            .gmail_get_within(
+                url,
+                access,
+                MAX_ATTACHMENT_RESPONSE_BYTES,
+                Some(ATTACHMENT_TIMEOUT),
+            )
+            .await?;
+        json.get("data")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or(GoogleApiError::Malformed)
     }
 
     /// Tells Google to revoke a refresh token (when a mailbox is unlinked).
@@ -719,6 +779,20 @@ pub(crate) mod tests {
         assert!(valid_gmail_id("18c2f0a9b3d4e5f6"));
         for bad in ["", "../../labels", "a/b", "a?b", "a%2Fb", &"a".repeat(65)] {
             assert!(!valid_gmail_id(bad), "accepted {bad:?}");
+        }
+        // Attachment IDs are long base64url; still nothing that changes the path.
+        assert!(valid_attachment_id("ANGjdJ8w-x_Yz09"));
+        for bad in [
+            "",
+            "../x",
+            "a/b",
+            "a?b",
+            "a%2Fb",
+            "a=",
+            "a b",
+            &"a".repeat(2049),
+        ] {
+            assert!(!valid_attachment_id(bad), "accepted {bad:?}");
         }
     }
 

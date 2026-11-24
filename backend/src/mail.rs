@@ -7,7 +7,11 @@
 //!   to their row (CASA 6.7.1). Access tokens live only in memory.
 //! - Bodies are reduced to plain text here and shown as text by the frontend,
 //!   so mail HTML is never rendered (CASA 5.1.7).
+//! - Attachments: only their name, type, size and Gmail ID are stored
+//!   (encrypted). A file is fetched from Gmail when its owner downloads it,
+//!   picked by its position in our own record, never by an ID from the request.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -22,7 +26,9 @@ use time::OffsetDateTime;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::auth::google::{GoogleApiError, GoogleClient, Identity, valid_gmail_id};
+use crate::auth::google::{
+    GoogleApiError, GoogleClient, Identity, valid_attachment_id, valid_gmail_id,
+};
 use crate::config::Secret;
 use crate::crypto::DataCipher;
 use crate::error::AppError;
@@ -42,6 +48,12 @@ const MAX_BODY_CHARS: usize = 200_000;
 const MAX_SUBJECT_CHARS: usize = 1_000;
 const MAX_ADDRESS_CHARS: usize = 2_000;
 const MAX_SNIPPET_CHARS: usize = 500;
+/// Most attachments recorded for one message.
+const MAX_ATTACHMENTS: usize = 50;
+const MAX_FILENAME_CHARS: usize = 255;
+const MAX_MIME_CHARS: usize = 255;
+/// Gmail's own limit on attachment size.
+pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 /// Most messages returned by one list call.
 pub const LIST_LIMIT: i64 = 200;
 
@@ -187,6 +199,40 @@ pub struct Summary {
     pub snippet: String,
 }
 
+/// One attachment as recorded at import, stored encrypted. The file itself
+/// stays at Google.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StoredAttachment {
+    /// Gmail's ID for the file. Never sent to the client.
+    pub gmail_attachment_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size: u64,
+}
+
+/// What the client sees of an attachment. `index` is how it asks for it.
+#[derive(Serialize, Debug)]
+pub struct AttachmentInfo {
+    index: usize,
+    filename: String,
+    mime_type: String,
+    size: u64,
+}
+
+fn attachment_infos(stored: Vec<StoredAttachment>) -> Vec<AttachmentInfo> {
+    stored
+        .into_iter()
+        .enumerate()
+        .map(|(index, a)| AttachmentInfo {
+            index,
+            filename: a.filename,
+            mime_type: a.mime_type,
+            size: a.size,
+        })
+        .collect()
+}
+
 #[derive(Serialize)]
 pub struct MessageItem {
     id: Uuid,
@@ -196,6 +242,7 @@ pub struct MessageItem {
     received_at: OffsetDateTime,
     #[serde(flatten)]
     summary: Summary,
+    attachments: Vec<AttachmentInfo>,
 }
 
 #[derive(Serialize)]
@@ -217,8 +264,42 @@ fn open_summary(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("stored summary is invalid: {e}")))
 }
 
-type ItemRow = (Uuid, Uuid, String, OffsetDateTime, Vec<u8>);
-type DetailRow = (Uuid, String, OffsetDateTime, Vec<u8>, Vec<u8>);
+/// Decrypts a message's attachment list. `None` (imported before attachments
+/// were recorded) reads as no attachments.
+fn open_attachments(
+    cipher: &DataCipher,
+    owner: Uuid,
+    id: Uuid,
+    sealed: Option<&[u8]>,
+) -> Result<Vec<StoredAttachment>, AppError> {
+    let Some(sealed) = sealed else {
+        return Ok(Vec::new());
+    };
+    let plain = cipher.decrypt(sealed, &message_aad("attachments", owner, id))?;
+    serde_json::from_slice(&plain)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("stored attachments are invalid: {e}")))
+}
+
+fn seal_attachments(
+    cipher: &DataCipher,
+    owner: Uuid,
+    id: Uuid,
+    attachments: &[StoredAttachment],
+) -> Result<Vec<u8>, AppError> {
+    let plain = serde_json::to_vec(attachments)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("attachment encoding failed: {e}")))?;
+    cipher.encrypt(&plain, &message_aad("attachments", owner, id))
+}
+
+type ItemRow = (Uuid, Uuid, String, OffsetDateTime, Vec<u8>, Option<Vec<u8>>);
+type DetailRow = (
+    Uuid,
+    String,
+    OffsetDateTime,
+    Vec<u8>,
+    Vec<u8>,
+    Option<Vec<u8>>,
+);
 
 /// Newest imported messages across all of the user's mailboxes.
 pub async fn list_messages(
@@ -227,7 +308,7 @@ pub async fn list_messages(
     owner: Uuid,
 ) -> Result<Vec<MessageItem>, AppError> {
     let rows: Vec<ItemRow> = sqlx::query_as(
-        "SELECT m.id, m.account_id, a.email, m.received_at, m.summary_enc
+        "SELECT m.id, m.account_id, a.email, m.received_at, m.summary_enc, m.attachments_enc
            FROM mail_messages m
            JOIN mail_accounts a ON a.id = m.account_id AND a.owner_id = m.owner_id
           WHERE m.owner_id = $1
@@ -239,15 +320,23 @@ pub async fn list_messages(
     .fetch_all(pool)
     .await?;
     rows.into_iter()
-        .map(|(id, account_id, account_email, received_at, sealed)| {
-            Ok(MessageItem {
-                id,
-                account_id,
-                account_email,
-                received_at,
-                summary: open_summary(cipher, owner, id, &sealed)?,
-            })
-        })
+        .map(
+            |(id, account_id, account_email, received_at, sealed, attachments)| {
+                Ok(MessageItem {
+                    id,
+                    account_id,
+                    account_email,
+                    received_at,
+                    summary: open_summary(cipher, owner, id, &sealed)?,
+                    attachments: attachment_infos(open_attachments(
+                        cipher,
+                        owner,
+                        id,
+                        attachments.as_deref(),
+                    )?),
+                })
+            },
+        )
         .collect()
 }
 
@@ -259,7 +348,8 @@ pub async fn get_message(
     id: Uuid,
 ) -> Result<Option<MessageDetail>, AppError> {
     let row: Option<DetailRow> = sqlx::query_as(
-        "SELECT m.account_id, a.email, m.received_at, m.summary_enc, m.body_enc
+        "SELECT m.account_id, a.email, m.received_at, m.summary_enc, m.body_enc,
+                m.attachments_enc
            FROM mail_messages m
            JOIN mail_accounts a ON a.id = m.account_id AND a.owner_id = m.owner_id
           WHERE m.id = $1 AND m.owner_id = $2",
@@ -268,7 +358,7 @@ pub async fn get_message(
     .bind(owner)
     .fetch_optional(pool)
     .await?;
-    let Some((account_id, account_email, received_at, summary, body)) = row else {
+    let Some((account_id, account_email, received_at, summary, body, attachments)) = row else {
         return Ok(None);
     };
     let body = cipher.decrypt(&body, &message_aad("body", owner, id))?;
@@ -279,8 +369,87 @@ pub async fn get_message(
             account_email,
             received_at,
             summary: open_summary(cipher, owner, id, &summary)?,
+            attachments: attachment_infos(open_attachments(
+                cipher,
+                owner,
+                id,
+                attachments.as_deref(),
+            )?),
         },
         body: String::from_utf8_lossy(&body).into_owned(),
+    }))
+}
+
+// ---- downloading an attachment ---------------------------------------------
+
+/// A downloaded attachment: its recorded name and type, and the file.
+pub struct Download {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
+type DownloadRow = (String, Option<Vec<u8>>, String, Vec<u8>);
+
+/// Fetches attachment `index` of the caller's message from Gmail. `None` if
+/// the message isn't the caller's or has no such attachment. The Gmail IDs
+/// come from our own encrypted records, never from the request.
+pub async fn download_attachment(
+    pool: &PgPool,
+    google: &GoogleClient,
+    cipher: &DataCipher,
+    owner: Uuid,
+    message_id: Uuid,
+    index: usize,
+) -> Result<Option<Download>, AppError> {
+    let row: Option<DownloadRow> = sqlx::query_as(
+        "SELECT m.gmail_id, m.attachments_enc, a.google_sub, a.refresh_token_enc
+           FROM mail_messages m
+           JOIN mail_accounts a ON a.id = m.account_id AND a.owner_id = m.owner_id
+          WHERE m.id = $1 AND m.owner_id = $2",
+    )
+    .bind(message_id)
+    .bind(owner)
+    .fetch_optional(pool)
+    .await?;
+    let Some((gmail_id, sealed_attachments, google_sub, sealed_token)) = row else {
+        return Ok(None);
+    };
+    let Some(attachment) =
+        open_attachments(cipher, owner, message_id, sealed_attachments.as_deref())?
+            .into_iter()
+            .nth(index)
+    else {
+        return Ok(None);
+    };
+
+    let gmail_failed = |e: GoogleApiError| {
+        // The file name is mail content: it is not logged.
+        tracing::warn!(message = %message_id, error = %e, "attachment download failed");
+        match e {
+            GoogleApiError::Revoked => {
+                AppError::Upstream("Google access was revoked or expired. Reconnect this mailbox.")
+            }
+            _ => AppError::Upstream("Could not get this attachment from Gmail. Try again."),
+        }
+    };
+    let refresh = open_token(cipher, owner, &google_sub, &sealed_token)?;
+    let access = google
+        .refresh_access_token(&refresh)
+        .await
+        .map_err(gmail_failed)?;
+    let data = google
+        .get_attachment(&access, &gmail_id, &attachment.gmail_attachment_id)
+        .await
+        .map_err(gmail_failed)?;
+    let bytes = GMAIL_BASE64
+        .decode(data.trim())
+        .map_err(|_| gmail_failed(GoogleApiError::Malformed))?;
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(gmail_failed(GoogleApiError::Malformed));
+    }
+    Ok(Some(Download {
+        filename: attachment.filename,
+        bytes,
     }))
 }
 
@@ -472,8 +641,10 @@ async fn import_account(
     let access = google.refresh_access_token(&refresh).await?;
     let ids = google.list_message_ids(&access, IMPORT_PER_MAILBOX).await?;
 
-    let known: Vec<String> = sqlx::query_scalar(
-        "SELECT gmail_id FROM mail_messages
+    // Already stored: skipped, unless stored before attachments were
+    // recorded, in which case it is fetched again to fill them in.
+    let known: Vec<(String, Uuid, bool)> = sqlx::query_as(
+        "SELECT gmail_id, id, attachments_enc IS NOT NULL FROM mail_messages
           WHERE owner_id = $1 AND account_id = $2 AND gmail_id = ANY($3)",
     )
     .bind(owner)
@@ -481,7 +652,17 @@ async fn import_account(
     .bind(&ids)
     .fetch_all(pool)
     .await?;
-    let mut pending = ids.into_iter().filter(|id| !known.contains(id));
+    let complete: Vec<&str> = known.iter().filter(|k| k.2).map(|k| k.0.as_str()).collect();
+    let backfill: HashMap<String, Uuid> = known
+        .iter()
+        .filter(|k| !k.2)
+        .map(|k| (k.0.clone(), k.1))
+        .collect();
+    let mut pending = ids
+        .into_iter()
+        .filter(|id| !complete.contains(&id.as_str()))
+        .collect::<Vec<_>>()
+        .into_iter();
 
     let mut fetches = JoinSet::new();
     loop {
@@ -511,7 +692,9 @@ async fn import_account(
             skipped.fetch_add(1, Ordering::Relaxed);
             continue;
         };
-        if store_message(pool, cipher, owner, account.id, &parsed).await? {
+        if let Some(&existing) = backfill.get(&parsed.gmail_id) {
+            fill_attachments(pool, cipher, owner, existing, &parsed.attachments).await?;
+        } else if store_message(pool, cipher, owner, account.id, &parsed).await? {
             imported.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -531,10 +714,12 @@ async fn store_message(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("summary encoding failed: {e}")))?;
     let summary = cipher.encrypt(&summary, &message_aad("summary", owner, id))?;
     let body = cipher.encrypt(msg.body.as_bytes(), &message_aad("body", owner, id))?;
+    let attachments = seal_attachments(cipher, owner, id, &msg.attachments)?;
     let result = sqlx::query(
         "INSERT INTO mail_messages
-             (id, owner_id, account_id, gmail_id, received_at, summary_enc, body_enc)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+             (id, owner_id, account_id, gmail_id, received_at, summary_enc, body_enc,
+              attachments_enc)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          ON CONFLICT (account_id, gmail_id) DO NOTHING",
     )
     .bind(id)
@@ -544,9 +729,32 @@ async fn store_message(
     .bind(msg.received_at)
     .bind(summary)
     .bind(body)
+    .bind(attachments)
     .execute(pool)
     .await?;
     Ok(result.rows_affected() == 1)
+}
+
+/// Records the attachments of a message imported before they were recorded.
+/// Sealed under the existing row's ID, which the ciphertext is bound to.
+async fn fill_attachments(
+    pool: &PgPool,
+    cipher: &DataCipher,
+    owner: Uuid,
+    id: Uuid,
+    attachments: &[StoredAttachment],
+) -> Result<(), AppError> {
+    let sealed = seal_attachments(cipher, owner, id, attachments)?;
+    sqlx::query(
+        "UPDATE mail_messages SET attachments_enc = $3
+          WHERE id = $1 AND owner_id = $2 AND attachments_enc IS NULL",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(sealed)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 // ---- parsing Gmail messages -------------------------------------------------
@@ -557,6 +765,7 @@ pub struct Parsed {
     pub received_at: OffsetDateTime,
     pub summary: Summary,
     pub body: String,
+    pub attachments: Vec<StoredAttachment>,
 }
 
 /// Reads a `format=full` Gmail message. `None` if it is malformed.
@@ -598,12 +807,92 @@ pub fn parse_message(msg: &Value) -> Option<Parsed> {
     } else {
         String::new()
     };
+    let mut attachments = Vec::new();
+    collect_attachments(payload, 0, &mut attachments);
     Some(Parsed {
         gmail_id: gmail_id.to_owned(),
         received_at,
         summary,
         body: cap_body(body),
+        attachments,
     })
+}
+
+/// A part's header value, matched case-insensitively.
+fn part_header<'a>(part: &'a Value, name: &str) -> Option<&'a str> {
+    part.get("headers")?
+        .as_array()?
+        .iter()
+        .find(|h| {
+            h.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })?
+        .get("value")?
+        .as_str()
+}
+
+/// Collects the parts that are real attachments: a file name and a Gmail
+/// attachment ID. Images embedded in an HTML body (a Content-ID, not marked
+/// as an attachment) are left out, as mail apps do.
+fn collect_attachments(part: &Value, depth: u8, out: &mut Vec<StoredAttachment>) {
+    if depth > 16 || out.len() >= MAX_ATTACHMENTS {
+        return;
+    }
+    // Gmail gives every attachment a file name; inline body parts have "".
+    let filename = part
+        .get("filename")
+        .and_then(Value::as_str)
+        .filter(|f| !f.trim().is_empty())
+        .map(|f| Some(clean_filename(f)).filter(|c| !c.is_empty()))
+        .map(|c| c.unwrap_or_else(|| "attachment".to_owned()))
+        .unwrap_or_default();
+    let attachment_id = part
+        .get("body")
+        .and_then(|b| b.get("attachmentId"))
+        .and_then(Value::as_str)
+        .filter(|id| valid_attachment_id(id));
+    let embedded = part_header(part, "Content-ID").is_some()
+        && !part_header(part, "Content-Disposition").is_some_and(|d| {
+            d.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("attachment")
+        });
+    if let Some(id) = attachment_id
+        && !filename.is_empty()
+        && !embedded
+    {
+        out.push(StoredAttachment {
+            gmail_attachment_id: id.to_owned(),
+            filename,
+            mime_type: part
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .map(|m| clean_line(m, MAX_MIME_CHARS).to_ascii_lowercase())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "application/octet-stream".to_owned()),
+            size: part
+                .get("body")
+                .and_then(|b| b.get("size"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        });
+    }
+    if let Some(parts) = part.get("parts").and_then(Value::as_array) {
+        for p in parts {
+            collect_attachments(p, depth + 1, out);
+        }
+    }
+}
+
+/// A file name that is safe to show and to offer as a download name: no
+/// control characters, no path separators, no leading dots, bounded length.
+fn clean_filename(raw: &str) -> String {
+    let name: String = clean_line(raw, MAX_FILENAME_CHARS)
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .collect();
+    name.trim_start_matches(['.', ' ']).trim_end().to_owned()
 }
 
 /// Drops control characters, trims, and cuts to `max` characters.
@@ -873,6 +1162,53 @@ pub(crate) mod tests {
         assert_eq!(p.summary.subject.chars().count(), MAX_SUBJECT_CHARS);
         assert!(!p.summary.subject.contains('\u{7}'));
         assert!(p.body.ends_with("[message truncated]"));
+    }
+
+    #[test]
+    fn attachments_are_recorded_without_embedded_images_or_unsafe_names() {
+        let msg = json!({
+            "id": "abc", "internalDate": "0",
+            "payload": {"mimeType": "multipart/mixed", "parts": [
+                {"mimeType": "multipart/related", "parts": [
+                    {"mimeType": "text/html", "filename": "", "body": {"data": b64("<p>hi</p>")}},
+                    // Embedded in the HTML body: not a user-facing attachment.
+                    {"mimeType": "image/png", "filename": "logo.png",
+                     "headers": [{"name": "Content-ID", "value": "<logo>"},
+                                 {"name": "Content-Disposition", "value": "inline"}],
+                     "body": {"attachmentId": "img1", "size": 100}},
+                ]},
+                {"mimeType": "application/PDF", "filename": "../../Q3\u{7}/report.pdf",
+                 "headers": [{"name": "Content-ID", "value": "<x>"},
+                             {"name": "content-disposition", "value": "Attachment; filename=x"}],
+                 "body": {"attachmentId": "pdf_1-A", "size": 2048}},
+                {"mimeType": "text/plain", "filename": "...",
+                 "body": {"attachmentId": "dots", "size": 1}},
+                // No attachment ID we could ever fetch: skipped.
+                {"mimeType": "text/plain", "filename": "bad.txt",
+                 "body": {"attachmentId": "../../messages", "size": 1}},
+                {"mimeType": "text/plain", "filename": "inline-data.txt",
+                 "body": {"data": b64("x"), "size": 1}},
+            ]},
+        });
+        let p = parse_message(&msg).unwrap();
+        assert_eq!(
+            p.attachments,
+            vec![
+                StoredAttachment {
+                    gmail_attachment_id: "pdf_1-A".into(),
+                    filename: "_.._Q3 _report.pdf".into(),
+                    mime_type: "application/pdf".into(),
+                    size: 2048,
+                },
+                StoredAttachment {
+                    gmail_attachment_id: "dots".into(),
+                    filename: "attachment".into(),
+                    mime_type: "text/plain".into(),
+                    size: 1,
+                },
+            ]
+        );
+        assert_eq!(p.body, "hi");
     }
 
     #[test]

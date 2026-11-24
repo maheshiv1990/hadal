@@ -79,6 +79,8 @@ macro_rules! test_app {
         use $crate::test_support::nz;
         actix_web::test::init_service(
             actix_web::App::new()
+                // The same response headers as production (main.rs).
+                .wrap($crate::security::security_headers())
                 .app_data($pool.clone())
                 .app_data(actix_web::web::Data::new(
                     $crate::config::tests::test_config().session,

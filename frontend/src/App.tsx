@@ -1,12 +1,14 @@
 import { createEffect, createResource, createSignal, For, Match, onCleanup, Show, Switch } from 'solid-js'
 import {
   api,
+  downloadAttachment,
   GMAIL_CONNECT_PATH,
   LOGIN_PATH,
   MAX_PASSWORD_LENGTH,
   MIN_PASSWORD_LENGTH,
   UnauthorizedError,
   type MailAccount,
+  type MailAttachment,
   type Me,
 } from './api'
 
@@ -345,6 +347,40 @@ const readerDate = (iso: string) =>
     minute: '2-digit',
   })
 
+/** 1536 → "1.5 KB". */
+const formatSize = (bytes: number) => {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB']
+  let n = bytes / 1024
+  let u = 0
+  while (n >= 1024 && u < units.length - 1) {
+    n /= 1024
+    u++
+  }
+  return `${n < 10 ? n.toFixed(1) : Math.round(n)} ${units[u]}`
+}
+
+/** A short type label for an attachment ("PDF", "PNG") and a colour family for it. */
+const fileKind = (a: MailAttachment): { label: string; kind: string } => {
+  const ext = a.filename.includes('.') ? a.filename.split('.').pop()!.toLowerCase() : ''
+  const label = (ext && ext.length <= 4 ? ext : a.mime_type.split('/').pop() ?? 'file').slice(0, 4).toUpperCase()
+  const kind = a.mime_type.startsWith('image/')
+    ? 'image'
+    : a.mime_type === 'application/pdf' || ext === 'pdf'
+      ? 'pdf'
+      : /sheet|excel|csv/.test(a.mime_type) || ['xls', 'xlsx', 'csv'].includes(ext)
+        ? 'sheet'
+        : /word|document|text\//.test(a.mime_type) || ['doc', 'docx', 'txt', 'rtf'].includes(ext)
+          ? 'doc'
+          : /zip|compressed|tar|gzip/.test(a.mime_type)
+            ? 'archive'
+            : 'other'
+  return { label, kind }
+}
+
+/** Attachment chips shown under a message row. */
+const MAX_ROW_CHIPS = 3
+
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`
 
 /**
@@ -407,6 +443,24 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
       setImporting(false)
     }
   }
+
+  /** `${messageId}:${index}` of the attachment being downloaded. */
+  const [downloading, setDownloading] = createSignal<string | null>(null)
+  const download = async (messageId: string, attachment: MailAttachment) => {
+    const key = `${messageId}:${attachment.index}`
+    if (downloading() === key) return
+    setError(null)
+    setDownloading(key)
+    try {
+      await downloadAttachment(messageId, attachment)
+    } catch (err) {
+      handle(err)
+    } finally {
+      setDownloading(null)
+    }
+  }
+  const isDownloading = (messageId: string, attachment: MailAttachment) =>
+    downloading() === `${messageId}:${attachment.index}`
 
   const disconnect = async (account: MailAccount) => {
     if (!window.confirm(`Disconnect ${account.email}? Its imported mail will be deleted from Hadal.`)) {
@@ -546,10 +600,44 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
                                 <span class="m-snippet"> - {m.snippet}</span>
                               </Show>
                             </span>
-                            <time class="m-date" datetime={m.received_at} title={formatDate(m.received_at)}>
-                              {listDate(m.received_at)}
-                            </time>
+                            <span class="m-end">
+                              <Show when={m.attachments.length}>
+                                <span
+                                  class="m-clip"
+                                  role="img"
+                                  aria-label={plural(m.attachments.length, 'attachment', 'attachments')}
+                                  title={plural(m.attachments.length, 'attachment', 'attachments')}
+                                >
+                                  📎
+                                </span>
+                              </Show>
+                              <time class="m-date" datetime={m.received_at} title={formatDate(m.received_at)}>
+                                {listDate(m.received_at)}
+                              </time>
+                            </span>
                           </button>
+                          <Show when={m.attachments.length}>
+                            <div class="m-chips">
+                              <For each={m.attachments.slice(0, MAX_ROW_CHIPS)}>
+                                {(a) => (
+                                  <button
+                                    class="chip"
+                                    classList={{ busy: isDownloading(m.id, a) }}
+                                    title={`Download ${a.filename} (${formatSize(a.size)})`}
+                                    onClick={() => download(m.id, a)}
+                                  >
+                                    <span class={`file-badge ${fileKind(a).kind}`}>{fileKind(a).label}</span>
+                                    <span class="chip-name">{a.filename}</span>
+                                  </button>
+                                )}
+                              </For>
+                              <Show when={m.attachments.length > MAX_ROW_CHIPS}>
+                                <button class="chip more" onClick={() => setOpenId(m.id)}>
+                                  +{m.attachments.length - MAX_ROW_CHIPS}
+                                </button>
+                              </Show>
+                            </div>
+                          </Show>
                         </li>
                       )}
                     </For>
@@ -576,6 +664,34 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
                         </time>
                       </div>
                       <pre>{d().body || '(This message has no text.)'}</pre>
+                      <Show when={d().attachments.length}>
+                        <section class="attachments" aria-label="Attachments">
+                          <h3>{plural(d().attachments.length, 'attachment', 'attachments')}</h3>
+                          <ul>
+                            <For each={d().attachments}>
+                              {(a) => (
+                                <li class="attachment-card">
+                                  <span class={`file-badge large ${fileKind(a).kind}`}>{fileKind(a).label}</span>
+                                  <span class="attachment-info">
+                                    <span class="attachment-name" title={a.filename}>
+                                      {a.filename}
+                                    </span>
+                                    <span class="muted">{formatSize(a.size)}</span>
+                                  </span>
+                                  <button
+                                    class="ghost"
+                                    disabled={isDownloading(d().id, a)}
+                                    onClick={() => download(d().id, a)}
+                                    aria-label={`Download ${a.filename}`}
+                                  >
+                                    {isDownloading(d().id, a) ? 'Downloading…' : '↓ Download'}
+                                  </button>
+                                </li>
+                              )}
+                            </For>
+                          </ul>
+                        </section>
+                      </Show>
                     </article>
                   )}
                 </Show>

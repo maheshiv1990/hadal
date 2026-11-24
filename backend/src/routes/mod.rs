@@ -44,6 +44,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                             .service(mail::import),
                     )
                     .service(mail::messages)
+                    // Each download refreshes a token and calls Gmail.
+                    .service(
+                        web::scope("/messages/{id}/attachments")
+                            .wrap(from_fn(crate::security::auth_rate_limit))
+                            .service(mail::attachment),
+                    )
                     .service(mail::message),
             ),
     )
@@ -403,6 +409,8 @@ mod tests {
         /// The mailbox, newest first.
         messages: Mutex<Vec<Value>>,
         message_fetches: Mutex<u32>,
+        /// Attachment files by Gmail attachment ID.
+        attachments: Mutex<HashMap<String, Vec<u8>>>,
     }
 
     const FAKE_ACCESS: &str = "fake-gmail-access";
@@ -524,6 +532,24 @@ mod tests {
         }
     }
 
+    async fn fake_gmail_attachment(
+        st: web::Data<FakeGoogle>,
+        req: actix_web::HttpRequest,
+        path: web::Path<(String, String)>,
+    ) -> HttpResponse {
+        if !bearer_ok(&req) {
+            return HttpResponse::Unauthorized().finish();
+        }
+        let (_, attachment_id) = path.into_inner();
+        match st.attachments.lock().unwrap().get(&attachment_id) {
+            Some(bytes) => HttpResponse::Ok().json(json!({
+                "size": bytes.len(),
+                "data": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes),
+            })),
+            None => HttpResponse::NotFound().finish(),
+        }
+    }
+
     async fn start_fake_google(st: Arc<FakeGoogle>) -> GoogleClient {
         let data = web::Data::from(st);
         let server = HttpServer::new(move || {
@@ -538,6 +564,10 @@ mod tests {
                 .route(
                     "/gmail/v1/users/me/messages/{id}",
                     web::get().to(fake_gmail_get),
+                )
+                .route(
+                    "/gmail/v1/users/me/messages/{id}/attachments/{attachment}",
+                    web::get().to(fake_gmail_attachment),
                 )
         })
         .workers(1)
@@ -985,6 +1015,14 @@ mod tests {
         )
         .await;
         assert_eq!((status, body), (404, json!({ "error": "not found" })));
+        // Nor can he download its attachment, which Alice can.
+        let attachment = format!("/api/mail/messages/{message_id}/attachments/0");
+        let resp = test::call_service(&app, req!("GET", &attachment, &bob)).await;
+        assert_eq!(resp.status(), 404);
+        assert!(
+            fake.attachments.lock().unwrap().is_empty(),
+            "no file to fetch"
+        );
         let resp = test::call_service(
             &app,
             req!("DELETE", &format!("/api/mail/accounts/{account_id}"), &bob),
@@ -1000,6 +1038,165 @@ mod tests {
             json_body(test::call_service(&app, req!("GET", "/api/mail/messages", &alice)).await)
                 .await;
         assert_eq!(still.as_array().unwrap().len(), 1);
+    }
+
+    #[actix_web::test]
+    async fn attachments_download_as_files_never_inline() {
+        // CASA 5.1.7 / 3.1.4: an attachment is fetched from Gmail only for
+        // its owner, picked by its position in our record, and always sent
+        // as a download that the browser won't render on our origin.
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        *fake.messages.lock().unwrap() = vec![gmail_message("d1", "Report", "See attached")];
+        let file = b"<script>alert(1)</script>".to_vec();
+        fake.attachments
+            .lock()
+            .unwrap()
+            .insert("att1".to_owned(), file.clone());
+        test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
+
+        let (_, list) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/messages", &session)).await)
+                .await;
+        assert_eq!(
+            list[0]["attachments"],
+            json!([{ "index": 0, "filename": "notes.txt", "mime_type": "text/plain", "size": 10 }]),
+            "Gmail's attachment ID is not exposed"
+        );
+        let id = list[0]["id"].as_str().unwrap().to_owned();
+        let (_, detail) = json_body(
+            test::call_service(
+                &app,
+                req!("GET", &format!("/api/mail/messages/{id}"), &session),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(detail["attachments"], list[0]["attachments"]);
+
+        // CASA 6.7.1: the file name is encrypted at rest, like the rest of the mail.
+        let sealed: Vec<u8> =
+            sqlx::query_scalar("SELECT attachments_enc FROM mail_messages WHERE id = $1")
+                .bind(uuid::Uuid::parse_str(&id).unwrap())
+                .fetch_one(pool.get_ref())
+                .await
+                .unwrap();
+        assert!(!sealed.windows(9).any(|w| w == b"notes.txt"));
+
+        let resp = test::call_service(
+            &app,
+            req!(
+                "GET",
+                &format!("/api/mail/messages/{id}/attachments/0"),
+                &session
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(header("content-type"), "application/octet-stream");
+        assert_eq!(
+            header("content-disposition"),
+            "attachment; filename=\"notes.txt\"; filename*=UTF-8''notes.txt"
+        );
+        assert_eq!(header("x-content-type-options"), "nosniff");
+        assert!(header("content-security-policy").starts_with("default-src 'none'"));
+        assert_eq!(header("cache-control"), "no-store");
+        assert_eq!(test::read_body(resp).await.as_ref(), file.as_slice());
+
+        for uri in [
+            format!("/api/mail/messages/{id}/attachments/1"),
+            format!("/api/mail/messages/{id}/attachments/-1"),
+            format!("/api/mail/messages/{id}/attachments/att1"),
+            format!("/api/mail/messages/{}/attachments/0", uuid::Uuid::new_v4()),
+        ] {
+            let resp = test::call_service(&app, req!("GET", &uri, &session)).await;
+            assert_eq!(resp.status(), 404, "{uri}");
+        }
+
+        // Gmail refusing the grant is reported, not hidden behind a 500.
+        fake.revoked
+            .lock()
+            .unwrap()
+            .push(format!("refresh-for-{sub}"));
+        let (status, body) = json_body(
+            test::call_service(
+                &app,
+                req!(
+                    "GET",
+                    &format!("/api/mail/messages/{id}/attachments/0"),
+                    &session
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            (status, body),
+            (
+                502,
+                json!({ "error": "Google access was revoked or expired. Reconnect this mailbox." })
+            )
+        );
+    }
+
+    #[actix_web::test]
+    async fn import_fills_in_attachments_for_mail_stored_before_them() {
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        *fake.messages.lock().unwrap() = vec![gmail_message("e1", "Old", "Body")];
+        test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
+        let (_, list) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/messages", &session)).await)
+                .await;
+        let id = list[0]["id"].as_str().unwrap().to_owned();
+
+        // As if it had been imported before attachments were recorded.
+        sqlx::query("UPDATE mail_messages SET attachments_enc = NULL WHERE id = $1")
+            .bind(uuid::Uuid::parse_str(&id).unwrap())
+            .execute(pool.get_ref())
+            .await
+            .unwrap();
+        let (_, list) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/messages", &session)).await)
+                .await;
+        assert_eq!(list[0]["attachments"], json!([]));
+
+        let fetched = *fake.message_fetches.lock().unwrap();
+        let (_, body) =
+            json_body(test::call_service(&app, req!("POST", "/api/mail/import", &session)).await)
+                .await;
+        assert_eq!(body["imported"], 0, "refilled, not imported again");
+        assert_eq!(*fake.message_fetches.lock().unwrap(), fetched + 1);
+        let (_, list) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/messages", &session)).await)
+                .await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["id"], id.as_str(), "same message, same ID");
+        assert_eq!(list[0]["attachments"][0]["filename"], "notes.txt");
+
+        // Once filled in, it isn't fetched again.
+        test::call_service(&app, req!("POST", "/api/mail/import", &session)).await;
+        assert_eq!(*fake.message_fetches.lock().unwrap(), fetched + 1);
     }
 
     #[actix_web::test]

@@ -16,6 +16,16 @@ export interface MailAccount {
   message_count: number
 }
 
+/** A file attached to an imported message. It is fetched from Gmail only when downloaded. */
+export interface MailAttachment {
+  /** Its position in the message; how the download asks for it. */
+  index: number
+  filename: string
+  mime_type: string
+  /** Bytes, as Gmail reports it. */
+  size: number
+}
+
 /** An imported message, without its body. */
 export interface MailMessage {
   id: string
@@ -26,6 +36,7 @@ export interface MailMessage {
   to: string
   subject: string
   snippet: string
+  attachments: MailAttachment[]
 }
 
 /** A message with its body. The body is plain text: never render it as HTML. */
@@ -65,6 +76,35 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new Error(data.error ?? `Request failed (${res.status})`)
   }
   return (res.status === 204 ? undefined : await res.json()) as T
+}
+
+/**
+ * Downloads a message attachment and hands it to the browser as a file to
+ * save. Fetched rather than linked so a failure can be shown in the page; the
+ * server always sends it as an opaque download, never as a page to render.
+ */
+export async function downloadAttachment(messageId: string, attachment: MailAttachment): Promise<void> {
+  const res = await fetch(
+    `/api/mail/messages/${encodeURIComponent(messageId)}/attachments/${attachment.index}`,
+    { credentials: 'same-origin' },
+  )
+  if (res.status === 401) {
+    throw new UnauthorizedError('Please sign in again.')
+  }
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.error ?? `Download failed (${res.status})`)
+  }
+  const url = URL.createObjectURL(await res.blob())
+  try {
+    const link = document.createElement('a')
+    link.href = url
+    link.download = attachment.filename
+    link.click()
+  } finally {
+    // Give the browser a moment to start saving before the URL goes away.
+    setTimeout(() => URL.revokeObjectURL(url), 10_000)
+  }
 }
 
 /** Starts Google sign-in. A plain link: the server redirects to Google. */
