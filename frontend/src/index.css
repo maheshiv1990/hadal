@@ -324,3 +324,5 @@ a.header-link[aria-current='page'] { border-color: var(--accent); color: var(--a
 .connected-info .muted { font-size: 0.8rem; }
 .settings-card a.add-account { display: inline-block; padding: 0.3rem 0; }
 .sign-in-account { font-size: 0.8rem; white-space: nowrap; }
+.settings-card p.muted { margin: 0 0 0.75rem; }
+.settings-card button.sign-out { color: var(--danger); border-color: var(--border); }

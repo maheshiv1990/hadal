@@ -320,6 +320,8 @@ function Settings(props: {
   me: Me
   onUpdated: (me: Me) => void
   onSignedOut: () => void
+  /** Ends this session (the Sign out button). */
+  onSignOut: () => void
   backLink: (e: MouseEvent) => void
 }) {
   const [first, setFirst] = createSignal(props.me.first_name ?? '')
@@ -498,6 +500,14 @@ function Settings(props: {
             }}
           />
         </Show>
+      </section>
+
+      <section class="panel settings-card" aria-labelledby="signout-heading">
+        <h2 id="signout-heading">Sign out</h2>
+        <p class="muted">Sign out of Hadal on this device.</p>
+        <button class="secondary sign-out" onClick={props.onSignOut}>
+          Sign out
+        </button>
       </section>
     </div>
   )
@@ -1195,9 +1205,6 @@ function App() {
                 </Show>
                 <span class="muted">{user().email}</span>
               </span>
-              <button class="secondary" onClick={signOut}>
-                Sign out
-              </button>
             </div>
           )}
         </Show>
@@ -1239,6 +1246,7 @@ function App() {
                   me={user()}
                   onUpdated={mutate}
                   onSignedOut={() => mutate(null)}
+                  onSignOut={signOut}
                   backLink={linkTo('home')}
                 />
               )}
