@@ -9,9 +9,9 @@
     {
       "id": "1.1.1",
       "title": "Authentication is resistant to brute force attacks",
-      "status": "pending",
-      "blocker": "No authentication yet (Google OAuth sign-in not built). Per-client rate limiting already protects every endpoint; re-verify on the OAuth callback once it exists.",
-      "evidence": ["test:rate_limit_returns_429_after_burst", "test:spoofed_real_ip_is_ignored_unless_proxy_trusted", "test:trusted_proxy_keys_on_real_ip"]
+      "status": "verified",
+      "evidence": ["test:auth_endpoints_have_their_own_stricter_limit", "test:rate_limit_returns_429_after_burst", "test:spoofed_real_ip_is_ignored_unless_proxy_trusted", "test:trusted_proxy_keys_on_real_ip", "test:missing_auth_limiter_fails_closed", "test:password_login_is_throttled_per_account", "test:account_limiter_is_per_account", "test:password_login_fails_closed_without_account_limiter"],
+      "notes": "Google sign-in: credentials are entered at Google. Email + password sign-in: /api/auth/register and /api/auth/password-login share the per-IP auth limit (default 10/min, burst 5) with the Google endpoints, and password-login is also limited per account (10 attempts, then 1 per 3 min, keyed by email whether or not it exists), so guessing one account from many IPs is slowed too. Both limiters fail closed."
     },
     {
       "id": "1.1.2",
@@ -23,9 +23,9 @@
     {
       "id": "1.1.3",
       "title": "Passwords are stored in a form resistant to offline attacks",
-      "status": "not_applicable",
-      "reason": "The app never receives or stores user passwords; sign-in is delegated to Google.",
-      "reopen_if": ["(?i)\\b(argon2|bcrypt|scrypt|pbkdf2|password_hash|hash_password|verify_password)\\b", "(?i)\\bpassword\\w*\\s+(text|varchar|bytea)"]
+      "status": "verified",
+      "evidence": ["test:hashes_are_salted_argon2id_and_verify", "test:registration_signs_in_and_stores_only_an_argon2id_hash", "test:password_policy_is_length_based", "test:password_login_does_not_reveal_which_emails_exist"],
+      "notes": "Passwords are hashed with Argon2id (m=19 MiB, t=2, p=1, OWASP's minimum, pinned in auth/password.rs) with a 128-bit random salt per password, as a PHC string. The users table only accepts '$argon2id$' values. Hashing runs on a blocking thread. Policy: 12-128 characters, no composition rules (ASVS 2.1). Unknown emails still cost one verification, so timing doesn't reveal accounts. Not yet: breached-password check (ASVS 2.1.7)."
     },
     {
       "id": "1.2.1",
@@ -71,86 +71,91 @@
     {
       "id": "2.2.1",
       "title": "Users can log out; logout or expiry invalidates all stateful session tokens, including refresh tokens",
-      "status": "pending",
-      "blocker": "Sessions do not exist yet. Build them with the OAuth login: server-side session table, a logout endpoint that deletes the row, and idle/absolute expiry."
+      "status": "verified",
+      "evidence": ["test:logout_revokes_the_session_server_side", "test:expired_and_idle_sessions_are_rejected", "test:google_sign_in_creates_a_fresh_session"],
+      "notes": "Sessions are server-side rows. POST /api/auth/logout deletes the row and clears the cookie. Idle (30 min) and absolute (12 h) expiry are checked against the database clock on every request. Google refresh tokens are never stored."
     },
     {
       "id": "2.2.2",
       "title": "Other sessions can be terminated after a password change or reset",
-      "status": "not_applicable",
-      "reason": "The app has no passwords; credential changes happen at Google. Revisit if local accounts are added.",
-      "reopen_if": ["(?i)\\b(argon2|bcrypt|scrypt|pbkdf2|password_hash|hash_password|verify_password|change_password|reset_password)\\b"]
+      "status": "pending",
+      "blocker": "Password accounts exist (auth/password.rs) but there is no password change or reset yet, so there is nothing to terminate sessions on. When either is added it must delete the user's other sessions (DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2) with a test, then this can be verified."
     },
     {
       "id": "2.2.3",
       "title": "Non-revocable stateless authentication tokens expire within 24 hours",
-      "status": "pending",
-      "blocker": "Session design pending. Prefer opaque, revocable server-side sessions; any JWT must have exp <= 24h."
+      "status": "verified",
+      "evidence": ["test:session_lifetime_is_capped_at_24_hours", "test:expired_and_idle_sessions_are_rejected"],
+      "notes": "No stateless tokens are issued. Sessions are revocable anyway, and the config refuses an absolute lifetime above 24 h."
     },
     {
       "id": "2.3.1",
       "title": "Cookie-based session tokens have the Secure attribute",
-      "status": "pending",
-      "blocker": "No session cookie yet. lint:cookie-flags already rejects any cookie built without secure(true), http_only(true) and same_site.",
-      "evidence": ["lint:cookie-flags"]
+      "status": "verified",
+      "evidence": ["lint:cookie-flags", "lint:set-cookie-outside-helper", "test:session_cookie_has_secure_attributes", "test:cleared_cookie_expires_immediately_and_keeps_flags", "test:google_sign_in_creates_a_fresh_session"],
+      "notes": "Cookies are built only in backend/src/auth/cookies.rs, always with Secure and the __Host- prefix."
     },
     {
       "id": "2.3.2",
       "title": "Cookie-based session tokens have the HttpOnly attribute",
-      "status": "pending",
-      "blocker": "No session cookie yet. lint:cookie-flags already enforces http_only(true).",
-      "evidence": ["lint:cookie-flags"]
+      "status": "verified",
+      "evidence": ["lint:cookie-flags", "lint:set-cookie-outside-helper", "test:session_cookie_has_secure_attributes", "test:cleared_cookie_expires_immediately_and_keeps_flags", "test:google_sign_in_creates_a_fresh_session"],
+      "notes": "Cookies are built only in backend/src/auth/cookies.rs, always HttpOnly. The SPA never reads them."
     },
     {
       "id": "2.3.3",
       "title": "Session tokens are used rather than static API secrets and keys",
-      "status": "pending",
-      "blocker": "Authentication not built. Use per-user session tokens; do not add static shared API keys for clients."
+      "status": "verified",
+      "evidence": ["test:google_sign_in_creates_a_fresh_session", "test:notes_require_a_session", "test:tokens_are_256_bit_and_unique"],
+      "notes": "Each sign-in gets its own random 256-bit session token (only its SHA-256 is stored). There are no static API keys for clients."
     },
     {
       "id": "2.3.4",
       "title": "Stateless session tokens are protected against tampering, replay, null cipher and key substitution",
-      "status": "pending",
-      "blocker": "Session design pending. If stateless tokens are chosen, pin the algorithm, reject alg=none and validate iss/aud/exp."
+      "status": "not_applicable",
+      "reason": "Sessions are opaque random tokens looked up server-side; no stateless (JWT/PASETO) session tokens exist. Google's ID token is consumed once at sign-in and never used as a session (see 3.2.1).",
+      "reopen_if": ["(?i)\\b(jsonwebtoken|jwt[-_]simple|josekit|biscuit[-_]auth|pasetors|rusty_paseto|jose)\\b"]
     },
     {
       "id": "2.4.1",
       "title": "A full valid session or re-authentication is required before sensitive transactions or account changes",
-      "status": "pending",
-      "blocker": "Authentication not built. All state-changing endpoints must require a valid session."
+      "status": "verified",
+      "evidence": ["test:notes_require_a_session", "test:users_cannot_reach_each_others_notes", "test:logout_rejects_cross_site_forms"],
+      "notes": "Every state-changing endpoint sits behind require_session. There are no account-change functions; the Google account is managed at Google."
     },
     {
       "id": "3.1.1",
       "title": "Least-privilege access control rules are enforced on a trusted service layer",
-      "status": "pending",
-      "blocker": "BLOCKER: /api/notes is unauthenticated. Any client can list, read and delete every note. Add OAuth sessions, a notes.owner_id column, and scope every query to the session user."
+      "status": "verified",
+      "evidence": ["test:notes_require_a_session", "test:users_cannot_reach_each_others_notes", "test:auth_user_extractor_rejects_unguarded_routes", "lint:notes-owner-scope"],
+      "notes": "Deny by default: the /api/notes scope is wrapped in require_session, and handlers take AuthUser, which refuses if the middleware didn't run. Only /api/health and the sign-in endpoints are public."
     },
     {
       "id": "3.1.2",
       "title": "User and data attributes used by access controls cannot be manipulated by end users",
       "status": "verified",
-      "evidence": ["lint:permissive-deserialize", "test:unknown_fields_are_rejected"],
-      "notes": "Every request body struct uses deny_unknown_fields, so server-controlled fields such as id, created_at and (later) owner_id cannot be mass-assigned."
+      "evidence": ["lint:permissive-deserialize", "test:unknown_fields_are_rejected", "test:registration_validates_input"],
+      "notes": "Every request body struct uses deny_unknown_fields, so server-controlled fields such as id, created_at and (later) owner_id cannot be mass-assigned. Registration rejects extra fields such as id, password_hash and google_sub."
     },
     {
       "id": "3.1.3",
       "title": "Access controls fail securely, including when an exception occurs",
-      "status": "pending",
-      "blocker": "No access control layer yet. Existing controls fail closed (missing limiter returns 500; internal errors are masked). Extend this to the auth middleware.",
-      "evidence": ["test:missing_limiter_fails_closed", "test:internal_errors_do_not_leak_details"]
+      "status": "verified",
+      "evidence": ["test:session_check_fails_closed_when_database_is_down", "test:session_check_fails_closed_when_not_configured", "test:auth_user_extractor_rejects_unguarded_routes", "test:missing_limiter_fails_closed", "test:missing_auth_limiter_fails_closed", "test:internal_errors_do_not_leak_details"]
     },
     {
       "id": "3.1.4",
       "title": "Sensitive resources are protected against IDOR on create, read, update and delete",
-      "status": "pending",
-      "blocker": "BLOCKER: GET/DELETE /api/notes/{id} perform no ownership check. Fix together with 3.1.1."
+      "status": "verified",
+      "evidence": ["test:users_cannot_reach_each_others_notes", "test:unknown_fields_are_rejected", "lint:notes-owner-scope"],
+      "notes": "Every notes query is scoped by owner_id from the session, never from the request. Another user's note returns the same 404 as a missing one."
     },
     {
       "id": "3.1.5",
       "title": "Strong anti-CSRF protects authenticated functionality; anti-automation or anti-CSRF protects unauthenticated functionality",
       "status": "verified",
-      "evidence": ["test:cross_site_form_post_is_rejected", "test:rate_limit_returns_429_after_burst", "lint:cors-wildcard"],
-      "notes": "State-changing endpoints accept only application/json, which a cross-site form cannot send without a CORS preflight, and no CORS is granted. Re-check when session cookies are added (SameSite is enforced by lint:cookie-flags)."
+      "evidence": ["test:cross_site_form_post_is_rejected", "test:logout_rejects_cross_site_forms", "test:session_cookie_has_secure_attributes", "test:rate_limit_returns_429_after_burst", "lint:cors-wildcard"],
+      "notes": "Session cookie is SameSite=Strict. State-changing endpoints (including logout) accept only application/json, which a cross-site form cannot send without a CORS preflight, and no CORS is granted. Sign-in CSRF is blocked by the state check (3.2.2)."
     },
     {
       "id": "3.1.6",
@@ -161,15 +166,16 @@
     {
       "id": "3.2.1",
       "title": "Only secure OAuth 2.0 flows (Authorization Code, with PKCE) are used; implicit and password grants are not",
-      "status": "pending",
-      "blocker": "Google OAuth not built yet. lint:oauth-implicit-flow already rejects response_type=token and grant_type=password.",
-      "evidence": ["lint:oauth-implicit-flow"]
+      "status": "verified",
+      "evidence": ["lint:oauth-implicit-flow", "test:authorize_url_uses_code_flow_with_pkce_and_fixed_redirect", "test:google_sign_in_creates_a_fresh_session", "test:callback_rejects_wrong_pkce_verifier_and_issuer", "test:rejects_each_bad_claim", "test:rejects_malformed_id_tokens", "test:pkce_challenge_matches_rfc7636_example"],
+      "notes": "Authorization Code + PKCE (S256) with a nonce. The ID token comes straight from Google's token endpoint over verified TLS, so per OIDC Core §3.1.3.7 the TLS check stands in for the signature; iss, aud, exp, iat, nonce and email_verified are all checked. Google's access/refresh tokens are discarded."
     },
     {
       "id": "3.2.2",
       "title": "redirect_uri and state are validated during OAuth authorization",
-      "status": "pending",
-      "blocker": "Google OAuth not built yet. Use a fixed, registered redirect_uri; generate a random state, bind it to the pre-auth session and compare it on callback."
+      "status": "verified",
+      "evidence": ["test:callback_rejects_forged_state", "test:callback_without_login_cookie_is_refused", "test:google_sign_in_creates_a_fresh_session", "test:redirect_uri_must_be_https_fixed_and_exact", "test:authorize_url_uses_code_flow_with_pkce_and_fixed_redirect"],
+      "notes": "redirect_uri is fixed in config, validated at startup (https, exact path, no query) and never read from the request. state is random, stored server-side under a __Host- login cookie, compared in constant time and single-use (replay test). The RFC 9207 iss parameter is checked when present."
     },
     {
       "id": "3.3.1",
@@ -189,8 +195,8 @@
       "id": "4.1.2",
       "title": "Connections to and from the server use trusted TLS certificates",
       "status": "pending",
-      "blocker": "Depends on 4.1.1. The backend-to-Postgres link is plaintext on the private compose network; use sslmode=verify-full for any managed or remote database.",
-      "evidence": ["lint:tls-verification-disabled"]
+      "blocker": "Depends on 4.1.1. Outbound calls to Google already use rustls with the Mozilla root set and https-only. The backend-to-Postgres link is plaintext on the private compose network; use sslmode=verify-full for any managed or remote database.",
+      "evidence": ["lint:tls-verification-disabled", "test:production_client_refuses_plain_http"]
     },
     {
       "id": "4.1.3",
@@ -234,9 +240,9 @@
     {
       "id": "5.1.5",
       "title": "Prevent server-side request forgery",
-      "status": "not_applicable",
-      "reason": "The backend makes no outbound HTTP requests.",
-      "reopen_if": ["(?i)\\b(reqwest|awc|ureq|isahc|surf|hyper-util|oauth2)\\b"]
+      "status": "verified",
+      "evidence": ["lint:outbound-http", "test:production_client_refuses_plain_http"],
+      "notes": "The only outbound HTTP is the sign-in code exchange in backend/src/auth/google.rs, to Google's constant token endpoint. No URL comes from user input; redirects and proxies are disabled on the client; lint:outbound-http rejects HTTP clients anywhere else."
     },
     {
       "id": "5.1.6",
@@ -306,14 +312,15 @@
       "id": "6.5.1",
       "title": "Credentials and payment details are not logged; session tokens appear in logs only hashed",
       "status": "verified",
-      "evidence": ["lint:sensitive-logging", "test:debug_output_redacts_database_url"]
+      "evidence": ["lint:sensitive-logging", "test:debug_output_redacts_secrets"],
+      "notes": "Session tokens are never logged; only their SHA-256 is stored. Sign-in failures log a reason code, not the code, state or tokens. Secret config values use a redacting Secret type. Passwords are never logged or returned: the request structs don't derive Debug, and failed sign-ins log only that they failed."
     },
     {
       "id": "6.6.1",
       "title": "Browser storage is securely cleared during logout",
       "status": "verified",
       "evidence": ["lint:browser-storage"],
-      "notes": "Nothing is written to localStorage, sessionStorage, IndexedDB or document.cookie from JS, and the lint keeps it that way."
+      "notes": "The SPA keeps nothing in browser storage; the session lives only in an HttpOnly cookie, which logout clears (Max-Age=0) and deletes server-side."
     },
     {
       "id": "6.7.1",

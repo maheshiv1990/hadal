@@ -45,9 +45,22 @@ Frontend (SolidJS):
 - No `localStorage`/`sessionStorage`/`indexedDB`/`document.cookie` (6.6.1). Auth stays in HttpOnly cookies.
 - No tokens or secrets in URLs (2.1.1). `target="_blank"` needs `rel="noopener noreferrer"`.
 
-When auth lands (unblocks 3.1.1 and 3.1.4, the current blockers): use Google OAuth
-Authorization Code + PKCE, random `state` bound to the session, a fixed `redirect_uri`,
-opaque server-side sessions with logout and expiry, and scope every notes query by `owner_id`.
+Auth (Google OAuth Authorization Code + PKCE, opaque server-side sessions) lives in
+`backend/src/auth/`. Keep it that way:
+- New API routes go inside a scope wrapped in `auth::require_session` and take
+  `AuthUser`. Only `/api/health` and the sign-in/register endpoints are public (3.1.1).
+- Every query on user data is scoped by `owner_id = user.user_id`; never trust an id or
+  owner from the request (3.1.4, lint:notes-owner-scope). Return 404 for others' rows.
+- Cookies only via `auth::cookies::SetCookie` (lint:set-cookie-outside-helper).
+- Outbound HTTP only in `auth/google.rs`, to fixed Google endpoints (5.1.5, lint:outbound-http).
+- Redirects only through `auth::redirect()` with a fixed target; `redirect_uri` stays in config.
+- Password accounts live in `auth/password.rs`: Argon2id via `hash_password` /
+  `verify_password` only, one "invalid email or password" error, no `Debug` on
+  request types holding passwords. They stay separate from Google accounts. Any
+  password change or reset must revoke the user's other sessions (2.2.2).
+- Secrets in config use `config::Secret`. Don't store Google tokens without encryption.
+- DB-backed tests use `test_support::{test_db, signed_in_user, test_app!}`; `verify.sh`
+  starts the throwaway DB (`scripts/test-db.sh`).
 
 ## Suppressions
 

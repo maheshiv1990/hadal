@@ -12,7 +12,10 @@ use actix_web::{
     middleware::{DefaultHeaders, Next},
     web,
 };
-use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
+use governor::{
+    DefaultKeyedRateLimiter, Quota, RateLimiter,
+    clock::{Clock, DefaultClock},
+};
 use serde_json::json;
 
 /// Headers applied to every response (ASVS V14.4). The API never serves HTML,
@@ -50,10 +53,26 @@ pub struct Limiter {
 
 impl Limiter {
     pub fn new(per_second: NonZeroU32, burst: NonZeroU32, trust_proxy_headers: bool) -> Self {
+        Self::with_quota(
+            Quota::per_second(per_second).allow_burst(burst),
+            trust_proxy_headers,
+        )
+    }
+
+    pub fn per_minute(
+        per_minute: NonZeroU32,
+        burst: NonZeroU32,
+        trust_proxy_headers: bool,
+    ) -> Self {
+        Self::with_quota(
+            Quota::per_minute(per_minute).allow_burst(burst),
+            trust_proxy_headers,
+        )
+    }
+
+    fn with_quota(quota: Quota, trust_proxy_headers: bool) -> Self {
         Self {
-            inner: Arc::new(RateLimiter::keyed(
-                Quota::per_second(per_second).allow_burst(burst),
-            )),
+            inner: Arc::new(RateLimiter::keyed(quota)),
             trust_proxy_headers,
         }
     }
@@ -80,12 +99,39 @@ impl Limiter {
     }
 }
 
+/// Stricter limiter for the unauthenticated sign-in endpoints (CASA 1.1.1).
+/// A separate type so it can sit in app data next to the global `Limiter`.
+#[derive(Clone)]
+pub struct AuthLimiter(pub Limiter);
+
 /// Per-client rate limit (CASA 1.1.1 / 3.1.5 anti-automation).
 pub async fn rate_limit(
     req: ServiceRequest,
     next: Next<impl MessageBody>,
 ) -> Result<ServiceResponse<EitherBody<impl MessageBody>>, Error> {
-    let Some(limiter) = req.app_data::<web::Data<Limiter>>().cloned() else {
+    let limiter = req
+        .app_data::<web::Data<Limiter>>()
+        .map(|l| l.get_ref().clone());
+    enforce(limiter, req, next).await
+}
+
+/// Extra per-client limit on `/api/auth/login` and `/api/auth/callback`.
+pub async fn auth_rate_limit(
+    req: ServiceRequest,
+    next: Next<impl MessageBody>,
+) -> Result<ServiceResponse<EitherBody<impl MessageBody>>, Error> {
+    let limiter = req
+        .app_data::<web::Data<AuthLimiter>>()
+        .map(|l| l.0.clone());
+    enforce(limiter, req, next).await
+}
+
+async fn enforce(
+    limiter: Option<Limiter>,
+    req: ServiceRequest,
+    next: Next<impl MessageBody>,
+) -> Result<ServiceResponse<EitherBody<impl MessageBody>>, Error> {
+    let Some(limiter) = limiter else {
         // Fail closed: a missing limiter is a wiring bug, not a reason to skip the control.
         tracing::error!("rate limiter not configured");
         let resp =
@@ -95,10 +141,14 @@ pub async fn rate_limit(
 
     let ip = limiter.client_ip(&req);
 
-    if limiter.inner.check_key(&ip).is_err() {
+    if let Err(not_until) = limiter.inner.check_key(&ip) {
+        let retry_after = not_until
+            .wait_time_from(DefaultClock::default().now())
+            .as_secs()
+            .max(1);
         tracing::warn!(client_ip = %ip, path = req.path(), "rate limit exceeded");
         let resp = HttpResponse::TooManyRequests()
-            .insert_header(("Retry-After", "1"))
+            .insert_header(("Retry-After", retry_after.to_string()))
             .json(json!({ "error": "too many requests" }));
         return Ok(req.into_response(resp).map_into_right_body());
     }
@@ -214,6 +264,68 @@ mod tests {
             .peer_addr("10.0.0.2:5000".parse().unwrap())
             .to_request();
         assert_eq!(test::call_service(&app, other).await.status(), 200);
+    }
+
+    #[actix_web::test]
+    async fn auth_endpoints_have_their_own_stricter_limit() {
+        // CASA 1.1.1: sign-in is limited per minute, separately from the API.
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(Limiter::new(nz(100), nz(100), false)))
+                .app_data(web::Data::new(AuthLimiter(Limiter::per_minute(
+                    nz(1),
+                    nz(2),
+                    false,
+                ))))
+                .wrap(from_fn(rate_limit))
+                .route("/", web::get().to(HttpResponse::Ok))
+                .service(
+                    web::resource("/login")
+                        .wrap(from_fn(auth_rate_limit))
+                        .route(web::get().to(HttpResponse::Ok)),
+                ),
+        )
+        .await;
+        let peer = "10.0.0.7:5000".parse().unwrap();
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            let req = test::TestRequest::get()
+                .uri("/login")
+                .peer_addr(peer)
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            if resp.status() == 429 {
+                let retry: u64 = resp
+                    .headers()
+                    .get("retry-after")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(retry >= 30, "per-minute limit should ask for a long wait");
+            }
+            statuses.push(resp.status().as_u16());
+        }
+        assert_eq!(statuses, [200, 200, 429]);
+        // The rest of the API is unaffected for the same client.
+        let req = test::TestRequest::get()
+            .uri("/")
+            .peer_addr(peer)
+            .to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), 200);
+    }
+
+    #[actix_web::test]
+    async fn missing_auth_limiter_fails_closed() {
+        let app = test::init_service(
+            App::new()
+                .wrap(from_fn(auth_rate_limit))
+                .route("/", web::get().to(HttpResponse::Ok)),
+        )
+        .await;
+        let req = test::TestRequest::get().uri("/").to_request();
+        assert_eq!(test::call_service(&app, req).await.status(), 500);
     }
 
     #[actix_web::test]

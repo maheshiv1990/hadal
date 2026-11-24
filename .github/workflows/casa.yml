@@ -23,6 +23,20 @@ jobs:
   gate:
     name: verify.sh full
     runs-on: ubuntu-latest
+    # Throwaway database for the sign-in, session and IDOR tests.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: hadal_test
+          POSTGRES_DB: hadal_test
+          POSTGRES_PASSWORD: ${{ github.run_id }}-${{ github.run_attempt }}
+        ports: ["127.0.0.1:5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U hadal_test" --health-interval 2s
+          --health-timeout 2s --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://hadal_test:${{ github.run_id }}-${{ github.run_attempt }}@127.0.0.1:5432/hadal_test
     steps:
       - uses: actions/checkout@v4
         with:
@@ -67,7 +81,14 @@ jobs:
           persist-credentials: false
       - name: Start stack
         run: |
-          printf 'POSTGRES_PASSWORD=%s\nHTTP_PORT=8000\n' "$(openssl rand -hex 24)" > .env
+          {
+            printf 'POSTGRES_PASSWORD=%s\nHTTP_PORT=8000\n' "$(openssl rand -hex 24)"
+            # Placeholder OAuth client: lets the stack boot for the scan; no
+            # real sign-in can complete with it.
+            printf 'GOOGLE_CLIENT_ID=zap-scan.apps.googleusercontent.com\n'
+            printf 'GOOGLE_CLIENT_SECRET=%s\n' "$(openssl rand -hex 24)"
+            printf 'OAUTH_REDIRECT_URI=http://localhost:8000/api/auth/callback\n'
+          } > .env
           docker compose up -d --build --wait
       - name: ZAP baseline scan
         run: |
