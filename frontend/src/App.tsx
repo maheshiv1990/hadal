@@ -1,4 +1,4 @@
-import { createEffect, createResource, createSignal, For, Show } from 'solid-js'
+import { createEffect, createResource, createSignal, For, Match, Show, Switch } from 'solid-js'
 import {
   api,
   GMAIL_CONNECT_PATH,
@@ -10,7 +10,24 @@ import {
   type Me,
 } from './api'
 
-type AuthView = 'signin' | 'register'
+/** What a signed-out visitor sees: the welcome page until they pick an action in the header. */
+type AuthView = 'home' | 'signin' | 'register'
+
+function Welcome(props: { onSignIn: () => void; onRegister: () => void }) {
+  return (
+    <section class="welcome">
+      <img src="/hadal-icon.png" alt="" width="96" height="96" />
+      <h1>Welcome to Hadal</h1>
+      <p class="muted">Your notes and email in one private place.</p>
+      <div class="row">
+        <button onClick={props.onSignIn}>Sign in</button>
+        <button class="secondary plain" onClick={props.onRegister}>
+          Register
+        </button>
+      </div>
+    </section>
+  )
+}
 
 /** Result of a Gmail link, from the `?mail=` flag the server redirects with. */
 type LinkResult = 'linked' | 'failed' | null
@@ -130,6 +147,13 @@ function Register(props: { onSignedIn: (me: Me) => void; onCancel: () => void })
   return (
     <section class="signin">
       <h2>Create an account</h2>
+      {/* Google sign-in creates the account on first use, so sign-up uses the same flow. */}
+      <a class="button" href={LOGIN_PATH}>
+        Sign up with Google
+      </a>
+
+      <p class="muted divider">or register with email</p>
+
       <form onSubmit={submit} class="auth-form">
         <div class="row">
           <label>
@@ -557,11 +581,12 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult }) {
 
 function App() {
   const [me, { mutate }] = createResource<Me | null>(api.me)
-  const [view, setView] = createSignal<AuthView>('signin')
-  const [changing, setChanging] = createSignal(false)
-  const [notice, setNotice] = createSignal<string | null>(null)
   const query = new URLSearchParams(window.location.search)
   const loginFailed = query.get('login') === 'failed'
+  // A failed Google sign-in comes back here; show the sign-in options with the error.
+  const [view, setView] = createSignal<AuthView>(loginFailed ? 'signin' : 'home')
+  const [changing, setChanging] = createSignal(false)
+  const [notice, setNotice] = createSignal<string | null>(null)
   const mailFlag = query.get('mail')
   const linkResult: LinkResult = mailFlag === 'linked' || mailFlag === 'failed' ? mailFlag : null
   if (loginFailed || mailFlag !== null) {
@@ -574,7 +599,7 @@ function App() {
       await api.logout()
     } finally {
       mutate(null)
-      setView('signin')
+      setView('home')
       setChanging(false)
       setNotice(null)
     }
@@ -585,7 +610,7 @@ function App() {
       <header class="site-header">
         <div class="site-header-inner">
         <a class="brand" href="/" aria-label="Hadal home">
-          <span class="brand-mark" aria-hidden="true">◆</span>
+          <img class="brand-mark" src="/hadal-icon.png" alt="" width="32" height="32" />
           Hadal
         </a>
         <Show
@@ -640,14 +665,17 @@ function App() {
           <Show
             when={me()}
             fallback={
-              <Show
-                when={view() === 'register'}
-                fallback={
+              <Switch>
+                <Match when={view() === 'signin'}>
                   <SignIn failed={loginFailed} onSignedIn={mutate} onRegister={() => setView('register')} />
-                }
-              >
-                <Register onSignedIn={mutate} onCancel={() => setView('signin')} />
-              </Show>
+                </Match>
+                <Match when={view() === 'register'}>
+                  <Register onSignedIn={mutate} onCancel={() => setView('signin')} />
+                </Match>
+                <Match when={view() === 'home'}>
+                  <Welcome onSignIn={() => setView('signin')} onRegister={() => setView('register')} />
+                </Match>
+              </Switch>
             }
           >
             <Show when={notice()}>
