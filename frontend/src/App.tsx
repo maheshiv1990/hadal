@@ -423,7 +423,6 @@ function Mail(props: {
   const [folder, setFolder] = createSignal<FolderLabel>('INBOX')
   const [openId, setOpenId] = createSignal<string | null>(null)
   const [detail] = createResource(openId, api.getMessage)
-  const [importing, setImporting] = createSignal(false)
   const [problems, setProblems] = createSignal<string[]>([])
   const [error, setError] = createSignal<string | null>(null)
 
@@ -454,6 +453,11 @@ function Mail(props: {
   const selectedAccount = () => {
     const list = orderedAccounts()
     return list.find((a) => a.id === mailbox()) ?? list[0]
+  }
+  /** The selected mailbox if it can be disconnected (it isn't the sign-in one). */
+  const disconnectable = () => {
+    const account = selectedAccount()
+    return account && !isPrimary(account) ? account : undefined
   }
   // The open folder of the selected mailbox, fetched from the server.
   const [messages, { refetch: refetchMessages }] = createResource(
@@ -497,7 +501,6 @@ function Mail(props: {
   const importAll = async () => {
     setError(null)
     setProblems([])
-    setImporting(true)
     try {
       const res = await api.importMail()
       setProblems(res.accounts.filter((a) => a.error).map((a) => `${a.email}: ${a.error}`))
@@ -506,8 +509,6 @@ function Mail(props: {
       // Another tab is already importing: its mail shows up on the next load.
       if (err instanceof Error && err.message === 'an import is already running') return
       handle(err)
-    } finally {
-      setImporting(false)
     }
   }
 
@@ -648,35 +649,33 @@ function Mail(props: {
       </aside>
 
       <div class="inbox-main">
-        <div class="inbox-toolbar">
-          <Show
-            when={openId()}
-            fallback={
-              <div class="toolbar-group">
-                <Show when={selectedAccount() && !isPrimary(selectedAccount()!) && selectedAccount()}>
-                  {(account) => (
-                    <button class="ghost danger" onClick={() => disconnect(account())}>
-                      Disconnect
-                    </button>
-                  )}
-                </Show>
-              </div>
-            }
-          >
-            <button class="ghost" onClick={() => setOpenId(null)} aria-label="Back to the list">
-              ← Back
-            </button>
-          </Show>
-          <Show when={importing()}>
-            <span class="muted toolbar-status" role="status">
-              Importing…
-            </span>
-          </Show>
-        </div>
+        {/* Only when there's something in it: Back, or Disconnect for a non-primary mailbox. */}
+        <Show when={openId() || disconnectable()}>
+          <div class="inbox-toolbar">
+            <Show
+              when={openId()}
+              fallback={
+                <div class="toolbar-group">
+                  <Show when={disconnectable()}>
+                    {(account) => (
+                      <button class="ghost danger" onClick={() => disconnect(account())}>
+                        Disconnect
+                      </button>
+                    )}
+                  </Show>
+                </div>
+              }
+            >
+              <button class="ghost" onClick={() => setOpenId(null)} aria-label="Back to the list">
+                ← Back
+              </button>
+            </Show>
+          </div>
+        </Show>
 
         <Show when={props.linkResult === 'linked'}>
           <p class="notice inbox-note" role="status">
-            Gmail connected. Its newest mail is being imported.
+            Gmail connected.
           </p>
         </Show>
         <Show when={props.linkResult === 'failed'}>
@@ -702,9 +701,7 @@ function Mail(props: {
                         ? 'No accounts connected. Connect a Gmail account to import its newest 100 messages.'
                         : selectedAccount()?.message_count
                           ? `Nothing in ${folderName()}.`
-                          : importing()
-                            ? 'Importing your newest mail…'
-                            : 'No messages yet.'}
+                          : 'No messages yet.'}
                     </p>
                   }
                 >
