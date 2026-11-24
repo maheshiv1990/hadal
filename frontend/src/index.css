@@ -138,27 +138,76 @@ button.link {
 button.secondary.plain { color: inherit; }
 .notice { color: var(--accent); }
 
-/* Email */
-.mail h2 { margin: 0; font-size: 1.125rem; }
-.mail-head { display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
-.mail-actions { display: flex; gap: 0.5rem; align-items: center; }
+/* Email: an inbox with mailboxes on the left and one row per message */
+main.wide, .site-header-inner.wide { max-width: 1200px; }
 a.button.outline { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
-.mail-accounts, .messages { list-style: none; padding: 0; margin: 0 0 1rem; }
-.mail-accounts li { display: flex; justify-content: space-between; align-items: center; gap: 0.75rem; padding: 0.5rem 0; border-bottom: 1px solid var(--border); }
-.messages li { border-bottom: 1px solid var(--border); }
-.message-row {
-  display: flex; flex-direction: column; align-items: stretch; gap: 0.15rem;
-  width: 100%; text-align: left; padding: 0.6rem 0.25rem;
-  background: transparent; color: inherit; border: 0; border-radius: 0; font-weight: normal;
+.inbox { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 1.25rem; align-items: start; }
+.inbox-side { display: flex; flex-direction: column; gap: 0.75rem; position: sticky; top: 5rem; }
+a.add-account {
+  padding: 0.4rem 0.75rem; border-radius: 0 999px 999px 0;
+  color: var(--accent); font-size: 0.9rem; font-weight: 600; text-decoration: none;
 }
-.message-row:hover, .messages li.open .message-row { background: color-mix(in srgb, var(--accent) 8%, transparent); }
-.message-top { display: flex; justify-content: space-between; gap: 0.75rem; }
-.message-top strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.message-top time { flex-shrink: 0; }
-.snippet { font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.message-body { padding: 0 0.25rem 0.75rem; }
-.message-body p { margin: 0.25rem 0 0.5rem; }
-.message-body pre {
-  margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
-  font: inherit; font-size: 0.9rem; max-height: 60vh; overflow: auto;
+a.add-account:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.mailboxes { display: flex; flex-direction: column; gap: 2px; }
+button.mailbox {
+  display: flex; justify-content: space-between; align-items: center; gap: 0.5rem;
+  align-self: stretch; padding: 0.4rem 0.75rem;
+  background: transparent; border: 0; border-radius: 0 999px 999px 0; color: inherit;
+  text-align: left; font-size: 0.9rem;
+}
+button.mailbox:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+button.mailbox.active { background: color-mix(in srgb, var(--accent) 16%, transparent); font-weight: 600; }
+.mailbox-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.count { color: var(--muted); font-size: 0.8rem; font-weight: normal; font-variant-numeric: tabular-nums; }
+
+.inbox-main { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; min-width: 0; }
+.inbox-toolbar {
+  display: flex; justify-content: space-between; align-items: center; gap: 0.75rem;
+  min-height: 2.75rem; padding: 0.25rem 0.75rem; border-bottom: 1px solid var(--border);
+}
+.toolbar-group { display: flex; align-items: center; gap: 0.25rem; }
+button.ghost { background: transparent; border-color: transparent; color: inherit; padding: 0.3rem 0.6rem; font-size: 0.9rem; }
+button.ghost:hover:not(:disabled) { background: color-mix(in srgb, var(--fg) 7%, transparent); }
+button.ghost.danger { color: var(--danger); }
+.inbox-note { margin: 0; padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); }
+.inbox-empty { margin: 0; padding: 2.5rem 1rem; text-align: center; }
+
+.message-list { list-style: none; margin: 0; padding: 0; }
+.message-list li + li { border-top: 1px solid var(--border); }
+.message-row {
+  display: grid; grid-template-columns: 190px minmax(0, 1fr) auto; align-items: center; gap: 1rem;
+  width: 100%; padding: 0.55rem 0.75rem;
+  background: transparent; border: 0; border-radius: 0; color: inherit;
+  text-align: left; font-size: 0.9rem;
+}
+.message-row:hover {
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.m-from, .m-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-from, .m-subject, .m-date { font-weight: 600; }
+.m-snippet { color: var(--muted); }
+.m-tag {
+  display: inline-block; margin-right: 0.5rem; padding: 0 0.4rem; border-radius: 4px;
+  background: color-mix(in srgb, var(--fg) 9%, transparent); color: var(--muted);
+  font-size: 0.75rem; font-weight: normal; vertical-align: 1px;
+}
+.m-date { font-size: 0.8rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+.reader { padding: 1.25rem 1.5rem 2rem; }
+.reader h2 { margin: 0 0 1rem; font-size: 1.375rem; font-weight: 500; }
+.reader-meta { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 1.25rem; }
+.reader-people { min-width: 0; overflow-wrap: anywhere; }
+.reader-meta time { white-space: nowrap; }
+.reader pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 0.95rem; line-height: 1.6; }
+
+@media (max-width: 760px) {
+  .inbox { grid-template-columns: minmax(0, 1fr); }
+  .inbox-side { position: static; }
+  .mailboxes { flex-direction: row; align-items: center; overflow-x: auto; }
+  button.mailbox, a.add-account { flex-shrink: 0; border-radius: 999px; white-space: nowrap; }
+  .message-row { grid-template-columns: minmax(0, 1fr) auto; row-gap: 0.15rem; }
+  .m-text { grid-column: 1 / -1; grid-row: 2; }
+  .m-tag { display: none; }
+  .reader-meta { flex-direction: column; }
 }
