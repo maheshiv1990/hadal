@@ -14,6 +14,9 @@ pub enum AppError {
     TooManyRequests,
     Conflict(&'static str),
     BadRequest(String),
+    /// Google failed or refused a call made for this request. A fixed,
+    /// user-facing message; the detail is logged where it happened.
+    Upstream(&'static str),
     Internal(anyhow::Error),
 }
 
@@ -31,6 +34,7 @@ impl std::fmt::Display for AppError {
             AppError::TooManyRequests => write!(f, "too many requests"),
             AppError::Conflict(msg) => write!(f, "{msg}"),
             AppError::BadRequest(msg) => write!(f, "{msg}"),
+            AppError::Upstream(msg) => write!(f, "{msg}"),
             AppError::Internal(_) => write!(f, "internal server error"),
         }
     }
@@ -44,6 +48,7 @@ impl ResponseError for AppError {
             AppError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AppError::Upstream(_) => StatusCode::BAD_GATEWAY,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

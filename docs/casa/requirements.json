@@ -149,7 +149,7 @@
       "title": "Sensitive resources are protected against IDOR on create, read, update and delete",
       "status": "verified",
       "evidence": ["test:users_cannot_reach_each_others_mail", "test:unknown_fields_are_rejected", "lint:notes-owner-scope"],
-      "notes": "Every mail_accounts and mail_messages query is scoped by owner_id from the session, never from the request (lint:notes-owner-scope covers both tables, and still flags the removed notes table if it comes back). mail_messages has a composite foreign key to (mailbox id, owner_id), so a message can't belong to someone else's mailbox. Another user's mailbox or message returns the same 404 as a missing one. The Gmail link callback takes the user from the single-use pending row, not the request."
+      "notes": "Every mail_accounts and mail_messages query is scoped by owner_id from the session, never from the request (lint:notes-owner-scope covers both tables, and still flags the removed notes table if it comes back). mail_messages has a composite foreign key to (mailbox id, owner_id), so a message can't belong to someone else's mailbox. Another user's mailbox, message or attachment returns the same 404 as a missing one; an attachment download is picked by its position in the owner's own encrypted record, never by a Gmail ID from the request. The Gmail link callback takes the user from the single-use pending row, not the request."
     },
     {
       "id": "3.1.5",
@@ -204,7 +204,7 @@
       "title": "No weak cryptography affecting confidential data",
       "status": "verified",
       "evidence": ["lint:weak-crypto", "lint:insecure-randomness", "tool:semgrep", "test:round_trips_and_uses_a_fresh_nonce_each_time"],
-      "notes": "Refresh tokens and imported mail are encrypted with AES-256-GCM (ring) under DATA_ENCRYPTION_KEY, with a random 96-bit nonce from the OS CSPRNG per value."
+      "notes": "Refresh tokens and imported mail (summary, body and attachment names/types/sizes) are encrypted with AES-256-GCM (ring) under DATA_ENCRYPTION_KEY, with a random 96-bit nonce from the OS CSPRNG per value. Attachment files are not stored: they are fetched from Gmail when downloaded."
     },
     {
       "id": "4.1.4",
@@ -244,7 +244,7 @@
       "title": "Prevent server-side request forgery",
       "status": "verified",
       "evidence": ["lint:outbound-http", "test:production_client_refuses_plain_http", "test:gmail_ids_are_checked_before_use_in_a_url"],
-      "notes": "All outbound HTTP is in backend/src/auth/google.rs, to Google's constant endpoints: token (code exchange and refresh), revoke, and the Gmail API under https://gmail.googleapis.com/gmail/v1/users/me/. No host or URL comes from user input; Gmail message IDs from Google are checked to be plain alphanumeric before they go into a path segment. Redirects and proxies are disabled on the client; lint:outbound-http rejects HTTP clients anywhere else."
+      "notes": "All outbound HTTP is in backend/src/auth/google.rs, to Google's constant endpoints: token (code exchange and refresh), revoke, and the Gmail API under https://gmail.googleapis.com/gmail/v1/users/me/ (message list, messages, and message attachments). No host or URL comes from user input; Gmail message IDs from Google are checked to be plain alphanumeric, and attachment IDs plain base64url, before they go into a path segment. Responses are size-capped (attachments at Gmail's 25 MB limit). Redirects and proxies are disabled on the client; lint:outbound-http rejects HTTP clients anywhere else."
     },
     {
       "id": "5.1.6",
@@ -257,8 +257,8 @@
       "id": "5.1.7",
       "title": "Context-aware output escaping protects against reflected, stored and DOM XSS",
       "status": "verified",
-      "evidence": ["lint:raw-html-sink", "lint:tabnabbing", "test:every_response_carries_security_headers", "file:nginx/security-headers.conf", "tool:semgrep", "test:html_only_bodies_become_text_with_scripts_and_styles_dropped"],
-      "notes": "API: JSON only, nosniff, CSP default-src 'none', set by the backend alone (nginx adds no headers to proxied /api/ responses). UI: Solid escapes interpolations, raw HTML sinks are banned, strict CSP from nginx. Imported mail is never rendered as HTML: HTML-only bodies are reduced to plain text on the server, and the UI shows bodies as text in a <pre>."
+      "evidence": ["lint:raw-html-sink", "lint:tabnabbing", "test:every_response_carries_security_headers", "file:nginx/security-headers.conf", "tool:semgrep", "test:html_only_bodies_become_text_with_scripts_and_styles_dropped", "test:attachments_download_as_files_never_inline", "test:download_names_cannot_break_the_header"],
+      "notes": "API: JSON only, nosniff, CSP default-src 'none', set by the backend alone (nginx adds no headers to proxied /api/ responses). UI: Solid escapes interpolations, raw HTML sinks are banned, strict CSP from nginx. Imported mail is never rendered as HTML: HTML-only bodies are reduced to plain text on the server, and the UI shows bodies as text in a <pre>. Attachments are only ever downloads: always application/octet-stream with Content-Disposition: attachment (whatever type the email claims), under the API's nosniff and CSP, so a file from an email can't run as a page on our origin. File names are cleaned at import and encoded in the header so they can't inject parameters."
     },
     {
       "id": "5.1.8",
@@ -329,7 +329,7 @@
       "title": "Access tokens, API keys and other server-side secrets are stored securely",
       "status": "pending",
       "blocker": "In code, secrets come only from the environment, .env is git-ignored, and gitleaks runs on every commit. Google refresh tokens and imported mail are stored AES-256-GCM encrypted, bound to their row; access tokens are only held in memory. Production still needs a secrets manager (encrypted, access-controlled, audited) holding DATA_ENCRYPTION_KEY and the OAuth client secret; record it as an attestation.",
-      "evidence": ["lint:env-file-tracked", "lint:hardcoded-secret", "tool:gitleaks", "test:linking_gmail_stores_an_encrypted_grant_and_keeps_the_session", "test:import_stores_new_mail_encrypted_and_skips_what_it_already_has", "test:debug_output_redacts_secrets"]
+      "evidence": ["lint:env-file-tracked", "lint:hardcoded-secret", "tool:gitleaks", "test:linking_gmail_stores_an_encrypted_grant_and_keeps_the_session", "test:import_stores_new_mail_encrypted_and_skips_what_it_already_has", "test:attachments_download_as_files_never_inline", "test:debug_output_redacts_secrets"]
     },
     {
       "id": "7.1.1",
