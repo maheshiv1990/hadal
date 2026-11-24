@@ -17,8 +17,10 @@
 //! come from the cookie there; it comes only from the single-use row bound to
 //! this browser's login cookie.
 //!
-//! Email + password accounts (`password.rs`) use `POST /api/auth/register` and
-//! `POST /api/auth/password-login`, and get the same kind of session.
+//! Email + password accounts (`password.rs`) use `POST /api/auth/register`,
+//! `POST /api/auth/password-login` and `POST /api/auth/password`, and get the
+//! same kind of session. They are off unless `PASSWORD_AUTH_ENABLED` is set:
+//! then those routes don't exist and Hadal is Google-only.
 //!
 //! `require_session` guards every authenticated route and fails closed.
 
@@ -122,7 +124,20 @@ impl From<LoginRejected> for LoginError {
     }
 }
 
+/// Whether email + password accounts are switched on (`Config::password_auth_enabled`).
+#[derive(Clone, Copy, Debug)]
+pub struct PasswordAuth(pub bool);
+
+/// Lets a password route match only when password accounts are on. Off, or
+/// not configured at all, the route doesn't match and the request gets the
+/// API's 404, before any rate limiter, extractor or handler runs.
+fn password_auth_on(ctx: &actix_web::guard::GuardContext) -> bool {
+    ctx.app_data::<web::Data<PasswordAuth>>()
+        .is_some_and(|p| p.0)
+}
+
 pub fn configure(cfg: &mut web::ServiceConfig) {
+    let password_auth = || actix_web::guard::fn_guard(password_auth_on);
     cfg.service(
         web::scope("/auth")
             // Unauthenticated entry points get a much tighter per-IP limit
@@ -139,16 +154,19 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             )
             .service(
                 web::resource("/register")
+                    .guard(password_auth())
                     .wrap(from_fn(security::auth_rate_limit))
                     .route(web::post().to(password::register)),
             )
             .service(
                 web::resource("/password-login")
+                    .guard(password_auth())
                     .wrap(from_fn(security::auth_rate_limit))
                     .route(web::post().to(password::login)),
             )
             .service(
                 web::resource("/password")
+                    .guard(password_auth())
                     .wrap(from_fn(require_session))
                     .wrap(from_fn(security::auth_rate_limit))
                     .route(web::post().to(password::change)),

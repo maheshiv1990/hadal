@@ -133,17 +133,6 @@ export const LOGIN_PATH = '/api/auth/login'
 /** Links a Gmail mailbox. A plain link: the server redirects to Google. */
 export const GMAIL_CONNECT_PATH = '/api/auth/gmail/connect'
 
-/** Must match the backend's password policy (auth/password.rs). */
-export const MIN_PASSWORD_LENGTH = 12
-export const MAX_PASSWORD_LENGTH = 128
-
-export interface Registration {
-  first_name: string
-  last_name: string
-  email: string
-  password: string
-}
-
 export const api = {
   /** The signed-in user, or `null` when signed out. */
   me: async (): Promise<Me | null> => {
@@ -154,32 +143,11 @@ export const api = {
       throw err
     }
   },
-  /** Creates an email + password account and signs it in. */
-  register: (r: Registration) =>
-    request<Me>('/auth/register', { method: 'POST', body: JSON.stringify(r) }),
-  /** Signs in with email + password. */
-  passwordLogin: async (email: string, password: string): Promise<Me> => {
-    try {
-      return await request<Me>('/auth/password-login', {
-        method: 'POST',
-        body: JSON.stringify({ email, password }),
-      })
-    } catch (err) {
-      if (err instanceof UnauthorizedError) throw new Error('Invalid email or password.')
-      throw err
-    }
-  },
-  /** Changes the password. The server signs out every other session. */
   /** Renames the signed-in user. From then on Google sign-in keeps this name. */
   updateProfile: (first_name: string, last_name: string) =>
     request<Me>('/auth/profile', {
       method: 'POST',
       body: JSON.stringify({ first_name, last_name }),
-    }),
-  changePassword: (current_password: string, new_password: string) =>
-    request<Me>('/auth/password', {
-      method: 'POST',
-      body: JSON.stringify({ current_password, new_password }),
     }),
   // JSON body so a cross-site form can't log the user out (CASA 3.1.5).
   logout: () => request<void>('/auth/logout', { method: 'POST', body: '{}' }),
