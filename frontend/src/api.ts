@@ -14,14 +14,25 @@ export interface MailAccount {
   created_at: string
   last_import_at: string | null
   message_count: number
-  inbox_count: number
-  starred_count: number
-  sent_count: number
-  draft_count: number
+  /** Messages per label ID (`INBOX`, `Label_12`, …), plus `ALL` for everything but spam. */
+  folder_counts: Record<string, number>
+  /** The mailbox's own Gmail labels. */
+  labels: MailLabel[]
 }
 
-/** The folders in the mailbox menu, as the Gmail labels the server filters on. */
-export type FolderLabel = 'INBOX' | 'STARRED' | 'SENT' | 'DRAFT'
+/** One of the user's own Gmail labels. */
+export interface MailLabel {
+  id: string
+  name: string
+  /** `#rrggbb`, if Gmail gives it a colour. */
+  color: string | null
+}
+
+/**
+ * What the message list shows: `ALL` (everything but spam), a Gmail system
+ * label such as `INBOX` or `CATEGORY_UPDATES`, or a user label ID.
+ */
+export type FolderLabel = string
 
 /** A file attached to an imported message. It is fetched from Gmail only when downloaded. */
 export interface MailAttachment {

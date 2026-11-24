@@ -398,15 +398,63 @@ const FolderIcon = (props: { label: FolderLabel }) => (
         <path d="M6 3h8.5L19 7.5V21H6z" />
         <path d="M14.5 3v4.5H19" />
       </Match>
+      <Match when={props.label === 'IMPORTANT'}>
+        <path d="M4 6h11l5 6-5 6H4l4-6z" />
+      </Match>
+      <Match when={props.label === 'ALL'}>
+        <path d="M4 8h16v11H4z" />
+        <path d="M6 5h12M8 2.5h8" />
+      </Match>
+      <Match when={props.label === 'SPAM'}>
+        <path d="M8.3 3h7.4L21 8.3v7.4L15.7 21H8.3L3 15.7V8.3z" />
+        <path d="M12 7.5v5.5M12 16.5v.01" />
+      </Match>
+      <Match when={props.label === 'CATEGORY_SOCIAL'}>
+        <circle cx="9" cy="8" r="3.2" />
+        <path d="M3 19c.6-3.4 3-5 6-5s5.4 1.6 6 5" />
+        <path d="M15.5 4.9a3.2 3.2 0 0 1 0 6.2M17.5 14.3c1.8.6 3 2.1 3.5 4.7" />
+      </Match>
+      <Match when={props.label === 'CATEGORY_UPDATES'}>
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 11v6M12 7.5v.01" />
+      </Match>
+      <Match when={props.label === 'CATEGORY_FORUMS'}>
+        <path d="M3 4h13v9H8l-5 4z" />
+        <path d="M16 8h5v12l-4-3h-7v-4" />
+      </Match>
+      <Match when={props.label === 'CATEGORY_PROMOTIONS'}>
+        <path d="M3 12.6V4h8.6L21 13.4 13.4 21z" />
+        <path d="M7.5 7.5v.01" />
+      </Match>
     </Switch>
   </svg>
 )
 
-const FOLDERS: { label: FolderLabel; name: string; count: (a: MailAccount) => number }[] = [
-  { label: 'INBOX', name: 'Inbox', count: (a) => a.inbox_count },
-  { label: 'STARRED', name: 'Starred', count: (a) => a.starred_count },
-  { label: 'SENT', name: 'Sent', count: (a) => a.sent_count },
-  { label: 'DRAFT', name: 'Drafts', count: (a) => a.draft_count },
+/** A user label's icon: a tag in the label's own colour. */
+const LabelIcon = (props: { color: string | null }) => (
+  <svg class="folder-icon label-icon" viewBox="0 0 24 24" aria-hidden="true">
+    <path d="M3 6.5h12.5L21 12l-5.5 5.5H3z" style={{ fill: props.color ?? 'var(--muted)' }} />
+  </svg>
+)
+
+type Folder = { label: FolderLabel; name: string }
+
+const FOLDERS: Folder[] = [
+  { label: 'INBOX', name: 'Inbox' },
+  { label: 'STARRED', name: 'Starred' },
+  { label: 'SENT', name: 'Sent' },
+  { label: 'DRAFT', name: 'Drafts' },
+]
+
+/** Shown under "More". (Gmail's API has no Scheduled, Snoozed or Purchases.) */
+const MORE_FOLDERS: Folder[] = [
+  { label: 'IMPORTANT', name: 'Important' },
+  { label: 'ALL', name: 'All mail' },
+  { label: 'SPAM', name: 'Spam' },
+  { label: 'CATEGORY_SOCIAL', name: 'Social' },
+  { label: 'CATEGORY_UPDATES', name: 'Updates' },
+  { label: 'CATEGORY_FORUMS', name: 'Forums' },
+  { label: 'CATEGORY_PROMOTIONS', name: 'Promotions' },
 ]
 
 /** Attachment chips shown under a message row. */
@@ -471,13 +519,23 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
     },
   )
   const visible = () => messages() ?? []
-  const folderName = () => FOLDERS.find((f) => f.label === folder())?.name ?? ''
+  const folderName = () =>
+    [...FOLDERS, ...MORE_FOLDERS].find((f) => f.label === folder())?.name ??
+    selectedAccount()?.labels.find((l) => l.id === folder())?.name ??
+    ''
+  const countOf = (label: FolderLabel) => selectedAccount()?.folder_counts[label] ?? 0
+  /** "More" is open when asked, or when one of its folders is showing. */
+  const [moreOpen, setMoreOpen] = createSignal(false)
+  const showMore = () => moreOpen() || MORE_FOLDERS.some((f) => f.label === folder())
+  const userLabel = (id: string) => selectedAccount()?.labels.find((l) => l.id === id)
   /** Sent mail and drafts are listed by recipient, the rest by sender. */
   const byRecipient = () => folder() === 'SENT' || folder() === 'DRAFT'
 
   const showMailbox = (id: string | null) => {
     setMailbox(id)
     setOpenId(null)
+    // A user label belongs to one mailbox; another one starts at its Inbox.
+    if (folder().startsWith('Label_')) setFolder('INBOX')
   }
   const showFolder = (label: FolderLabel) => {
     setFolder(label)
@@ -564,7 +622,7 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
           </nav>
         </div>
         <nav class="folders" aria-label="Folders">
-          <For each={FOLDERS}>
+          <For each={showMore() ? [...FOLDERS, ...MORE_FOLDERS] : FOLDERS}>
             {(f) => (
               <button
                 class="mailbox folder"
@@ -576,13 +634,50 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                   <FolderIcon label={f.label} />
                   {f.name}
                 </span>
-                <Show when={selectedAccount() && f.count(selectedAccount()!) > 0}>
-                  <span class="count">{f.count(selectedAccount()!)}</span>
+                <Show when={countOf(f.label) > 0}>
+                  <span class="count">{countOf(f.label)}</span>
                 </Show>
               </button>
             )}
           </For>
+          <button
+            class="mailbox folder more-toggle"
+            aria-expanded={showMore()}
+            onClick={() => setMoreOpen(!showMore())}
+            disabled={MORE_FOLDERS.some((f) => f.label === folder())}
+          >
+            <span class="folder-label">
+              <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d={showMore() ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'} />
+              </svg>
+              {showMore() ? 'Less' : 'More'}
+            </span>
+          </button>
         </nav>
+        <Show when={selectedAccount()?.labels.length}>
+          <h2 class="side-heading labels-heading">Labels</h2>
+          <nav class="folders labels" aria-label="Labels">
+            <For each={selectedAccount()?.labels}>
+              {(l) => (
+                <button
+                  class="mailbox folder"
+                  classList={{ active: folder() === l.id }}
+                  aria-current={folder() === l.id ? 'true' : undefined}
+                  title={l.name}
+                  onClick={() => showFolder(l.id)}
+                >
+                  <span class="folder-label">
+                    <LabelIcon color={l.color} />
+                    <span class="mailbox-name">{l.name}</span>
+                  </span>
+                  <Show when={countOf(l.id) > 0}>
+                    <span class="count">{countOf(l.id)}</span>
+                  </Show>
+                </button>
+              )}
+            </For>
+          </nav>
+        </Show>
       </aside>
 
       <div class="inbox-main">
@@ -681,6 +776,16 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
                               </span>
                             </Show>
                             <span class="m-text">
+                              <For each={m.labels.filter((l) => l !== folder() && userLabel(l))}>
+                                {(l) => (
+                                  <span
+                                    class="m-label"
+                                    style={{ 'border-color': userLabel(l)?.color ?? 'var(--border)' }}
+                                  >
+                                    {userLabel(l)?.name}
+                                  </span>
+                                )}
+                              </For>
                               <span class="m-subject">{m.subject || '(no subject)'}</span>
                               <Show when={m.snippet}>
                                 <span class="m-snippet"> - {m.snippet}</span>

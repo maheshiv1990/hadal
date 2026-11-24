@@ -19,8 +19,12 @@ use crate::error::AppError;
 use crate::mail::{self, ImportOutcome};
 
 #[get("/accounts")]
-pub async fn accounts(user: AuthUser, pool: web::Data<PgPool>) -> Result<HttpResponse, AppError> {
-    Ok(HttpResponse::Ok().json(mail::list_accounts(&pool, user.user_id).await?))
+pub async fn accounts(
+    user: AuthUser,
+    pool: web::Data<PgPool>,
+    cipher: web::Data<DataCipher>,
+) -> Result<HttpResponse, AppError> {
+    Ok(HttpResponse::Ok().json(mail::list_accounts(&pool, &cipher, user.user_id).await?))
 }
 
 #[delete("/accounts/{id}")]
@@ -72,12 +76,13 @@ pub async fn import(
     }
 }
 
-/// `?account=<mailbox id>&label=INBOX|STARRED|SENT|DRAFT`, both optional.
+/// `?account=<mailbox id>&label=<ALL, a system folder or a user label ID>`,
+/// both optional.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessagesQuery {
     account: Option<Uuid>,
-    label: Option<mail::Folder>,
+    label: Option<String>,
 }
 
 #[get("/messages")]
@@ -88,8 +93,15 @@ pub async fn messages(
     query: web::Query<MessagesQuery>,
 ) -> Result<HttpResponse, AppError> {
     let MessagesQuery { account, label } = query.into_inner();
+    let filter = match label {
+        None => None,
+        Some(raw) => Some(
+            mail::LabelFilter::parse(&raw)
+                .ok_or_else(|| AppError::BadRequest("invalid query string".into()))?,
+        ),
+    };
     Ok(HttpResponse::Ok()
-        .json(mail::list_messages(&pool, &cipher, user.user_id, account, label).await?))
+        .json(mail::list_messages(&pool, &cipher, user.user_id, account, filter).await?))
 }
 
 #[get("/messages/{id}")]

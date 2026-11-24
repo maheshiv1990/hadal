@@ -176,6 +176,16 @@ button.folder.active .count { color: inherit; font-weight: 600; }
   font-size: 0.85rem; font-weight: 600; color: var(--muted);
 }
 .m-star { color: #e3a008; font-size: 0.9rem; }
+button.more-toggle { color: var(--muted); }
+button.more-toggle:disabled { opacity: 1; cursor: default; }
+.labels-heading { margin-top: 0.9rem; }
+.label-icon path { stroke: none; }
+.folder-label { min-width: 0; }
+.m-label {
+  display: inline-block; margin-right: 0.4rem; padding: 0 0.35rem;
+  border: 1px solid var(--border); border-left-width: 4px; border-radius: 4px;
+  font-size: 0.72rem; color: var(--muted); vertical-align: 1px;
+}
 .m-draft { color: var(--danger); font-weight: 600; }
 .mailbox-label { display: flex; flex-direction: column; min-width: 0; }
 .mailbox-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -261,8 +271,9 @@ button.chip.more { padding: 0.2rem 0.6rem; color: var(--muted); }
 @media (max-width: 760px) {
   .inbox { grid-template-columns: minmax(0, 1fr); }
   .inbox-side { position: static; }
-  .mailboxes, .folders { flex-direction: row; align-items: center; overflow-x: auto; }
+  .mailboxes, .folders { flex-direction: row; align-items: center; overflow-x: auto; scrollbar-width: none; }
   .side-heading { display: none; }
+  .labels-heading { display: none; }
   .side-block { padding: 0.4rem; }
   button.mailbox, a.add-account { flex-shrink: 0; border-radius: 999px; white-space: nowrap; }
   .message-row { grid-template-columns: minmax(0, 1fr) auto; row-gap: 0.15rem; }
