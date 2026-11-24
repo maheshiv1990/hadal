@@ -494,17 +494,36 @@ function Mail(props: {
     setOpenId(null)
   }
 
+  /** True while an import refreshes the list: the list stays up meanwhile. */
+  const [refreshing, setRefreshing] = createSignal(false)
+  let stopped = false
+  onCleanup(() => {
+    stopped = true
+  })
+
   /**
-   * Fetches new mail from every connected account. Runs by itself once the
-   * accounts have loaded; only failures are shown.
+   * Imports every connected account in full. Each request imports what fits
+   * in its time and the next one continues, so this repeats until no account
+   * has older mail left, one fails, or the user leaves. Runs by itself once
+   * the accounts have loaded; only failures are shown.
    */
   const importAll = async () => {
     setError(null)
     setProblems([])
     try {
-      const res = await api.importMail()
-      setProblems(res.accounts.filter((a) => a.error).map((a) => `${a.email}: ${a.error}`))
-      if (res.imported > 0) await Promise.all([refetchAccounts(), refetchMessages()])
+      while (!stopped) {
+        const res = await api.importMail()
+        setProblems(res.accounts.filter((a) => a.error).map((a) => `${a.email}: ${a.error}`))
+        if (res.imported > 0 && !stopped) {
+          setRefreshing(true)
+          try {
+            await Promise.all([refetchAccounts(), refetchMessages()])
+          } finally {
+            setRefreshing(false)
+          }
+        }
+        if (!res.accounts.some((a) => a.remaining && !a.error)) break
+      }
     } catch (err) {
       // Another tab is already importing: its mail shows up on the next load.
       if (err instanceof Error && err.message === 'an import is already running') return
@@ -689,7 +708,10 @@ function Mail(props: {
         </Show>
 
         <Show when={!accounts.error && !messages.error} fallback={<p class="error inbox-empty">Could not load your mail.</p>}>
-          <Show when={!accounts.loading && !messages.loading} fallback={<p class="muted inbox-empty">Loading…</p>}>
+          <Show
+            when={refreshing() || (!accounts.loading && !messages.loading)}
+            fallback={<p class="muted inbox-empty">Loading…</p>}
+          >
             <Show
               when={openId()}
               fallback={
@@ -698,7 +720,7 @@ function Mail(props: {
                   fallback={
                     <p class="muted inbox-empty">
                       {!accounts()?.length
-                        ? 'No accounts connected. Connect a Gmail account to import its newest 100 messages.'
+                        ? 'No accounts connected. Connect a Gmail account to import its mail.'
                         : selectedAccount()?.message_count
                           ? `Nothing in ${folderName()}.`
                           : 'No messages yet.'}

@@ -36,13 +36,20 @@ use crate::error::AppError;
 
 /// Most mailboxes one user may link.
 pub const MAX_MAILBOXES: i64 = 10;
-/// Newest messages fetched per mailbox on each import.
+/// Newest messages fetched first on each import, so new mail shows up at
+/// once. The rest of the mailbox follows a page at a time (`BACKFILL_PAGE`).
 pub const IMPORT_PER_MAILBOX: u32 = 100;
+/// Messages listed per step of the walk through older mail.
+const BACKFILL_PAGE: u32 = 500;
 /// Parallel message fetches per mailbox.
 const FETCH_CONCURRENCY: usize = 8;
 /// An import must answer before nginx gives up on the request
 /// (`proxy_read_timeout 30s`). What was stored by then is kept.
 const IMPORT_BUDGET: Duration = Duration::from_secs(24);
+/// When the walk through older mail stops starting new fetches, leaving
+/// time to finish the ones under way within `IMPORT_BUDGET`. The next import
+/// continues from where it stopped.
+const BACKFILL_DEADLINE: Duration = Duration::from_secs(18);
 /// A claim on a mailbox older than this is from a crashed import.
 const STALE_CLAIM_SECS: f64 = 300.0;
 const MAX_BODY_CHARS: usize = 200_000;
@@ -672,6 +679,8 @@ pub struct AccountImport {
     pub email: String,
     pub imported: u32,
     pub skipped: u32,
+    /// Older mail is still to be imported; the next import continues.
+    pub remaining: bool,
     pub error: Option<&'static str>,
 }
 
@@ -686,6 +695,9 @@ struct Claimed {
     google_sub: String,
     email: String,
     sealed_token: Vec<u8>,
+    /// Where the walk through older mail stopped last time.
+    backfill_page_token: Option<String>,
+    backfill_done: bool,
 }
 
 #[derive(Debug)]
@@ -737,9 +749,11 @@ impl From<sqlx::Error> for ImportFailure {
     }
 }
 
-/// Imports the newest `IMPORT_PER_MAILBOX` messages from every mailbox the
-/// user linked, all mailboxes at once. Messages already imported are not
-/// fetched again.
+/// Imports every mailbox the user linked, all mailboxes at once: first the
+/// newest mail, then as much older mail as fits in the time left, a page at
+/// a time. A mailbox reports `remaining` until all of it is imported; each
+/// call continues where the last one stopped. Messages already imported are
+/// not fetched again.
 pub async fn import_all(
     pool: &PgPool,
     google: Arc<GoogleClient>,
@@ -747,12 +761,14 @@ pub async fn import_all(
     owner: Uuid,
 ) -> Result<ImportOutcome, AppError> {
     // Claim the mailboxes so a second click can't import them twice at once.
-    let claimed: Vec<(Uuid, String, String, Vec<u8>)> = sqlx::query_as(
+    #[allow(clippy::type_complexity)]
+    let claimed: Vec<(Uuid, String, String, Vec<u8>, Option<String>, bool)> = sqlx::query_as(
         "UPDATE mail_accounts SET import_started_at = now()
           WHERE owner_id = $1
             AND (import_started_at IS NULL
                  OR import_started_at < now() - make_interval(secs => $2))
-          RETURNING id, google_sub, email, refresh_token_enc",
+          RETURNING id, google_sub, email, refresh_token_enc,
+                    backfill_page_token, backfill_done",
     )
     .bind(owner)
     .bind(STALE_CLAIM_SECS)
@@ -772,40 +788,38 @@ pub async fn import_all(
     }
     let ids: Vec<Uuid> = claimed.iter().map(|c| c.0).collect();
 
+    let deadline = tokio::time::Instant::now() + BACKFILL_DEADLINE;
     let mut tasks = JoinSet::new();
-    for (id, google_sub, email, sealed_token) in claimed {
+    for (id, google_sub, email, sealed_token, backfill_page_token, backfill_done) in claimed {
         let account = Claimed {
             id,
             google_sub,
             email,
             sealed_token,
+            backfill_page_token,
+            backfill_done,
         };
         let (pool, google, cipher) = (pool.clone(), google.clone(), cipher.clone());
         tasks.spawn(async move {
-            let imported = Arc::new(AtomicU32::new(0));
-            let skipped = Arc::new(AtomicU32::new(0));
-            let run = import_account(
-                &pool,
-                &google,
-                &cipher,
-                owner,
-                &account,
-                imported.clone(),
-                skipped.clone(),
-            );
-            let error = match tokio::time::timeout(IMPORT_BUDGET, run).await {
-                Ok(Ok(())) => None,
+            let counts = Counts::default();
+            let run = import_account(&pool, &google, &cipher, owner, &account, deadline, &counts);
+            let (remaining, error) = match tokio::time::timeout(IMPORT_BUDGET, run).await {
+                Ok(Ok(remaining)) => (remaining, None),
                 Ok(Err(e)) => {
                     tracing::warn!(account = %account.id, error = %e, "mailbox import failed");
-                    Some(e.user_message())
+                    (true, Some(e.user_message()))
                 }
-                Err(_) => Some("Import ran out of time. Run it again to continue."),
+                Err(_) => (
+                    true,
+                    Some("Import ran out of time. Run it again to continue."),
+                ),
             };
             AccountImport {
                 id: account.id,
                 email: account.email,
-                imported: imported.load(Ordering::Relaxed),
-                skipped: skipped.load(Ordering::Relaxed),
+                imported: counts.imported.load(Ordering::Relaxed),
+                skipped: counts.skipped.load(Ordering::Relaxed),
+                remaining,
                 error,
             }
         });
@@ -840,15 +854,22 @@ pub async fn import_all(
     Ok(ImportOutcome::Done(results))
 }
 
+#[derive(Default)]
+struct Counts {
+    imported: AtomicU32,
+    skipped: AtomicU32,
+}
+
+/// Returns whether older mail is still left to import.
 async fn import_account(
     pool: &PgPool,
     google: &Arc<GoogleClient>,
     cipher: &DataCipher,
     owner: Uuid,
     account: &Claimed,
-    imported: Arc<AtomicU32>,
-    skipped: Arc<AtomicU32>,
-) -> Result<(), ImportFailure> {
+    deadline: tokio::time::Instant,
+    counts: &Counts,
+) -> Result<bool, ImportFailure> {
     let refresh = open_token(cipher, owner, &account.google_sub, &account.sealed_token)?;
     let access = google.refresh_access_token(&refresh).await?;
     let user_labels = google.list_user_labels(&access, MAX_USER_LABELS).await?;
@@ -860,6 +881,7 @@ async fn import_account(
     let (mut ids, _) = google
         .list_message_ids(&access, IMPORT_PER_MAILBOX, None)
         .await?;
+    let newest = ids.clone();
     let lists = IMPORT_LISTS
         .iter()
         .map(|&(label, max, import)| (label.to_owned(), max, import))
@@ -898,53 +920,196 @@ async fn import_account(
         .filter(|k| !k.2)
         .map(|k| (k.0.clone(), k.1))
         .collect();
-    let mut pending = ids
+    // None of the newest mail was here before: more new mail arrived since
+    // the last import than the newest list holds. Walk the whole mailbox
+    // again so the mail in between isn't left out.
+    let outrun = !newest.is_empty() && !newest.iter().any(|id| known.iter().any(|k| &k.0 == id));
+    let pending: Vec<String> = ids
         .into_iter()
         .filter(|id| !complete.contains(&id.as_str()))
-        .collect::<Vec<_>>()
-        .into_iter();
-
-    let mut fetches = JoinSet::new();
-    loop {
-        while fetches.len() < FETCH_CONCURRENCY {
-            let Some(id) = pending.next() else { break };
-            let (google, access) = (google.clone(), access.clone());
-            fetches.spawn(async move { google.get_message(&access, &id).await });
-        }
-        let Some(joined) = fetches.join_next().await else {
-            break;
-        };
-        let message = match joined {
-            Ok(Ok(message)) => message,
-            Ok(Err(GoogleApiError::Revoked)) => return Err(GoogleApiError::Revoked.into()),
-            Ok(Err(e)) => {
-                tracing::warn!(account = %account.id, error = %e, "message fetch failed");
-                skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(account = %account.id, error = %e, "message fetch task failed");
-                skipped.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-        let Some(parsed) = parse_message(&message) else {
-            skipped.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        if let Some(&existing) = backfill.get(&parsed.gmail_id) {
-            fill_details(pool, cipher, owner, existing, &parsed).await?;
-        } else if store_message(pool, cipher, owner, account.id, &parsed).await? {
-            imported.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+        .collect();
+    let run = Fetch {
+        pool,
+        google,
+        cipher,
+        owner,
+        account,
+        access: &access,
+        counts,
+    };
+    run.fetch_and_store(pending, &backfill, None).await?;
 
     // Starring, sending or archiving in Gmail changes labels on mail we
     // already have: bring those up to date from the folder lists.
     for (label, listed, complete) in folder_lists {
         refresh_label(pool, owner, account.id, &label, &listed, complete).await?;
     }
-    Ok(())
+
+    if account.backfill_done && !outrun {
+        return Ok(false);
+    }
+    // A walk that started before the new mail arrived would miss it too, so
+    // that one starts over as well. Pages already imported go quickly: only
+    // listed, nothing fetched.
+    let start = if outrun {
+        None
+    } else {
+        account.backfill_page_token.clone()
+    };
+    run.backfill(start, deadline).await
+}
+
+/// One mailbox's import run: what fetching and storing its messages needs.
+struct Fetch<'a> {
+    pool: &'a PgPool,
+    google: &'a Arc<GoogleClient>,
+    cipher: &'a DataCipher,
+    owner: Uuid,
+    account: &'a Claimed,
+    access: &'a Secret,
+    counts: &'a Counts,
+}
+
+/// How a batch of message fetches ended.
+enum Fetched {
+    /// Every message was stored, or skipped for good (gone or unreadable).
+    All,
+    /// The deadline came before every fetch was started.
+    OutOfTime,
+    /// A fetch failed in a way that may pass (Gmail unreachable or limiting
+    /// requests). The first such error.
+    Failed(GoogleApiError),
+}
+
+impl Fetch<'_> {
+    /// Fetches `ids` from Gmail, a few at a time, and stores them. IDs in
+    /// `refill` are already stored without attachments or labels: those are
+    /// filled in instead. With a deadline, no fetch starts after it.
+    async fn fetch_and_store(
+        &self,
+        ids: Vec<String>,
+        refill: &HashMap<String, Uuid>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Fetched, ImportFailure> {
+        let account = self.account.id;
+        let mut pending = ids.into_iter();
+        let mut outcome = Fetched::All;
+        let mut fetches = JoinSet::new();
+        loop {
+            let out_of_time = deadline.is_some_and(|d| tokio::time::Instant::now() >= d);
+            if out_of_time && pending.len() > 0 && matches!(outcome, Fetched::All) {
+                outcome = Fetched::OutOfTime;
+            }
+            while !out_of_time && fetches.len() < FETCH_CONCURRENCY {
+                let Some(id) = pending.next() else { break };
+                let (google, access) = (self.google.clone(), self.access.clone());
+                fetches.spawn(async move { google.get_message(&access, &id).await });
+            }
+            let Some(joined) = fetches.join_next().await else {
+                break;
+            };
+            let message = match joined {
+                Ok(Ok(message)) => message,
+                Ok(Err(GoogleApiError::Revoked)) => return Err(GoogleApiError::Revoked.into()),
+                // Deleted in Gmail since it was listed: nothing to import.
+                Ok(Err(GoogleApiError::Status(404, _))) => {
+                    self.counts.skipped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(%account, error = %e, "message fetch failed");
+                    self.counts.skipped.fetch_add(1, Ordering::Relaxed);
+                    if matches!(outcome, Fetched::All | Fetched::OutOfTime) {
+                        outcome = Fetched::Failed(e);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(%account, error = %e, "message fetch task failed");
+                    self.counts.skipped.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            let Some(parsed) = parse_message(&message) else {
+                self.counts.skipped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            if let Some(&existing) = refill.get(&parsed.gmail_id) {
+                fill_details(self.pool, self.cipher, self.owner, existing, &parsed).await?;
+            } else if store_message(self.pool, self.cipher, self.owner, account, &parsed).await? {
+                self.counts.imported.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Walks the mailbox from `page` (or the newest mail) towards the oldest,
+    /// importing what isn't stored yet, until it reaches the end or the
+    /// deadline. Saves where it got to after each page, so the next import
+    /// continues there. Returns whether older mail is still left.
+    async fn backfill(
+        &self,
+        mut page: Option<String>,
+        deadline: tokio::time::Instant,
+    ) -> Result<bool, ImportFailure> {
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                self.save_backfill(page.as_deref(), false).await?;
+                return Ok(true);
+            }
+            let (ids, next) = self
+                .google
+                .list_message_page(self.access, BACKFILL_PAGE, page.as_deref())
+                .await?;
+            let stored: Vec<String> = sqlx::query_scalar(
+                "SELECT gmail_id FROM mail_messages
+                  WHERE owner_id = $1 AND account_id = $2 AND gmail_id = ANY($3)",
+            )
+            .bind(self.owner)
+            .bind(self.account.id)
+            .bind(&ids)
+            .fetch_all(self.pool)
+            .await?;
+            let new: Vec<String> = ids.into_iter().filter(|id| !stored.contains(id)).collect();
+            match self
+                .fetch_and_store(new, &HashMap::new(), Some(deadline))
+                .await?
+            {
+                Fetched::All => {}
+                // This page again next time; what was stored is skipped then.
+                Fetched::OutOfTime => {
+                    self.save_backfill(page.as_deref(), false).await?;
+                    return Ok(true);
+                }
+                Fetched::Failed(e) => {
+                    self.save_backfill(page.as_deref(), false).await?;
+                    return Err(e.into());
+                }
+            }
+            match next {
+                Some(next) => page = Some(next),
+                None => {
+                    self.save_backfill(None, true).await?;
+                    return Ok(false);
+                }
+            }
+            self.save_backfill(page.as_deref(), false).await?;
+        }
+    }
+
+    async fn save_backfill(&self, page: Option<&str>, done: bool) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE mail_accounts SET backfill_page_token = $3, backfill_done = $4
+              WHERE id = $1 AND owner_id = $2",
+        )
+        .bind(self.account.id)
+        .bind(self.owner)
+        .bind(page)
+        .bind(done)
+        .execute(self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Stores the mailbox's own labels as Gmail has them now: names encrypted,

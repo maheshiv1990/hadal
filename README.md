@@ -45,9 +45,11 @@ stack: TLS versions and suites, the redirect, HSTS, and TLS to Postgres.
 
 ### Importing Gmail
 
-Signed-in users can link one or more Gmail
-mailboxes on the home page and import the newest 100 messages from each with
-**Import all**. Later imports fetch only messages not imported yet.
+Signed-in users can link one or more Gmail mailboxes on the home page. Opening
+the inbox imports them in full (spam and trash excepted): each import request
+fetches the newest mail first, then older mail page by page for as long as its
+time allows, and saves where it stopped. The page keeps calling it until every
+mailbox is done. Later imports fetch only messages not imported yet.
 
 1. In the same Cloud project, enable the **Gmail API** (APIs & Services → Library).
 2. On the OAuth consent screen, add the scope

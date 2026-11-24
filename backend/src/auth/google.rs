@@ -201,6 +201,16 @@ pub fn valid_gmail_id(id: &str) -> bool {
     (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// Gmail list page tokens are opaque, but only ever digits and letters.
+/// Anything else is refused before it goes into a URL or the database (the
+/// column allows at most 256 characters).
+pub fn valid_page_token(token: &str) -> bool {
+    (1..=256).contains(&token.len())
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Gmail attachment IDs are long base64url strings. Anything else is refused
 /// before it goes into a URL path.
 pub fn valid_attachment_id(id: &str) -> bool {
@@ -541,11 +551,53 @@ impl GoogleClient {
                     .append_pair("includeSpamTrash", "true");
             }
         }
+        let (ids, next) = self.read_message_list(url, access, max).await?;
+        Ok((ids, next.is_none()))
+    }
+
+    /// One page of the whole mailbox (spam and trash excluded), newest first:
+    /// up to `max` IDs and the token for the next, older page, or `None` on
+    /// the last page. `page_token` is one Gmail gave us, checked again here.
+    pub async fn list_message_page(
+        &self,
+        access: &Secret,
+        max: u32,
+        page_token: Option<&str>,
+    ) -> Result<(Vec<String>, Option<String>), GoogleApiError> {
+        let mut url = self
+            .gmail_api
+            .join("messages")
+            .map_err(|_| GoogleApiError::Malformed)?;
+        url.query_pairs_mut()
+            .append_pair("maxResults", &max.clamp(1, MAX_LIST_RESULTS).to_string());
+        if let Some(page) = page_token {
+            if !valid_page_token(page) {
+                return Err(GoogleApiError::Malformed);
+            }
+            url.query_pairs_mut().append_pair("pageToken", page);
+        }
+        self.read_message_list(url, access, max).await
+    }
+
+    async fn read_message_list(
+        &self,
+        url: Url,
+        access: &Secret,
+        max: u32,
+    ) -> Result<(Vec<String>, Option<String>), GoogleApiError> {
         let json = self.gmail_get(url, access, MAX_RESPONSE_BYTES).await?;
-        let complete = json.get("nextPageToken").is_none();
+        let next = match json.get("nextPageToken") {
+            None => None,
+            Some(t) => Some(
+                t.as_str()
+                    .filter(|t| valid_page_token(t))
+                    .ok_or(GoogleApiError::Malformed)?
+                    .to_owned(),
+            ),
+        };
         let Some(list) = json.get("messages") else {
             // An empty mailbox or label has no `messages` key at all.
-            return Ok((Vec::new(), complete));
+            return Ok((Vec::new(), next));
         };
         let list = list.as_array().ok_or(GoogleApiError::Malformed)?;
         let ids = list
@@ -555,7 +607,7 @@ impl GoogleClient {
             .take(max as usize)
             .map(str::to_owned)
             .collect();
-        Ok((ids, complete))
+        Ok((ids, next))
     }
 
     /// The user's own labels (Gmail's system labels are left out), at most
@@ -929,6 +981,18 @@ pub(crate) mod tests {
         assert!(valid_gmail_id("18c2f0a9b3d4e5f6"));
         for bad in ["", "../../labels", "a/b", "a?b", "a%2Fb", &"a".repeat(65)] {
             assert!(!valid_gmail_id(bad), "accepted {bad:?}");
+        }
+        // Page tokens go into the list query and the database.
+        assert!(valid_page_token("09876543210987654321"));
+        for bad in [
+            "",
+            "a&maxResults=1",
+            "a b",
+            "a/b",
+            "a%26b",
+            &"1".repeat(257),
+        ] {
+            assert!(!valid_page_token(bad), "accepted {bad:?}");
         }
         // Label IDs go into the list query; user labels look like Label_12.
         for good in ["INBOX", "CATEGORY_UPDATES", "Label_12"] {

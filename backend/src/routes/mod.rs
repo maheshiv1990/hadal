@@ -598,13 +598,19 @@ mod tests {
             })
             .map(|m| json!({ "id": m["id"], "threadId": m["id"] }))
             .collect();
-        if matching.is_empty() {
+        // Page tokens are the offset of the page, like "p500".
+        let start: usize = q
+            .get("pageToken")
+            .map(|t| t.strip_prefix('p').unwrap().parse().unwrap())
+            .unwrap_or(0);
+        if matching.len() <= start {
             return HttpResponse::Ok().json(json!({ "resultSizeEstimate": 0 }));
         }
-        let more = matching.len() > max;
-        let list: Vec<Value> = matching.into_iter().take(max).collect();
+        let more = matching.len() > start + max;
+        let list: Vec<Value> = matching.into_iter().skip(start).take(max).collect();
         if more {
-            return HttpResponse::Ok().json(json!({ "messages": list, "nextPageToken": "next" }));
+            let next = format!("p{}", start + max);
+            return HttpResponse::Ok().json(json!({ "messages": list, "nextPageToken": next }));
         }
         HttpResponse::Ok().json(json!({ "messages": list }))
     }
@@ -1064,6 +1070,95 @@ mod tests {
                 .await;
         assert_eq!(body["imported"], 1);
         assert_eq!(*fake.message_fetches.lock().unwrap(), fetched + 1);
+    }
+
+    #[actix_web::test]
+    async fn import_takes_the_whole_mailbox_and_resumes_where_it_stopped() {
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        // More than the newest-mail list (100) and than one page (500).
+        let mail = |prefix: &str, n: usize| -> Vec<Value> {
+            (0..n)
+                .map(|i| gmail_message(&format!("{prefix}{i}"), "Old news", "Body"))
+                .collect()
+        };
+        *fake.messages.lock().unwrap() = mail("old", 620);
+        let stored = || async {
+            sqlx::query_as::<_, (i64, Option<String>, bool)>(
+                "SELECT (SELECT count(*) FROM mail_messages m WHERE m.account_id = a.id),
+                        a.backfill_page_token, a.backfill_done
+                   FROM mail_accounts a WHERE a.google_sub = $1",
+            )
+            .bind(&sub)
+            .fetch_one(pool.get_ref())
+            .await
+            .unwrap()
+        };
+        let import = || async {
+            json_body(test::call_service(&app, req!("POST", "/api/mail/import", &session)).await)
+                .await
+        };
+
+        let (status, body) = import().await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["imported"], 620);
+        assert_eq!(body["accounts"][0]["remaining"], false);
+        assert_eq!(body["accounts"][0]["error"], Value::Null);
+        assert_eq!(stored().await, (620, None, true));
+        assert_eq!(
+            *fake.message_fetches.lock().unwrap(),
+            620,
+            "each message fetched once"
+        );
+
+        // Nothing new: nothing fetched, and the walk isn't repeated.
+        let (_, body) = import().await;
+        assert_eq!(body["imported"], 0);
+        assert_eq!(body["accounts"][0]["remaining"], false);
+        assert_eq!(*fake.message_fetches.lock().unwrap(), 620);
+
+        // More new mail than the newest list holds: the walk starts over and
+        // picks up the new mail past the first 100, without refetching.
+        let mut newer = mail("new", 150);
+        newer.extend(fake.messages.lock().unwrap().drain(..));
+        *fake.messages.lock().unwrap() = newer;
+        let (_, body) = import().await;
+        assert_eq!(body["imported"], 150);
+        assert_eq!(stored().await, (770, None, true));
+        assert_eq!(*fake.message_fetches.lock().unwrap(), 770);
+
+        // An import cut short continues from the page it saved: only that
+        // page and older are walked.
+        sqlx::query(
+            "DELETE FROM mail_messages WHERE account_id =
+                 (SELECT id FROM mail_accounts WHERE google_sub = $1)
+               AND gmail_id IN ('old0', 'old600')",
+        )
+        .bind(&sub)
+        .execute(pool.get_ref())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE mail_accounts SET backfill_page_token = 'p500', backfill_done = false
+              WHERE google_sub = $1",
+        )
+        .bind(&sub)
+        .execute(pool.get_ref())
+        .await
+        .unwrap();
+        let (_, body) = import().await;
+        assert_eq!(
+            body["imported"], 1,
+            "only old600 is at or past the saved page"
+        );
+        assert_eq!(body["accounts"][0]["remaining"], false);
+        assert_eq!(stored().await, (769, None, true));
     }
 
     #[actix_web::test]

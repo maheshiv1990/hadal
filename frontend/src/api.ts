@@ -71,6 +71,8 @@ export interface MailImportResult {
     email: string
     imported: number
     skipped: number
+    /** Older mail is still to come: importing again continues. */
+    remaining: boolean
     /** A user-facing reason this mailbox failed, or null. */
     error: string | null
   }[]
