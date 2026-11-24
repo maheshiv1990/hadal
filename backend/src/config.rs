@@ -133,6 +133,7 @@ impl Config {
     /// Refuse to start with settings that would weaken auth.
     pub fn validate(&self) -> Result<()> {
         validate_redirect_uri(&self.oauth.redirect_uri)?;
+        validate_database_tls(self.database_url.expose())?;
         let s = &self.session;
         if s.idle_secs == 0 || s.absolute_secs == 0 {
             bail!("session lifetimes must be non-zero");
@@ -165,6 +166,25 @@ fn validate_redirect_uri(uri: &Url) -> Result<()> {
     Ok(())
 }
 
+/// Any database that isn't on this machine must be reached over TLS with the
+/// certificate and host name verified (`sslmode=verify-full`, CASA 4.1.2).
+/// Only a loopback database may skip it. The URL is never echoed in errors.
+fn validate_database_tls(raw: &str) -> Result<()> {
+    let Ok(url) = Url::parse(raw) else {
+        bail!("DATABASE_URL is not a valid URL");
+    };
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    let mode = url
+        .query_pairs()
+        .filter(|(k, _)| k == "sslmode" || k == "ssl-mode")
+        .map(|(_, v)| v.to_ascii_lowercase())
+        .last();
+    if !loopback && mode.as_deref() != Some("verify-full") {
+        bail!("DATABASE_URL must use sslmode=verify-full for a non-local database");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub(crate) mod tests {
@@ -172,7 +192,7 @@ pub(crate) mod tests {
 
     pub(crate) fn test_config() -> Config {
         Config {
-            database_url: Secret::new("postgres://hadal:s3cret-pw@db/hadal"),
+            database_url: Secret::new("postgres://hadal:s3cret-pw@db/hadal?sslmode=verify-full"),
             host: "0.0.0.0".into(),
             port: 8080,
             db_max_connections: 10,
@@ -224,6 +244,32 @@ pub(crate) mod tests {
         let mut cfg = test_config();
         cfg.oauth.redirect_uri = Url::parse("https://hadal.example.com/api/auth/callback").unwrap();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn remote_database_requires_verified_tls() {
+        // CASA 4.1.2: no plaintext or unverified TLS to a database elsewhere.
+        for bad in [
+            "postgres://u@db/hadal",
+            "postgres://u@db/hadal?sslmode=require",
+            "postgres://u@db/hadal?sslmode=verify-ca",
+            "postgres://u@db.example.com/hadal?sslmode=disable",
+            "postgres://u@db/hadal?sslmode=verify-full&sslmode=prefer",
+            "not a url",
+        ] {
+            assert!(validate_database_tls(bad).is_err(), "accepted {bad}");
+        }
+        for good in [
+            "postgres://u@db/hadal?sslmode=verify-full&sslrootcert=/etc/hadal/db-ca.crt",
+            "postgres://u@db.example.com/hadal?ssl-mode=VERIFY-FULL",
+            "postgres://u@127.0.0.1:55432/hadal_test",
+            "postgres://u@localhost/hadal",
+        ] {
+            validate_database_tls(good).unwrap();
+        }
+        // The error never contains the URL (it holds the password).
+        let err = validate_database_tls("postgres://u:pw-in-url@db/hadal").unwrap_err();
+        assert!(!err.to_string().contains("pw-in-url"));
     }
 
     #[test]

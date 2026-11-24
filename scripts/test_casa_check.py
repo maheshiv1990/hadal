@@ -59,6 +59,7 @@ CASES = {
     "outbound-http": ("x.rs",
         "let c = reqwest::Client::new(); c.get(user_url).send().await?;",
         "let u: reqwest::Url = cfg.redirect_uri.clone();"),
+    "directory-listing-template": ("default.conf.template", "autoindex on;", "autoindex off;"),
     "cookie-flags": ("x.rs",
         'let c = Cookie::build("sid", v).secure(true).finish();',
         'let c = Cookie::build("sid", v).secure(true).http_only(true).same_site(SameSite::Lax).finish();'),
@@ -66,7 +67,8 @@ CASES = {
 
 
 ALIASES = {"sql-string-building-var": "sql-string-building", "sql-string-building-ident": "sql-string-building",
-           "notes-owner-scope-multiline": "notes-owner-scope"}
+           "notes-owner-scope-multiline": "notes-owner-scope",
+           "directory-listing-template": "directory-listing"}
 
 
 def rules_hit(name: str, text: str) -> set[str]:

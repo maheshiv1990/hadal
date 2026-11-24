@@ -39,7 +39,20 @@ Scanner ignores:
   publishes no port and is reachable only through nginx, which overwrites the
   header. Publishing port 8080 directly while this is true would let clients
   spoof their IP to dodge the limit. Tests cover both modes.
-- **Backend to Postgres is plaintext** on the private compose network (pending 4.1.2).
+- **TLS layout.** Browser to nginx: TLS 1.2/1.3 (4.1.1). Backend to Postgres:
+  TLS with `sslmode=verify-full` against a private CA whose key is discarded
+  after signing (4.1.2). nginx to backend is plain HTTP on the private compose
+  network: it never leaves the host and the backend port isn't published. Put
+  it on TLS too if the two ever run on different machines.
+- **Production certificates: Let's Encrypt.** hadalspace.com and
+  www.hadalspace.com share one certificate (HTTP-01 webroot), renewed by the
+  certbot service within 30 days of expiry; nginx reloads every 6 hours.
+  Port 80 serves only `/.well-known/acme-challenge/` and the HTTPS redirect.
+  HSTS uses `includeSubDomains`, so every *.hadalspace.com host must serve
+  HTTPS.
+- **HSTS is 5 minutes in local compose.** Browsers apply HSTS to every port of
+  `localhost`, so a 2-year value would force HTTPS on unrelated local dev
+  servers. The image default (production) is 2 years; `HSTS_MAX_AGE` overrides.
 - **ID token signature is not checked (OIDC Core 1.0 §3.1.3.7, step 6).** The
   backend receives the ID token directly from Google's token endpoint, over a
   TLS connection it opened and verified, in exchange for a single-use code bound
@@ -48,7 +61,8 @@ Scanner ignores:
   nonce, email_verified). If ID tokens are ever accepted from any other source
   (the browser, another service), signature verification against Google's JWKS
   becomes mandatory.
-- **Google tokens are not stored.** Sign-in requests only `openid email`, and
+- **Google tokens are not stored.** Sign-in requests only `openid email profile`
+  (non-sensitive: the name is stored as first/last name, nothing else), and
   Google's access and refresh tokens are dropped after the exchange. When
   restricted scopes are added, their tokens need encrypted storage and revocation
   on logout (reopen 2.2.1, 6.7.1).

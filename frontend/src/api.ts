@@ -7,6 +7,11 @@ export interface Note {
 
 export interface Me {
   email: string
+  /** Null for Google accounts that don't share a name. */
+  first_name: string | null
+  last_name: string | null
+  /** False for Google accounts, which have no password here. */
+  has_password: boolean
 }
 
 /** The session is missing or expired: the user has to sign in again. */
@@ -70,6 +75,12 @@ export const api = {
       throw err
     }
   },
+  /** Changes the password. The server signs out every other session. */
+  changePassword: (current_password: string, new_password: string) =>
+    request<Me>('/auth/password', {
+      method: 'POST',
+      body: JSON.stringify({ current_password, new_password }),
+    }),
   // JSON body so a cross-site form can't log the user out (CASA 3.1.5).
   logout: () => request<void>('/auth/logout', { method: 'POST', body: '{}' }),
   listNotes: () => request<Note[]>('/notes'),

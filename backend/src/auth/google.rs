@@ -18,8 +18,11 @@ const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 /// Google's issuer. ID tokens may carry either form (Google OIDC docs).
 pub const ISSUER: &str = "https://accounts.google.com";
 const ISSUER_SHORT: &str = "accounts.google.com";
-/// Sign-in only needs identity. Restricted scopes are requested separately.
-const SCOPES: &str = "openid email";
+/// Sign-in only needs identity and the user's name (`profile` gives
+/// `given_name` / `family_name`). Restricted scopes are requested separately.
+const SCOPES: &str = "openid email profile";
+/// Same bound as names entered at registration (users.first_name/last_name).
+const MAX_NAME_CHARS: usize = 100;
 /// Largest token-endpoint response we will read.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 /// Tolerated clock difference with Google when checking `exp`/`iat`.
@@ -31,6 +34,27 @@ pub struct Identity {
     /// Google's stable account ID; the key we match users on.
     pub sub: String,
     pub email: String,
+    /// `given_name` / `family_name`. Optional: Google omits them for some
+    /// accounts, and a user may have only one.
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+}
+
+/// Cleans an optional name claim. A missing, non-string or blank value is
+/// `None`; control characters are dropped and long names are cut to fit the
+/// database limit. A bad name never blocks sign-in.
+fn name_claim(claims: &Value, name: &str) -> Option<String> {
+    let raw = claims.get(name)?.as_str()?;
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(MAX_NAME_CHARS)
+        .collect();
+    let cleaned = cleaned.trim_end().to_owned();
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 /// A URL on Google's authorization endpoint. The field is private, so the only
@@ -270,6 +294,8 @@ pub fn validate_id_token(
     Ok(Identity {
         sub: sub.to_owned(),
         email: email.to_owned(),
+        first_name: name_claim(&claims, "given_name"),
+        last_name: name_claim(&claims, "family_name"),
     })
 }
 
@@ -297,6 +323,8 @@ pub(crate) mod tests {
             "sub": sub,
             "email": format!("{sub}@example.com"),
             "email_verified": true,
+            "given_name": "Ada",
+            "family_name": "Lovelace",
             "nonce": nonce,
             "iat": now,
             "exp": now + 3600,
@@ -312,6 +340,30 @@ pub(crate) mod tests {
         let id = check(&good_claims("n0nce", "1234", NOW)).unwrap();
         assert_eq!(id.sub, "1234");
         assert_eq!(id.email, "1234@example.com");
+        assert_eq!(id.first_name.as_deref(), Some("Ada"));
+        assert_eq!(id.last_name.as_deref(), Some("Lovelace"));
+    }
+
+    #[test]
+    fn name_claims_are_optional_and_cleaned() {
+        let with = |given: Value, family: Value| {
+            let mut c = good_claims("n0nce", "1234", NOW);
+            c["given_name"] = given;
+            c["family_name"] = family;
+            check(&c).unwrap()
+        };
+        // Missing, blank or non-string names never block sign-in.
+        let id = with(json!(null), json!("   "));
+        assert_eq!((id.first_name, id.last_name), (None, None));
+        let id = with(json!(42), json!(["x"]));
+        assert_eq!((id.first_name, id.last_name), (None, None));
+        let mut c = good_claims("n0nce", "1234", NOW);
+        c.as_object_mut().unwrap().remove("given_name");
+        assert_eq!(check(&c).unwrap().first_name, None);
+        // Trimmed, control characters dropped, cut to the column limit.
+        let id = with(json!("  Ada\u{7}\n "), json!("é".repeat(150)));
+        assert_eq!(id.first_name.as_deref(), Some("Ada"));
+        assert_eq!(id.last_name.unwrap().chars().count(), MAX_NAME_CHARS);
     }
 
     #[test]
@@ -367,7 +419,7 @@ pub(crate) mod tests {
         assert_eq!(q["state"], "st");
         assert_eq!(q["nonce"], "nn");
         assert_eq!(q["redirect_uri"], "http://localhost:8000/api/auth/callback");
-        assert_eq!(q["scope"], "openid email");
+        assert_eq!(q["scope"], "openid email profile");
         assert!(!q.contains_key("client_secret"));
     }
 

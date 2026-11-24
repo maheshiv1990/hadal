@@ -49,17 +49,17 @@ SECTIONS = {
 # Tools that scripts/verify.sh or CI actually run. Evidence may only cite these.
 TOOLS = {
     "clippy", "cargo-test", "cargo-deny", "cargo-audit", "npm-audit",
-    "gitleaks", "semgrep", "zap-baseline", "claude-review",
+    "gitleaks", "semgrep", "zap-baseline", "claude-review", "check-tls",
 }
 
 SCAN_GLOBS = [
     "backend/src/*.rs", "backend/src/**/*.rs", "backend/migrations/*.sql", "backend/Cargo.toml",
     "frontend/src/*", "frontend/src/**/*", "frontend/index.html", "frontend/vite.config.ts",
-    "frontend/package.json", "nginx/*.conf", "docker-compose.yml",
+    "frontend/package.json", "nginx/*.conf", "nginx/*.conf.template", "docker-compose.yml", "docker-compose.prod.yml",
 ]
 RS = ["*.rs"]
 WEB = ["*.ts", "*.tsx", "*.js", "*.jsx", "*.html"]
-CONF = ["*.conf"]
+CONF = ["*.conf", "*.conf.template"]
 ALL = ["*"]
 
 
