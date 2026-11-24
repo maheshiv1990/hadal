@@ -424,7 +424,6 @@ function Mail(props: {
   const [openId, setOpenId] = createSignal<string | null>(null)
   const [detail] = createResource(openId, api.getMessage)
   const [importing, setImporting] = createSignal(false)
-  const [status, setStatus] = createSignal<string | null>(null)
   const [problems, setProblems] = createSignal<string[]>([])
   const [error, setError] = createSignal<string | null>(null)
 
@@ -491,25 +490,35 @@ function Mail(props: {
     setOpenId(null)
   }
 
+  /**
+   * Fetches new mail from every connected account. Runs by itself once the
+   * accounts have loaded; only failures are shown.
+   */
   const importAll = async () => {
     setError(null)
-    setStatus(null)
     setProblems([])
     setImporting(true)
     try {
       const res = await api.importMail()
-      const ok = res.accounts.filter((a) => !a.error).length
-      setStatus(
-        `Imported ${plural(res.imported, 'new message', 'new messages')} from ${plural(ok, 'account', 'accounts')}.`,
-      )
       setProblems(res.accounts.filter((a) => a.error).map((a) => `${a.email}: ${a.error}`))
-      await Promise.all([refetchAccounts(), refetchMessages()])
+      if (res.imported > 0) await Promise.all([refetchAccounts(), refetchMessages()])
     } catch (err) {
+      // Another tab is already importing: its mail shows up on the next load.
+      if (err instanceof Error && err.message === 'an import is already running') return
       handle(err)
     } finally {
       setImporting(false)
     }
   }
+
+  // Import automatically once per page load, as soon as there is an account.
+  let autoImported = false
+  createEffect(() => {
+    if (!autoImported && accounts()?.length) {
+      autoImported = true
+      void importAll()
+    }
+  })
 
   /** `${messageId}:${index}` of the attachment being downloaded. */
   const [downloading, setDownloading] = createSignal<string | null>(null)
@@ -644,14 +653,6 @@ function Mail(props: {
             when={openId()}
             fallback={
               <div class="toolbar-group">
-                <button
-                  class="ghost"
-                  onClick={importAll}
-                  disabled={importing() || !accounts()?.length}
-                  title="Import new mail from every connected account"
-                >
-                  {importing() ? 'Importing…' : '↻ Import'}
-                </button>
                 <Show when={selectedAccount() && !isPrimary(selectedAccount()!) && selectedAccount()}>
                   {(account) => (
                     <button class="ghost danger" onClick={() => disconnect(account())}>
@@ -666,30 +667,22 @@ function Mail(props: {
               ← Back
             </button>
           </Show>
-          <Show when={selectedAccount()}>
-            {(account) => (
-              <span
-                class="muted toolbar-status"
-                title={account().last_import_at ? formatDate(account().last_import_at!) : undefined}
-              >
-                {account().last_import_at ? `Imported ${listDate(account().last_import_at!)}` : 'Not imported yet'}
-              </span>
-            )}
+          <Show when={importing()}>
+            <span class="muted toolbar-status" role="status">
+              Importing…
+            </span>
           </Show>
         </div>
 
         <Show when={props.linkResult === 'linked'}>
           <p class="notice inbox-note" role="status">
-            Gmail connected. Use “Import” to fetch its mail.
+            Gmail connected. Its newest mail is being imported.
           </p>
         </Show>
         <Show when={props.linkResult === 'failed'}>
           <p class="error inbox-note" role="alert">
             Gmail wasn't connected. Allow read access to your mail on Google's screen and try again.
           </p>
-        </Show>
-        <Show when={status()}>
-          <p class="notice inbox-note" role="status">{status()}</p>
         </Show>
         <For each={problems()}>{(p) => <p class="error inbox-note" role="alert">{p}</p>}</For>
         <Show when={error()}>
@@ -709,7 +702,9 @@ function Mail(props: {
                         ? 'No accounts connected. Connect a Gmail account to import its newest 100 messages.'
                         : selectedAccount()?.message_count
                           ? `Nothing in ${folderName()}.`
-                          : 'No messages yet. Use “Import” to fetch the newest mail from each account.'}
+                          : importing()
+                            ? 'Importing your newest mail…'
+                            : 'No messages yet.'}
                     </p>
                   }
                 >
