@@ -89,6 +89,8 @@ jobs:
             printf 'GOOGLE_CLIENT_ID=zap-scan.apps.googleusercontent.com\n'
             printf 'GOOGLE_CLIENT_SECRET=%s\n' "$(openssl rand -hex 24)"
             printf 'OAUTH_REDIRECT_URI=https://localhost:8000/api/auth/callback\n'
+            # Throwaway AES-256-GCM key for data at rest (32 random bytes).
+            printf 'DATA_ENCRYPTION_KEY=%s\n' "$(openssl rand -base64 32)"
           } > .env
           docker compose up -d --build --wait
       # CASA 4.1.1 / 4.1.2: TLS versions and suites, HTTP->HTTPS, HSTS, and
