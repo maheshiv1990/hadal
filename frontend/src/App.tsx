@@ -539,6 +539,33 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
   return (
     <section class="inbox">
       <aside class="inbox-side">
+        <div class="side-block">
+          <h2 class="side-heading">Mailboxes</h2>
+          <nav class="mailboxes" aria-label="Mailboxes">
+            <For each={orderedAccounts()}>
+              {(account) => (
+                <button
+                  class="mailbox"
+                  classList={{ active: selectedAccount()?.id === account.id }}
+                  aria-current={selectedAccount()?.id === account.id ? 'true' : undefined}
+                  title={account.email}
+                  onClick={() => showMailbox(account.id)}
+                >
+                  <span class="mailbox-label">
+                    <span class="mailbox-name">{account.email}</span>
+                    <Show when={isPrimary(account)}>
+                      <span class="primary-tag">Primary</span>
+                    </Show>
+                  </span>
+                  <span class="count">{account.message_count}</span>
+                </button>
+              )}
+            </For>
+            <a class="add-account" href={GMAIL_CONNECT_PATH}>
+              {accounts()?.length ? '+ Add another account' : '+ Add an account'}
+            </a>
+          </nav>
+        </div>
         <nav class="folders" aria-label="Folders">
           <For each={FOLDERS}>
             {(f) => (
@@ -558,31 +585,6 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
               </button>
             )}
           </For>
-        </nav>
-        <h2 class="side-heading">Mailboxes</h2>
-        <nav class="mailboxes" aria-label="Mailboxes">
-          <For each={orderedAccounts()}>
-            {(account) => (
-              <button
-                class="mailbox"
-                classList={{ active: selectedAccount()?.id === account.id }}
-                aria-current={selectedAccount()?.id === account.id ? 'true' : undefined}
-                title={account.email}
-                onClick={() => showMailbox(account.id)}
-              >
-                <span class="mailbox-label">
-                  <span class="mailbox-name">{account.email}</span>
-                  <Show when={isPrimary(account)}>
-                    <span class="primary-tag">Primary</span>
-                  </Show>
-                </span>
-                <span class="count">{account.message_count}</span>
-              </button>
-            )}
-          </For>
-          <a class="add-account" href={GMAIL_CONNECT_PATH}>
-            {accounts()?.length ? '+ Add another account' : '+ Add an account'}
-          </a>
         </nav>
       </aside>
 

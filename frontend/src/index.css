@@ -165,8 +165,14 @@ button.mailbox.active { background: color-mix(in srgb, var(--accent) 16%, transp
 }
 button.folder.active .folder-icon { stroke-width: 2; }
 button.folder.active .count { color: inherit; font-weight: 600; }
+.side-block {
+  display: flex; flex-direction: column; gap: 0.35rem;
+  padding: 0.6rem 0.4rem 0.4rem 0; margin-bottom: 0.25rem;
+  border: 1px solid var(--border); border-radius: 10px;
+  background: color-mix(in srgb, var(--fg) 2.5%, transparent);
+}
 .side-heading {
-  margin: 0.75rem 0 0; padding: 0 0.75rem;
+  margin: 0; padding: 0 0.75rem;
   font-size: 0.75rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted);
 }
 .m-star { color: #e3a008; font-size: 0.9rem; }
@@ -258,6 +264,7 @@ button.chip.more { padding: 0.2rem 0.6rem; color: var(--muted); }
   .inbox-side { position: static; }
   .mailboxes, .folders { flex-direction: row; align-items: center; overflow-x: auto; }
   .side-heading { display: none; }
+  .side-block { padding: 0.4rem; }
   button.mailbox, a.add-account { flex-shrink: 0; border-radius: 999px; white-space: nowrap; }
   .message-row { grid-template-columns: minmax(0, 1fr) auto; row-gap: 0.15rem; }
   .m-text { grid-column: 1 / -1; grid-row: 2; }
