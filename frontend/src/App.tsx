@@ -657,7 +657,13 @@ const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one :
  * mailboxes on the left, one row per message, and a reading view. Bodies are
  * plain text from the server and are only ever shown as text (CASA 5.1.7).
  */
-function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryEmail: string }) {
+function Mail(props: {
+  onSignedOut: () => void
+  linkResult: LinkResult
+  primaryEmail: string
+  /** Opens Settings (an in-app link). */
+  settingsLink: (e: MouseEvent) => void
+}) {
   const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
   /** The mailbox the user picked; null (or one since disconnected) means the primary one. */
   const [mailbox, setMailbox] = createSignal<string | null>(null)
@@ -787,87 +793,96 @@ function Mail(props: { onSignedOut: () => void; linkResult: LinkResult; primaryE
   return (
     <section class="inbox">
       <aside class="inbox-side">
-        <div class="side-block">
-          <h2 class="side-heading">Accounts</h2>
-          <nav class="mailboxes" aria-label="Accounts">
-            <For each={orderedAccounts()}>
-              {(account) => (
-                <button
-                  class="mailbox"
-                  classList={{ active: selectedAccount()?.id === account.id }}
-                  aria-current={selectedAccount()?.id === account.id ? 'true' : undefined}
-                  title={account.email}
-                  onClick={() => showMailbox(account.id)}
-                >
-                  <span class="mailbox-label">
-                    <span class="mailbox-name">{account.email}</span>
-                  </span>
-                  <span class="count">{account.message_count}</span>
-                </button>
-              )}
-            </For>
-            <a class="add-account" href={GMAIL_CONNECT_PATH}>
-              {accounts()?.length ? '+ Add another account' : '+ Add an account'}
-            </a>
-          </nav>
-        </div>
-        <nav class="folders" aria-label="Folders">
-          <For each={showMore() ? [...FOLDERS, ...MORE_FOLDERS] : FOLDERS}>
-            {(f) => (
-              <button
-                class="mailbox folder"
-                classList={{ active: folder() === f.label }}
-                aria-current={folder() === f.label ? 'true' : undefined}
-                onClick={() => showFolder(f.label)}
-              >
-                <span class="folder-label">
-                  <FolderIcon label={f.label} />
-                  {f.name}
-                </span>
-                <Show when={countOf(f.label) > 0}>
-                  <span class="count">{countOf(f.label)}</span>
-                </Show>
-              </button>
-            )}
-          </For>
-          <button
-            class="mailbox folder more-toggle"
-            aria-expanded={showMore()}
-            onClick={() => setMoreOpen(!showMore())}
-            disabled={MORE_FOLDERS.some((f) => f.label === folder())}
-          >
-            <span class="folder-label">
-              <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d={showMore() ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'} />
-              </svg>
-              {showMore() ? 'Less' : 'More'}
-            </span>
-          </button>
-        </nav>
-        <Show when={selectedAccount()?.labels.length}>
-          <h2 class="side-heading labels-heading">Labels</h2>
-          <nav class="folders labels" aria-label="Labels">
-            <For each={selectedAccount()?.labels}>
-              {(l) => (
+        <div class="side-scroll">
+          <div class="side-block">
+            <h2 class="side-heading">Accounts</h2>
+            <nav class="mailboxes" aria-label="Accounts">
+              <For each={orderedAccounts()}>
+                {(account) => (
+                  <button
+                    class="mailbox"
+                    classList={{ active: selectedAccount()?.id === account.id }}
+                    aria-current={selectedAccount()?.id === account.id ? 'true' : undefined}
+                    title={account.email}
+                    onClick={() => showMailbox(account.id)}
+                  >
+                    <span class="mailbox-label">
+                      <span class="mailbox-name">{account.email}</span>
+                    </span>
+                    <span class="count">{account.message_count}</span>
+                  </button>
+                )}
+              </For>
+              <a class="add-account" href={GMAIL_CONNECT_PATH}>
+                {accounts()?.length ? '+ Add another account' : '+ Add an account'}
+              </a>
+            </nav>
+          </div>
+          <nav class="folders" aria-label="Folders">
+            <For each={showMore() ? [...FOLDERS, ...MORE_FOLDERS] : FOLDERS}>
+              {(f) => (
                 <button
                   class="mailbox folder"
-                  classList={{ active: folder() === l.id }}
-                  aria-current={folder() === l.id ? 'true' : undefined}
-                  title={l.name}
-                  onClick={() => showFolder(l.id)}
+                  classList={{ active: folder() === f.label }}
+                  aria-current={folder() === f.label ? 'true' : undefined}
+                  onClick={() => showFolder(f.label)}
                 >
                   <span class="folder-label">
-                    <LabelIcon color={l.color} />
-                    <span class="mailbox-name">{l.name}</span>
+                    <FolderIcon label={f.label} />
+                    {f.name}
                   </span>
-                  <Show when={countOf(l.id) > 0}>
-                    <span class="count">{countOf(l.id)}</span>
+                  <Show when={countOf(f.label) > 0}>
+                    <span class="count">{countOf(f.label)}</span>
                   </Show>
                 </button>
               )}
             </For>
+            <button
+              class="mailbox folder more-toggle"
+              aria-expanded={showMore()}
+              onClick={() => setMoreOpen(!showMore())}
+              disabled={MORE_FOLDERS.some((f) => f.label === folder())}
+            >
+              <span class="folder-label">
+                <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d={showMore() ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'} />
+                </svg>
+                {showMore() ? 'Less' : 'More'}
+              </span>
+            </button>
           </nav>
-        </Show>
+          <Show when={selectedAccount()?.labels.length}>
+            <h2 class="side-heading labels-heading">Labels</h2>
+            <nav class="folders labels" aria-label="Labels">
+              <For each={selectedAccount()?.labels}>
+                {(l) => (
+                  <button
+                    class="mailbox folder"
+                    classList={{ active: folder() === l.id }}
+                    aria-current={folder() === l.id ? 'true' : undefined}
+                    title={l.name}
+                    onClick={() => showFolder(l.id)}
+                  >
+                    <span class="folder-label">
+                      <LabelIcon color={l.color} />
+                      <span class="mailbox-name">{l.name}</span>
+                    </span>
+                    <Show when={countOf(l.id) > 0}>
+                      <span class="count">{countOf(l.id)}</span>
+                    </Show>
+                  </button>
+                )}
+              </For>
+            </nav>
+          </Show>
+        </div>
+        <a class="side-settings" href="/settings" onClick={props.settingsLink}>
+          <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" />
+          </svg>
+          Settings
+        </a>
       </aside>
 
       <div class="inbox-main">
@@ -1180,14 +1195,6 @@ function App() {
                 </Show>
                 <span class="muted">{user().email}</span>
               </span>
-              <a
-                class="header-link"
-                href={VIEW_PATHS.settings}
-                aria-current={view() === 'settings' ? 'page' : undefined}
-                onClick={linkTo('settings')}
-              >
-                Settings
-              </a>
               <button class="secondary" onClick={signOut}>
                 Sign out
               </button>
@@ -1219,7 +1226,12 @@ function App() {
             <Show
               when={view() === 'settings' && me()}
               fallback={
-                <Mail onSignedOut={() => mutate(null)} linkResult={linkResult} primaryEmail={me()?.email ?? ''} />
+                <Mail
+                  onSignedOut={() => mutate(null)}
+                  linkResult={linkResult}
+                  primaryEmail={me()?.email ?? ''}
+                  settingsLink={linkTo('settings')}
+                />
               }
             >
               {(user) => (
