@@ -581,7 +581,12 @@ function Mail(props: {
           // Another tab is importing, or an import cut short (the server
           // restarted) still holds the mailbox for up to a minute: wait,
           // then try again rather than give up.
-          if (err instanceof Error && err.message === 'an import is already running') {
+          // Likewise when the server asks to slow down (many reloads in a
+          // row): the import still has to happen.
+          if (
+            err instanceof Error &&
+            (err.message === 'an import is already running' || err.message === 'too many requests')
+          ) {
             await new Promise((resolve) => setTimeout(resolve, BUSY_RETRY_MS))
             continue
           }

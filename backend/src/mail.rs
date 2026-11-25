@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
@@ -72,6 +72,11 @@ const BACKFILL_DEADLINE: Duration = Duration::from_secs(18);
 /// backend restarted mid-import, say): a live one gives up within
 /// `IMPORT_BUDGET` and then releases it.
 const STALE_CLAIM_SECS: f64 = 60.0;
+/// After Gmail refuses a mailbox's requests for going over its quota (counted
+/// per user, per minute), nothing contacts Gmail for that mailbox for this
+/// long. Otherwise each page load would start another round against a quota
+/// that is already spent, and keep it spent.
+const LIMITED_HOLD_SECS: f64 = 60.0;
 const MAX_BODY_CHARS: usize = 200_000;
 const MAX_SUBJECT_CHARS: usize = 1_000;
 const MAX_ADDRESS_CHARS: usize = 2_000;
@@ -753,6 +758,10 @@ pub struct AccountImport {
     /// after it are what push sync reads next.
     #[serde(skip)]
     history_id: Option<String>,
+    /// Gmail refused requests for going over its quota: the mailbox is left
+    /// alone for `LIMITED_HOLD_SECS`.
+    #[serde(skip)]
+    limited: bool,
 }
 
 pub enum ImportOutcome {
@@ -778,6 +787,10 @@ enum ImportFailure {
 }
 
 impl ImportFailure {
+    fn is_rate_limited(&self) -> bool {
+        matches!(self, ImportFailure::Google(e) if e.is_rate_limited())
+    }
+
     fn user_message(&self) -> &'static str {
         match self {
             ImportFailure::Google(GoogleApiError::Revoked) => {
@@ -838,6 +851,7 @@ pub async fn import_all(
           WHERE owner_id = $1
             AND (import_started_at IS NULL
                  OR import_started_at < now() - make_interval(secs => $2))
+            AND (import_retry_at IS NULL OR import_retry_at <= now())
           RETURNING id, google_sub, email, refresh_token_enc,
                     backfill_page_token, backfill_done",
     )
@@ -845,7 +859,31 @@ pub async fn import_all(
     .bind(STALE_CLAIM_SECS)
     .fetch_all(pool)
     .await?;
+    // Mailboxes Gmail limited a moment ago are left alone: reported as having
+    // mail left, without an error, so the page just waits and asks again.
+    let held: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, email FROM mail_accounts
+          WHERE owner_id = $1 AND import_retry_at > now()",
+    )
+    .bind(owner)
+    .fetch_all(pool)
+    .await?;
+    let held = held.into_iter().map(|(id, email)| AccountImport {
+        id,
+        email,
+        imported: 0,
+        skipped: 0,
+        remaining: true,
+        error: None,
+        history_id: None,
+        limited: true,
+    });
     if claimed.is_empty() {
+        let mut held: Vec<AccountImport> = held.collect();
+        if !held.is_empty() {
+            held.sort_by(|a, b| a.email.cmp(&b.email));
+            return Ok(ImportOutcome::Done(held));
+        }
         let linked: i64 =
             sqlx::query_scalar("SELECT count(*) FROM mail_accounts WHERE owner_id = $1")
                 .bind(owner)
@@ -874,11 +912,13 @@ pub async fn import_all(
         tasks.spawn(async move {
             let counts = Counts::default();
             let run = import_account(&pool, &google, &cipher, owner, &account, deadline, &counts);
+            let mut limited = false;
             let (remaining, error, history_id) =
                 match tokio::time::timeout(IMPORT_BUDGET, run).await {
                     Ok(Ok((remaining, history_id))) => (remaining, None, history_id),
                     Ok(Err(e)) => {
                         tracing::warn!(account = %account.id, error = %e, "mailbox import failed");
+                        limited = e.is_rate_limited();
                         (true, Some(e.user_message()), None)
                     }
                     Err(_) => (
@@ -895,6 +935,7 @@ pub async fn import_all(
                 remaining,
                 error,
                 history_id,
+                limited: limited || counts.limited.load(Ordering::Relaxed),
             }
         });
     }
@@ -909,20 +950,26 @@ pub async fn import_all(
     // Release every claim, including any whose task died.
     let finished: Vec<Uuid> = results
         .iter()
-        .filter(|r| r.error.is_none())
+        .filter(|r| r.error.is_none() && !r.limited)
         .map(|r| r.id)
         .collect();
+    let limited: Vec<Uuid> = results.iter().filter(|r| r.limited).map(|r| r.id).collect();
     sqlx::query(
         "UPDATE mail_accounts SET
              import_started_at = NULL,
-             last_import_at = CASE WHEN id = ANY($3) THEN now() ELSE last_import_at END
+             last_import_at = CASE WHEN id = ANY($3) THEN now() ELSE last_import_at END,
+             import_retry_at = CASE WHEN id = ANY($4)
+                                    THEN now() + make_interval(secs => $5) END
           WHERE owner_id = $1 AND id = ANY($2)",
     )
     .bind(owner)
     .bind(&ids)
     .bind(&finished)
+    .bind(&limited)
+    .bind(LIMITED_HOLD_SECS)
     .execute(pool)
     .await?;
+    results.extend(held);
     // Push sync reads history from here, unless it already reads from an
     // earlier point: moving that later would skip the changes in between.
     for r in results.iter().filter(|r| r.error.is_none()) {
@@ -947,6 +994,8 @@ pub async fn import_all(
 struct Counts {
     imported: AtomicU32,
     skipped: AtomicU32,
+    /// Gmail refused a fetch for going over its quota.
+    limited: AtomicBool,
 }
 
 /// Returns whether older mail is still left to import, and Gmail's history
@@ -1210,6 +1259,7 @@ impl Fetch<'_> {
                 // round stops. The page is tried again next round.
                 Fetched::Failed(e) if e.is_rate_limited() => {
                     tracing::info!(account = %self.account.id, "Gmail rate limit; continuing next round");
+                    self.counts.limited.store(true, Ordering::Relaxed);
                     self.save_backfill(page.as_deref(), false).await?;
                     return Ok(true);
                 }
@@ -1553,6 +1603,7 @@ pub async fn sync_account(
               WHERE id = $1 AND owner_id = $2
                 AND (import_started_at IS NULL
                      OR import_started_at < now() - make_interval(secs => $3))
+                AND (import_retry_at IS NULL OR import_retry_at <= now())
               RETURNING google_sub, email, refresh_token_enc,
                         backfill_page_token, backfill_done, history_id",
     )

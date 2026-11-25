@@ -158,6 +158,9 @@ export function watchMail(onChange: (accountId: string) => void, onEnded: () => 
       // Not an event we understand: nothing to reload.
     }
   })
+  // The server ended this stream for a newer one (more tabs open than it
+  // keeps streams for): stop, rather than reconnect and end another tab's.
+  source.addEventListener('replaced', () => source.close())
   source.onerror = () => {
     if (source.readyState === EventSource.CLOSED) onEnded()
   }

@@ -6,6 +6,12 @@
 //! mailbox owner's own streams only, and a stream ends as soon as its session
 //! does (logout, idle or absolute expiry), checked without keeping the
 //! session alive (CASA 2.2.x, 3.1.4).
+//!
+//! A user's newest streams win: opening one more than allowed ends their
+//! oldest. A reloaded page's old stream can stay registered until its next
+//! ping (the server only learns the browser left when it writes), so
+//! refusing the new one instead would lock out someone who reloads a few
+//! times in a row.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -21,7 +27,8 @@ use uuid::Uuid;
 
 use crate::auth::session;
 
-/// Most open streams one user may have (a few tabs).
+/// Most open streams one user may have (a few tabs). One more ends the
+/// oldest.
 const MAX_STREAMS_PER_USER: usize = 5;
 /// Most open streams in all.
 const MAX_STREAMS: usize = 2_000;
@@ -35,6 +42,9 @@ const PING_EVERY: Duration = Duration::from_millis(50);
 /// How long the browser waits before reconnecting a dropped stream.
 const RETRY_MS: u32 = 5_000;
 
+/// Last thing sent on a stream that a newer one replaced.
+const REPLACED: &[u8] = b"event: replaced\ndata: {}\n\n";
+
 /// Who to tell when a mailbox changes. Cheap to clone; all clones share it.
 #[derive(Clone, Default)]
 pub struct MailEvents {
@@ -42,8 +52,8 @@ pub struct MailEvents {
 }
 
 impl MailEvents {
-    /// Registers a stream for `owner`. `None` if they, or everyone together,
-    /// already have as many open as allowed.
+    /// Registers a stream for `owner`, ending their oldest one if they
+    /// already have as many as allowed. `None` if everyone together does.
     fn subscribe(&self, owner: Uuid) -> Option<mpsc::Receiver<Uuid>> {
         let mut streams = self.streams.lock().ok()?;
         streams.retain(|_, senders| {
@@ -52,7 +62,13 @@ impl MailEvents {
         });
         let total: usize = streams.values().map(Vec::len).sum();
         let mine = streams.entry(owner).or_default();
-        if mine.len() >= MAX_STREAMS_PER_USER || total >= MAX_STREAMS {
+        if mine.len() >= MAX_STREAMS_PER_USER {
+            // Oldest first. Dropping its sender ends that stream's task.
+            mine.remove(0);
+        } else if total >= MAX_STREAMS {
+            if mine.is_empty() {
+                streams.remove(&owner);
+            }
             return None;
         }
         let (tx, rx) = mpsc::channel(16);
@@ -76,7 +92,7 @@ impl MailEvents {
 }
 
 /// Starts `owner`'s event stream for the session `token_hash`. `None` if
-/// they have too many open already.
+/// too many are open in all.
 pub fn open_stream(
     events: &MailEvents,
     pool: PgPool,
@@ -104,7 +120,13 @@ pub fn open_stream(
                         let data = serde_json::json!({ "account": account });
                         Bytes::from(format!("event: mail\ndata: {data}\n\n"))
                     }
-                    None => break,
+                    // A newer stream took this one's place. Tell the page,
+                    // if it's still there, not to reconnect (that would
+                    // push out another of the user's streams in turn).
+                    None => {
+                        let _ = out.send(Bytes::from_static(REPLACED)).await;
+                        break;
+                    }
                 },
                 _ = ping.tick() => {
                     match session::is_live(&pool, &token_hash, idle_secs).await {
@@ -161,18 +183,26 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn streams_per_user_are_capped_and_closed_ones_free_a_slot() {
+    async fn one_stream_too_many_ends_the_users_oldest() {
         let events = MailEvents::default();
-        let owner = Uuid::new_v4();
+        let (owner, other, account) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut theirs = events.subscribe(other).unwrap();
         let mut open: Vec<_> = (0..MAX_STREAMS_PER_USER)
             .map(|_| events.subscribe(owner).unwrap())
             .collect();
-        assert!(events.subscribe(owner).is_none());
+        // E.g. a page reloaded before its old streams were noticed gone.
+        let mut newest = events.subscribe(owner).unwrap();
+        assert_eq!(open[0].recv().await, None, "the oldest stream stays open");
+        events.publish(owner, account);
+        assert_eq!(newest.recv().await, Some(account));
+        for kept in &mut open[1..] {
+            assert_eq!(kept.recv().await, Some(account));
+        }
         assert!(
-            events.subscribe(Uuid::new_v4()).is_some(),
-            "others unaffected"
+            theirs.try_recv().is_err(),
+            "another user's stream was touched"
         );
-        drop(open.pop());
-        assert!(events.subscribe(owner).is_some());
+        let count = events.streams.lock().unwrap()[&owner].len();
+        assert_eq!(count, MAX_STREAMS_PER_USER);
     }
 }

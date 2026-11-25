@@ -90,7 +90,8 @@ Scanner ignores:
   reloads its data through the usual owner-scoped endpoints. Each stream
   re-checks its session every 20 s *without* sliding the idle window, so an
   open tab neither keeps a session alive nor outlives a logout. At most 5
-  streams per user and 2,000 in all.
+  streams per user (one more ends that user's oldest, so reloading a page
+  never locks its owner out) and 2,000 in all (then 429).
 - **Google tokens are not stored.** Sign-in requests only `openid email profile`
   (non-sensitive: the name is stored as first/last name, nothing else), and
   Google's access and refresh tokens are dropped after the exchange. When

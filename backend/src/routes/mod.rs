@@ -1943,8 +1943,21 @@ mod tests {
         assert_eq!(body["accounts"][0]["error"], Value::Null, "{body}");
         assert_eq!(body["accounts"][0]["remaining"], true);
 
-        // Once Gmail lets up, the next round picks up where it stopped.
+        // For the next minute the mailbox is left alone, however often the
+        // page asks (a reload, say): no error, and nothing fetched.
         fake.rate_limited_messages.lock().unwrap().clear();
+        let (status, body) = import().await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["imported"], 0);
+        assert_eq!(body["accounts"][0]["error"], Value::Null, "{body}");
+        assert_eq!(body["accounts"][0]["remaining"], true);
+
+        // After that, the next round picks up where it stopped.
+        sqlx::query("UPDATE mail_accounts SET import_retry_at = now() WHERE google_sub = $1")
+            .bind(&sub)
+            .execute(pool.get_ref())
+            .await
+            .unwrap();
         let (_, body) = import().await;
         assert_eq!(body["imported"], 30);
         assert_eq!(body["accounts"][0]["error"], Value::Null);
@@ -2426,6 +2439,37 @@ mod tests {
                 Some(chunk) => assert_eq!(chunk, ": ping\n\n"),
             }
         }
+    }
+
+    #[actix_web::test]
+    async fn reloading_the_page_many_times_still_gets_a_live_stream() {
+        use actix_web::body::MessageBody;
+        let pool = test_db().await;
+        let app = test_app!(pool);
+        let (_, session) = signed_in_user(&pool).await;
+        // Each reload opens a stream while the old ones are still registered.
+        let mut bodies = Vec::new();
+        for _ in 0..8 {
+            let resp = test::call_service(&app, req!("GET", "/api/mail/events", &session)).await;
+            assert_eq!(resp.status(), 200);
+            bodies.push(Box::pin(resp.into_body()));
+        }
+        // The first one was replaced: it says so, then ends.
+        let oldest = &mut bodies[0];
+        let mut seen = String::new();
+        loop {
+            let chunk = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                std::future::poll_fn(|cx| oldest.as_mut().poll_next(cx)),
+            )
+            .await
+            .expect("stream stalled");
+            match chunk {
+                Some(c) => seen.push_str(std::str::from_utf8(&c.unwrap()).unwrap()),
+                None => break,
+            }
+        }
+        assert!(seen.ends_with("event: replaced\ndata: {}\n\n"), "{seen}");
     }
 
     #[actix_web::test]
