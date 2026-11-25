@@ -11,6 +11,7 @@ import {
   type OutgoingMail,
   type MailAccount,
   type MailAttachment,
+  type MailMessageDetail,
   type Me,
 } from './api'
 
@@ -274,6 +275,45 @@ const MAX_RECIPIENTS = 50
 const MAX_SUBJECT_CHARS = 255
 const MAX_BODY_CHARS = 100_000
 
+/** What a new message starts with. */
+interface Draft {
+  to: string
+  subject: string
+  body: string
+}
+const NEW_MESSAGE: Draft = { to: '', subject: '', body: '' }
+
+/** "Re: x", without stacking a second "Re:" on a reply to a reply. */
+const prefixed = (prefix: string, already: RegExp, subject: string) =>
+  (already.test(subject) ? subject : `${prefix} ${subject}`.trim()).slice(0, MAX_SUBJECT_CHARS)
+
+/** A reply to `m`: to its sender, with its text quoted below. */
+const replyTo = (m: MailMessageDetail): Draft => {
+  const quoted = m.body.replace(/^/gm, '> ')
+  return {
+    to: looksLikeAddress(senderAddress(m.from)) ? senderAddress(m.from) : '',
+    subject: prefixed('Re:', /^\s*re:/i, m.subject),
+    body: `\n\nOn ${formatDate(m.received_at)}, ${m.from} wrote:\n${quoted}`.slice(0, MAX_BODY_CHARS),
+  }
+}
+
+/** `m` forwarded: no recipient yet, its text below a header block. Files are not sent along. */
+const forwardOf = (m: MailMessageDetail): Draft => ({
+  to: '',
+  subject: prefixed('Fwd:', /^\s*fwd?:/i, m.subject),
+  body: [
+    '\n\n---------- Forwarded message ----------',
+    `From: ${m.from}`,
+    `Date: ${formatDate(m.received_at)}`,
+    `Subject: ${m.subject}`,
+    `To: ${m.to}`,
+    '',
+    m.body,
+  ]
+    .join('\n')
+    .slice(0, MAX_BODY_CHARS),
+})
+
 /** Addresses typed into To, Cc or Bcc: split on commas, semicolons, spaces. */
 const splitAddresses = (text: string) => text.split(/[\s,;]+/).filter(Boolean)
 /** A rough check for a typo; the server decides what it accepts. */
@@ -289,8 +329,8 @@ function Compose(props: {
   senders: MailAccount[]
   /** The mailbox being viewed, used as the sender when it may send. */
   preferred: string | undefined
-  /** An address to start the To field with. */
-  to: string
+  /** What the form starts with: empty, an address, a reply or a forward. */
+  draft: Draft
   onSent: () => void
   onDiscard: () => void
   onSignedOut: () => void
@@ -298,12 +338,12 @@ function Compose(props: {
   const [from, setFrom] = createSignal(
     props.senders.find((a) => a.id === props.preferred)?.id ?? props.senders[0].id,
   )
-  const [to, setTo] = createSignal(props.to)
+  const [to, setTo] = createSignal(props.draft.to)
   const [cc, setCc] = createSignal('')
   const [bcc, setBcc] = createSignal('')
   const [showCopies, setShowCopies] = createSignal(false)
-  const [subject, setSubject] = createSignal('')
-  const [body, setBody] = createSignal('')
+  const [subject, setSubject] = createSignal(props.draft.subject)
+  const [body, setBody] = createSignal(props.draft.body)
   const [sending, setSending] = createSignal(false)
   const [error, setError] = createSignal<string | null>(null)
 
@@ -687,15 +727,18 @@ function Mail(props: {
   const [composing, setComposing] = createSignal(false)
   /** "Message sent." is shown until the user moves on. */
   const [sent, setSent] = createSignal(false)
+  /** The open message, once it has loaded. */
+  const opened = () => (!detail.loading && detail()?.id === openId() ? detail() : undefined)
+  const composeTo = (to: string) => compose({ ...NEW_MESSAGE, to })
   /** Mailboxes the user allowed sending from. */
   const senders = () => (accounts() ?? []).filter((a) => a.can_send)
   /** The address the new message starts with, when one was clicked. */
-  const [composeTo, setComposeTo] = createSignal('')
-  const compose = (to = '') => {
+  const [draft, setDraft] = createSignal<Draft>(NEW_MESSAGE)
+  const compose = (start: Draft = NEW_MESSAGE) => {
     setSent(false)
     setError(null)
     setOpenId(null)
-    setComposeTo(to)
+    setDraft(start)
     setComposing(true)
   }
 
@@ -1072,6 +1115,18 @@ function Mail(props: {
                 <button class="ghost" onClick={() => setOpenId(null)} aria-label="Back to the list">
                   ← Back
                 </button>
+                <Show when={opened()}>
+                  {(m) => (
+                    <div class="toolbar-group toolbar-end">
+                      <button class="ghost" onClick={() => compose(replyTo(m()))}>
+                        ↩ Reply
+                      </button>
+                      <button class="ghost" onClick={() => compose(forwardOf(m()))}>
+                        ↪ Forward
+                      </button>
+                    </div>
+                  )}
+                </Show>
               </Show>
             </Show>
           </div>
@@ -1122,7 +1177,7 @@ function Mail(props: {
             <Compose
               senders={senders()}
               preferred={selectedAccount()?.id}
-              to={composeTo()}
+              draft={draft()}
               onSignedOut={props.onSignedOut}
               onDiscard={() => setComposing(false)}
               onSent={() => {
@@ -1247,7 +1302,7 @@ function Mail(props: {
             >
               <Show when={!detail.error} fallback={<p class="error inbox-empty">Could not open this message.</p>}>
                 <Show
-                  when={!detail.loading && detail()?.id === openId() ? detail() : undefined}
+                  when={opened()}
                   fallback={<p class="muted inbox-empty">Loading…</p>}
                 >
                   {(d) => (
@@ -1260,7 +1315,7 @@ function Mail(props: {
                             <strong>{senderName(d().from)}</strong>{' '}
                             <span class="muted">
                               &lt;
-                              <AddressLink address={senderAddress(d().from)} onCompose={compose} />
+                              <AddressLink address={senderAddress(d().from)} onCompose={composeTo} />
                               &gt;
                             </span>
                             <div class="muted">
@@ -1272,7 +1327,7 @@ function Mail(props: {
                                     <AddressLink
                                       address={senderAddress(person)}
                                       text={person}
-                                      onCompose={compose}
+                                      onCompose={composeTo}
                                     />
                                   </>
                                 )}

@@ -211,6 +211,7 @@ button.more-toggle:disabled { opacity: 1; cursor: default; }
   min-height: 2.75rem; padding: 0.25rem 0.75rem; border-bottom: 1px solid var(--border);
 }
 .toolbar-group { display: flex; align-items: center; gap: 0.25rem; }
+.toolbar-end { margin-left: auto; }
 .inbox-toolbar button { white-space: nowrap; }
 .toolbar-status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 button.ghost { background: transparent; border-color: transparent; color: inherit; padding: 0.3rem 0.6rem; font-size: 0.9rem; }
