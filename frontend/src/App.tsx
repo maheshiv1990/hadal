@@ -831,6 +831,20 @@ function Mail(props: {
   const hasNext = () => (page() + 1) * PAGE_SIZE < importedOf(folder())
   /** Page buttons only when the folder doesn't fit on one page. */
   const paged = () => page() > 0 || total() > PAGE_SIZE
+  /** IDs of the rows ticked on the shown page. */
+  const [selected, setSelected] = createSignal<ReadonlySet<string>>(new Set())
+  const toggleSelected = (id: string) => {
+    const next = new Set(selected())
+    if (!next.delete(id)) next.add(id)
+    setSelected(next)
+  }
+  // Ticks belong to the page they were made on: another mailbox, folder or
+  // page starts with none.
+  createEffect(() => {
+    void [selectedAccount()?.id, folder(), page()]
+    setSelected(new Set<string>())
+  })
+
   const turnPage = (to: number) => {
     setPage(to)
     document.querySelector('.inbox-main')?.scrollIntoView({ block: 'nearest' })
@@ -1213,7 +1227,14 @@ function Mail(props: {
                   <ul class="message-list">
                     <For each={visible()}>
                       {(m) => (
-                        <li>
+                        <li classList={{ selected: selected().has(m.id) }}>
+                          <input
+                            type="checkbox"
+                            class="m-check"
+                            checked={selected().has(m.id)}
+                            onChange={() => toggleSelected(m.id)}
+                            aria-label={`Select: ${m.subject || '(no subject)'}`}
+                          />
                           <button
                             class="message-row"
                             classList={{ unread: m.labels.includes('UNREAD') }}
