@@ -365,6 +365,12 @@ button.compose-button .folder-icon { stroke: currentColor; }
 .compose input:disabled { color: var(--muted); background: color-mix(in srgb, var(--fg) 4%, transparent); }
 .compose button.compose-copies { align-self: flex-start; margin-left: 5rem; font-size: 0.875rem; }
 .compose-actions { display: flex; align-items: center; gap: 0.5rem; margin-left: 5rem; }
+/* Both the same size and on one line: the base button rule pins buttons to
+   the top of a flex row, and a ghost button is smaller. */
+.compose-actions button, .compose-actions a.header-link {
+  align-self: center; padding: 0.45rem 1rem; font-size: 0.9rem; line-height: 1.4;
+}
+.compose-actions button.ghost { border-color: var(--border); }
 @media (max-width: 640px) {
   .compose label { grid-template-columns: 1fr; gap: 0.25rem; }
   .compose button.compose-copies, .compose-actions { margin-left: 0; }
