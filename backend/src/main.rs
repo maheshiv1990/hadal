@@ -1,4 +1,5 @@
 mod auth;
+mod compose;
 mod config;
 mod crypto;
 mod error;

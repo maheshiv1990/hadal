@@ -28,7 +28,7 @@ Scanner ignores:
 | `licenses.private.ignore = true` | Our own crate is `publish = false` and proprietary. |
 | actix-web built with `default-features = false, features = ["macros"]` | Drops `cookie 0.16` (RUSTSEC-2026-0594) and `h2 0.3` (RUSTSEC-2026-0258). HTTP/2 belongs at the TLS-terminating proxy. |
 | `chrono` replaced by `time` | RUSTSEC-2026-0543 (chrono unmaintained). |
-| `reqwest` with `default-features = false, features = ["rustls-no-provider", "json", "form"]` | Only for calls to Google's fixed endpoints in `auth/google.rs`: code exchange, token refresh and revocation, and the read-only Gmail API. Default features would add aws-lc-rs, HTTP/2 and system proxy support, none of which we need. TLS is a rustls `ClientConfig` on the `ring` provider (already used by sqlx) with `webpki-roots`. |
+| `reqwest` with `default-features = false, features = ["rustls-no-provider", "json", "form"]` | Only for calls to Google's fixed endpoints in `auth/google.rs`: code exchange, token refresh and revocation, sending a message, and the read-only Gmail API. Default features would add aws-lc-rs, HTTP/2 and system proxy support, none of which we need. TLS is a rustls `ClientConfig` on the `ring` provider (already used by sqlx) with `webpki-roots`. |
 | `ring` as a direct dependency (`default-features = false, features = ["alloc"]`) | AES-256-GCM for refresh tokens and imported mail (`backend/src/crypto.rs`). Already in the tree as the rustls crypto provider, so it adds no new crate. ISC/Apache-2.0-style license. |
 | `webpki-roots` (CDLA-Permissive-2.0) | Mozilla's CA set, compiled in, so the container's trust store can't weaken verification of Google's certificate. |
 | `argon2` 0.6 with `default-features = false, features = ["alloc", "password-hash", "zeroize"]` | RustCrypto, MIT/Apache-2.0. Salts come from the `getrandom` 0.3 we already use, so the crate's own `getrandom` feature is off. |
@@ -94,6 +94,19 @@ Scanner ignores:
   either. At most 5
   streams per user (one more ends that user's oldest, so reloading a page
   never locks its owner out) and 2,000 in all (then 429).
+- **Sending mail (`POST /api/mail/send`, Compose).** Linking a mailbox now also
+  asks for `gmail.send` (send only; a sensitive scope, not a restricted one).
+  The user may leave it unticked: the mailbox is then read-only (`can_send`),
+  and mailboxes linked earlier stay read-only until reconnected. The route is
+  inside the session scope with the tight per-IP limit, takes JSON only, and
+  refuses unknown fields. The sender is the caller's own mailbox address from
+  our row, never request input. What the form sends is checked before it goes
+  into mail headers (`backend/src/compose.rs`): bare ASCII addresses only, 50
+  recipients at most, no control characters in the subject, and a base64
+  body, so nothing typed can add a header or a recipient. A message is not
+  stored or logged by the send path; a failure logs the mailbox ID and
+  Google's status only. The call to Gmail is not retried, so an unclear
+  failure can't send twice.
 - **Google tokens are not stored.** Sign-in requests only `openid email profile`
   (non-sensitive: the name is stored as first/last name, nothing else), and
   Google's access and refresh tokens are dropped after the exchange. When

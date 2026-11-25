@@ -55,7 +55,11 @@ mailbox is done. Later imports fetch only messages not imported yet.
 2. On the OAuth consent screen, add the scope
    `https://www.googleapis.com/auth/gmail.readonly`. It is a *restricted*
    scope: until the app is verified (which needs the CASA assessment), only the
-   consent screen's test users can link a mailbox.
+   consent screen's test users can link a mailbox. Also add
+   `https://www.googleapis.com/auth/gmail.send` (a *sensitive* scope), which
+   the Compose button uses to send mail. A user who leaves it unticked when
+   linking gets a read-only mailbox, and a mailbox linked before this scope
+   existed has to be connected again before it can send.
 3. Set `DATA_ENCRYPTION_KEY` in `.env` (`openssl rand -base64 32`). It
    encrypts refresh tokens and imported mail at rest; if it changes, stored mail
    can't be read and mailboxes must be relinked.

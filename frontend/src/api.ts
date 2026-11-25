@@ -13,6 +13,8 @@ export interface MailAccount {
   email: string
   created_at: string
   last_import_at: string | null
+  /** The user allowed sending from this mailbox when connecting it. */
+  can_send: boolean
   message_count: number
   /** Messages per label ID (`INBOX`, `Label_12`, …), plus `ALL` for everything but spam. */
   folder_counts: Record<string, number>
@@ -26,6 +28,17 @@ export interface MailAccount {
   gmail_unread: Record<string, number>
   /** The mailbox's own Gmail labels. */
   labels: MailLabel[]
+}
+
+/** A message to send. Addresses are bare (`ada@example.com`), no names. */
+export interface OutgoingMail {
+  /** ID of the mailbox to send from. */
+  account: string
+  to: string[]
+  cc: string[]
+  bcc: string[]
+  subject: string
+  body: string
 }
 
 /** One of the user's own Gmail labels. */
@@ -202,5 +215,8 @@ export const api = {
     request<MailMessage[]>(
       `/mail/messages?${new URLSearchParams({ account, label, page: String(page) })}`,
     ),
+  /** Sends a new plain-text message from one of the user's mailboxes. */
+  sendMail: (message: OutgoingMail) =>
+    request<void>('/mail/send', { method: 'POST', body: JSON.stringify(message) }),
   getMessage: (id: string) => request<MailMessageDetail>(`/mail/messages/${encodeURIComponent(id)}`),
 }

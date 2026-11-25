@@ -30,12 +30,17 @@ const ISSUER_SHORT: &str = "accounts.google.com";
 /// Read-only Gmail access (restricted scope). Requested only when a signed-in
 /// user links a mailbox, never at sign-in.
 pub const GMAIL_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
+/// Sending mail as the mailbox, and nothing else (a sensitive scope, not a
+/// restricted one). Asked for along with read-only when linking; the user
+/// may leave it unticked, and the mailbox is then read-only.
+pub const GMAIL_SEND: &str = "https://www.googleapis.com/auth/gmail.send";
 /// Sign-in only needs identity and the user's name (`profile` gives
 /// `given_name` / `family_name`).
 const SIGN_IN_SCOPES: &str = "openid email profile";
-/// Linking needs the mailbox's identity (to tell linked accounts apart) and
-/// read-only mail.
-const LINK_SCOPES: &str = "openid email https://www.googleapis.com/auth/gmail.readonly";
+/// Linking needs the mailbox's identity (to tell linked accounts apart),
+/// read-only mail, and permission to send.
+const LINK_SCOPES: &str = "openid email https://www.googleapis.com/auth/gmail.readonly \
+                           https://www.googleapis.com/auth/gmail.send";
 /// Same bound as names entered at registration (users.first_name/last_name).
 const MAX_NAME_CHARS: usize = 100;
 /// Largest token or list response we will read.
@@ -1081,6 +1086,36 @@ impl GoogleClient {
         Ok(keys)
     }
 
+    /// Sends `message` (RFC 5322 text, built by `compose::build` from checked
+    /// input) as the mailbox the access token is for (`users.messages.send`).
+    /// Not retried: a retry after an unclear failure could send it twice.
+    pub async fn send_message(&self, access: &Secret, message: &str) -> Result<(), GoogleApiError> {
+        let url = self
+            .gmail_api
+            .join("messages/send")
+            .map_err(|_| GoogleApiError::Malformed)?;
+        let body = serde_json::json!({ "raw": URL_SAFE_NO_PAD.encode(message) });
+        let resp = self
+            .http
+            .post(url)
+            .bearer_auth(access.expose())
+            .json(&body)
+            .send()
+            .await
+            .map_err(unreachable)?;
+        let status = resp.status();
+        if status.as_u16() == 401 {
+            return Err(GoogleApiError::Revoked);
+        }
+        if !status.is_success() {
+            return Err(GoogleApiError::Status(
+                status.as_u16(),
+                error_reason(resp).await,
+            ));
+        }
+        Ok(())
+    }
+
     /// Tells Google to revoke a refresh token (when a mailbox is unlinked).
     pub async fn revoke(&self, refresh: &Secret) -> Result<(), GoogleApiError> {
         let resp = self
@@ -1536,7 +1571,8 @@ pub(crate) mod tests {
         let link = query(Purpose::LinkGmail);
         assert_eq!(
             link["scope"],
-            "openid email https://www.googleapis.com/auth/gmail.readonly"
+            "openid email https://www.googleapis.com/auth/gmail.readonly \
+             https://www.googleapis.com/auth/gmail.send"
         );
         assert_eq!(link["access_type"], "offline");
         assert_eq!(link["prompt"], "consent select_account");

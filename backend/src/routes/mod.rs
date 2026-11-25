@@ -49,6 +49,13 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                             .wrap(from_fn(crate::security::auth_rate_limit))
                             .service(mail::import),
                     )
+                    // Each call sends real mail from the user's mailbox.
+                    .service(
+                        web::scope("/send")
+                            .wrap(from_fn(crate::security::auth_rate_limit))
+                            .app_data(send_json_config())
+                            .service(mail::send),
+                    )
                     .service(mail::messages)
                     // Each download refreshes a token and calls Gmail.
                     .service(
@@ -62,6 +69,17 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     .default_service(web::to(|| async {
         HttpResponse::NotFound().json(serde_json::json!({ "error": "not found" }))
     }));
+}
+
+/// The Compose form's body may be longer than other requests: a message of
+/// `compose::MAX_BODY_CHARS`, with room for JSON escapes.
+fn send_json_config() -> web::JsonConfig {
+    web::JsonConfig::default()
+        .limit(512 * 1024)
+        .error_handler(|err, _req| {
+            tracing::debug!(error = %err, "rejected JSON body");
+            AppError::BadRequest("invalid request body".into()).into()
+        })
 }
 
 #[cfg(test)]
@@ -127,6 +145,7 @@ mod tests {
             ("GET", "/api/mail/accounts".to_owned()),
             ("DELETE", format!("/api/mail/accounts/{id}")),
             ("POST", "/api/mail/import".to_owned()),
+            ("POST", "/api/mail/send".to_owned()),
             ("GET", "/api/mail/messages".to_owned()),
             ("GET", format!("/api/mail/messages/{id}")),
             ("GET", "/api/mail/events".to_owned()),
@@ -490,6 +509,10 @@ mod tests {
         labels: Mutex<Vec<Value>>,
         /// How many upcoming message-list calls answer 403 rateLimitExceeded.
         rate_limited: Mutex<u32>,
+        /// Messages Gmail was asked to send, as RFC 5322 text.
+        sent: Mutex<Vec<String>>,
+        /// `users.messages.send` answers with this status instead of sending.
+        send_status: Mutex<Option<u16>>,
         /// The signing-key endpoint answers 503, and how often it was asked.
         certs_down: Mutex<bool>,
         certs_calls: Mutex<u32>,
@@ -802,6 +825,29 @@ mod tests {
         HttpResponse::Ok().json(json!({ "history": records, "historyId": history_id }))
     }
 
+    async fn fake_gmail_send(
+        st: web::Data<FakeGoogle>,
+        req: actix_web::HttpRequest,
+        body: web::Json<Value>,
+    ) -> HttpResponse {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        if !bearer_ok(&req) {
+            return HttpResponse::Unauthorized().finish();
+        }
+        if let Some(status) = *st.send_status.lock().unwrap() {
+            return HttpResponse::build(actix_web::http::StatusCode::from_u16(status).unwrap())
+                .json(json!({ "error": { "status": "FAILED_PRECONDITION" } }));
+        }
+        let raw = URL_SAFE_NO_PAD
+            .decode(body["raw"].as_str().unwrap())
+            .unwrap();
+        st.sent
+            .lock()
+            .unwrap()
+            .push(String::from_utf8(raw).unwrap());
+        HttpResponse::Ok().json(json!({ "id": "sent-1", "labelIds": ["SENT"] }))
+    }
+
     async fn fake_gmail_watch(
         st: web::Data<FakeGoogle>,
         req: actix_web::HttpRequest,
@@ -855,6 +901,10 @@ mod tests {
                 .route(
                     "/gmail/v1/users/me/messages",
                     web::get().to(fake_gmail_list),
+                )
+                .route(
+                    "/gmail/v1/users/me/messages/send",
+                    web::post().to(fake_gmail_send),
                 )
                 .route(
                     "/gmail/v1/users/me/labels",
@@ -1073,7 +1123,8 @@ mod tests {
         }};
     }
 
-    const GMAIL_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
+    const GMAIL_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly \
+                               https://www.googleapis.com/auth/gmail.send";
 
     /// A signed-in JSON request with an empty `{}` body.
     macro_rules! req {
@@ -2446,6 +2497,131 @@ mod tests {
                 Some(chunk) => assert_eq!(chunk, ": ping\n\n"),
             }
         }
+    }
+
+    /// A signed-in `POST /api/mail/send`.
+    fn send_request(session: &str, body: &Value) -> test::TestRequest {
+        test::TestRequest::post()
+            .uri("/api/mail/send")
+            .insert_header(("cookie", session))
+            .set_json(body)
+    }
+
+    #[actix_web::test]
+    async fn compose_sends_from_the_callers_own_mailbox_only() {
+        // CASA 3.1.4: the request names one of the caller's mailboxes; the
+        // sender is that mailbox's address, never something from the request.
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let (_, stranger) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        let (_, accounts) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/accounts", &session)).await)
+                .await;
+        assert_eq!(accounts[0]["can_send"], true);
+        let draft = json!({
+            "account": accounts[0]["id"],
+            "to": ["ada@example.com"],
+            "cc": ["bob@example.org"],
+            "subject": "Lunch on Friday?",
+            "body": "Noon works for me.",
+        });
+
+        // Someone else's mailbox is a 404, like one that doesn't exist.
+        let resp = test::call_service(&app, send_request(&stranger, &draft).to_request()).await;
+        assert_eq!(resp.status(), 404);
+        assert!(fake.sent.lock().unwrap().is_empty());
+
+        let resp = test::call_service(&app, send_request(&session, &draft).to_request()).await;
+        assert_eq!(resp.status(), 204);
+        let sent = fake.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].starts_with(&format!(
+            "From: {sub}@example.com\r\nTo: ada@example.com\r\nCc: bob@example.org\r\n\
+             Subject: Lunch on Friday?\r\n"
+        )));
+
+        // A sender in the request is refused, not used (3.1.2).
+        let mut forged = draft.clone();
+        forged["from"] = json!("ceo@example.com");
+        let (status, _) =
+            json_body(test::call_service(&app, send_request(&session, &forged).to_request()).await)
+                .await;
+        assert_eq!(status, 400);
+        // So is anything that would add a header or a recipient (mail header injection).
+        let mut injected = draft.clone();
+        injected["to"] = json!(["ada@example.com\r\nBcc: spy@evil.example"]);
+        let (status, body) = json_body(
+            test::call_service(&app, send_request(&session, &injected).to_request()).await,
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(
+            body["error"],
+            "One of the addresses isn't a valid email address."
+        );
+        assert_eq!(fake.sent.lock().unwrap().len(), 1);
+    }
+
+    #[actix_web::test]
+    async fn compose_needs_the_send_permission_and_reports_gmail_failures_plainly() {
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let (_, session) = signed_in_user(&pool).await;
+        let app = test_app!(pool, google);
+        let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+
+        // The user left "send" unticked on Google's screen: linked, read-only.
+        let req = test::TestRequest::get()
+            .uri("/api/auth/gmail/connect")
+            .insert_header(("cookie", session.as_str()))
+            .to_request();
+        let (login_cookie, q) = read_login(test::call_service(&app, req).await, &fake);
+        *fake.sub.lock().unwrap() = sub.clone();
+        *fake.scope.lock().unwrap() =
+            Some("openid email https://www.googleapis.com/auth/gmail.readonly".into());
+        *fake.refresh_token.lock().unwrap() = Some(format!("refresh-for-{sub}"));
+        let resp =
+            test::call_service(&app, callback(&q["state"], &login_cookie).to_request()).await;
+        assert_eq!(location(&resp), "/?mail=linked");
+        let (_, accounts) =
+            json_body(test::call_service(&app, req!("GET", "/api/mail/accounts", &session)).await)
+                .await;
+        assert_eq!(accounts[0]["can_send"], false);
+        let draft = json!({
+            "account": accounts[0]["id"],
+            "to": ["ada@example.com"],
+            "subject": "Private subject",
+            "body": "Private text",
+        });
+        let (status, _) =
+            json_body(test::call_service(&app, send_request(&session, &draft).to_request()).await)
+                .await;
+        assert_eq!(status, 409);
+        assert!(fake.sent.lock().unwrap().is_empty());
+
+        // Reconnecting with it ticked allows sending.
+        link_mailbox!(app, fake, session.as_str(), sub.as_str());
+        let resp = test::call_service(&app, send_request(&session, &draft).to_request()).await;
+        assert_eq!(resp.status(), 204);
+
+        // Gmail refuses: a fixed message, with nothing of Gmail's answer or
+        // of the mail in it (6.2.1).
+        *fake.send_status.lock().unwrap() = Some(403);
+        let (status, body) =
+            json_body(test::call_service(&app, send_request(&session, &draft).to_request()).await)
+                .await;
+        assert_eq!(status, 502);
+        assert_eq!(
+            body,
+            json!({ "error": "Gmail refused to send from this mailbox. Reconnect it and allow sending." })
+        );
+        assert_eq!(fake.sent.lock().unwrap().len(), 1);
     }
 
     #[actix_web::test]

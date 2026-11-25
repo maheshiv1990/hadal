@@ -282,7 +282,23 @@ button.chip.more { padding: 0.2rem 0.6rem; color: var(--muted); }
 .reader { padding: 1.25rem 1.5rem 2rem; }
 .reader h2 { margin: 0 0 1rem; font-size: 1.375rem; font-weight: 500; }
 .reader-meta { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 1.25rem; }
+.reader-sender { display: flex; align-items: flex-start; gap: 0.75rem; min-width: 0; }
 .reader-people { min-width: 0; overflow-wrap: anywhere; }
+a.address-link { color: var(--accent); text-decoration: none; }
+a.address-link:hover { text-decoration: underline; }
+.avatar {
+  flex-shrink: 0; width: 2.5rem; height: 2.5rem; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 1.1rem; font-weight: 600; line-height: 1; user-select: none;
+}
+.avatar-0 { background: #b3472d; }
+.avatar-1 { background: #1d6fb8; }
+.avatar-2 { background: #2e7d4f; }
+.avatar-3 { background: #7b4bb3; }
+.avatar-4 { background: #b0356b; }
+.avatar-5 { background: #9a6700; }
+.avatar-6 { background: #0f7b8a; }
+.avatar-7 { background: #5b6472; }
 .reader-meta time { white-space: nowrap; }
 .reader pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 0.95rem; line-height: 1.6; }
 
@@ -330,3 +346,26 @@ a.header-link[aria-current='page'] { border-color: var(--accent); color: var(--a
 .sign-in-account { font-size: 0.8rem; white-space: nowrap; }
 .settings-card p.muted { margin: 0 0 0.75rem; }
 .settings-card button.sign-out { color: var(--danger); border-color: var(--border); }
+
+/* New message */
+button.compose-button { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.3rem 0.8rem; font-size: 0.9rem; }
+button.compose-button .folder-icon { stroke: currentColor; }
+.compose { display: flex; flex-direction: column; gap: 0.75rem; padding: 1rem 1.25rem 1.25rem; max-width: 760px; }
+.compose h2 { margin: 0; font-size: 1.15rem; }
+.compose p { margin: 0; }
+.compose label { display: grid; grid-template-columns: 4.5rem minmax(0, 1fr); align-items: center; gap: 0.5rem; font-size: 0.875rem; }
+.compose label > span { color: var(--muted); }
+.compose label.compose-body { align-items: start; }
+.compose label.compose-body > span { padding-top: 0.55rem; }
+.compose textarea { resize: vertical; min-height: 12rem; line-height: 1.45; }
+.compose select {
+  font: inherit; padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: 6px;
+  background: transparent; color: inherit;
+}
+.compose input:disabled { color: var(--muted); background: color-mix(in srgb, var(--fg) 4%, transparent); }
+.compose button.compose-copies { align-self: flex-start; margin-left: 5rem; font-size: 0.875rem; }
+.compose-actions { display: flex; align-items: center; gap: 0.5rem; margin-left: 5rem; }
+@media (max-width: 640px) {
+  .compose label { grid-template-columns: 1fr; gap: 0.25rem; }
+  .compose button.compose-copies, .compose-actions { margin-left: 0; }
+}
