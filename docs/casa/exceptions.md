@@ -89,7 +89,9 @@ Scanner ignores:
   session scope. An event carries only the changed mailbox's ID; the page
   reloads its data through the usual owner-scoped endpoints. Each stream
   re-checks its session every 20 s *without* sliding the idle window, so an
-  open tab neither keeps a session alive nor outlives a logout. At most 5
+  open tab neither keeps a session alive nor outlives a logout. Opening (or
+  reopening) a stream needs a live session but doesn't slide the window
+  either. At most 5
   streams per user (one more ends that user's oldest, so reloading a page
   never locks its owner out) and 2,000 in all (then 429).
 - **Google tokens are not stored.** Sign-in requests only `openid email profile`

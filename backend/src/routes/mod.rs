@@ -490,6 +490,9 @@ mod tests {
         labels: Mutex<Vec<Value>>,
         /// How many upcoming message-list calls answer 403 rateLimitExceeded.
         rate_limited: Mutex<u32>,
+        /// The signing-key endpoint answers 503, and how often it was asked.
+        certs_down: Mutex<bool>,
+        certs_calls: Mutex<u32>,
         /// Messages whose fetch answers 403 rateLimitExceeded, every time.
         rate_limited_messages: Mutex<Vec<String>>,
         /// The mailbox's history ID now, and its change records (each with
@@ -827,7 +830,11 @@ mod tests {
         HttpResponse::NoContent().finish()
     }
 
-    async fn fake_certs() -> HttpResponse {
+    async fn fake_certs(st: web::Data<FakeGoogle>) -> HttpResponse {
+        *st.certs_calls.lock().unwrap() += 1;
+        if *st.certs_down.lock().unwrap() {
+            return HttpResponse::ServiceUnavailable().finish();
+        }
         HttpResponse::Ok().json(crate::auth::google::tests::test_jwks())
     }
 
@@ -2439,6 +2446,74 @@ mod tests {
                 Some(chunk) => assert_eq!(chunk, ": ping\n\n"),
             }
         }
+    }
+
+    #[actix_web::test]
+    async fn opening_the_live_stream_does_not_count_as_activity() {
+        // CASA 2.2.x: the browser reopens a dropped stream by itself, so
+        // that must not keep an unattended session from going idle.
+        let pool = test_db().await;
+        let app = test_app!(pool);
+        let (user, session) = signed_in_user(&pool).await;
+        let set_last_seen = |minutes: i32| {
+            sqlx::query(
+                "UPDATE sessions SET last_seen_at = now() - make_interval(mins => $2)
+                  WHERE user_id = $1",
+            )
+            .bind(user)
+            .bind(minutes)
+            .execute(pool.get_ref())
+        };
+        let idle_minutes = || async {
+            sqlx::query_scalar::<_, f64>(
+                "SELECT (extract(epoch FROM now() - last_seen_at) / 60)::float8
+                   FROM sessions WHERE user_id = $1",
+            )
+            .bind(user)
+            .fetch_one(pool.get_ref())
+            .await
+            .unwrap()
+        };
+        set_last_seen(20).await.unwrap();
+        let resp = test::call_service(&app, req!("GET", "/api/mail/events", &session)).await;
+        assert_eq!(resp.status(), 200);
+        assert!(
+            idle_minutes().await > 19.0,
+            "the stream slid the idle window"
+        );
+        // Any other request is the user being there.
+        let resp = test::call_service(&app, req!("GET", "/api/auth/me", &session)).await;
+        assert_eq!(resp.status(), 200);
+        assert!(idle_minutes().await < 1.0);
+        // Idle for longer than allowed (30 minutes): no stream either.
+        set_last_seen(31).await.unwrap();
+        let resp = test::call_service(&app, req!("GET", "/api/mail/events", &session)).await;
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[actix_web::test]
+    async fn googles_signing_keys_are_asked_for_once_while_google_is_down() {
+        // CASA 1.1.1 / 5.1.5: the push endpoint is public, so requests to it
+        // must not be able to make the backend call Google each time.
+        use crate::auth::google::tests::push_token;
+        use crate::auth::google::{PushExpectation, PushRejected};
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let config = crate::config::tests::test_push_config();
+        let expect = PushExpectation {
+            audience: &config.audience,
+            service_account: &config.service_account,
+        };
+        let token = push_token(time::OffsetDateTime::now_utc().unix_timestamp());
+        *fake.certs_down.lock().unwrap() = true;
+        for _ in 0..5 {
+            let refused = google.verify_push_token(&token, &expect).await;
+            assert!(
+                matches!(refused, Err(PushRejected::KeysUnavailable(_))),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(*fake.certs_calls.lock().unwrap(), 1);
     }
 
     #[actix_web::test]

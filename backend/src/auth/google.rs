@@ -60,8 +60,9 @@ const MAX_HISTORY_ID_DIGITS: usize = 20;
 /// How long Google's signing keys are kept before they are fetched again.
 const KEYS_TTL: Duration = Duration::from_secs(60 * 60);
 /// A token signed with a key we don't have makes us fetch the keys again
-/// (Google rotates them), but at most this often: forged key IDs can't make
-/// us call Google on every request.
+/// (Google rotates them), but at most this often, whether the last fetch
+/// worked or not: neither forged key IDs nor an outage at Google can make us
+/// call Google on every request.
 const KEYS_REFETCH_GAP: Duration = Duration::from_secs(60);
 
 /// Why a Google authorization was started.
@@ -381,7 +382,20 @@ pub struct SigningKey {
 #[derive(Default)]
 struct KeyCache {
     keys: HashMap<String, SigningKey>,
+    /// When `keys` were fetched.
     fetched: Option<Instant>,
+    /// When a fetch was last started, whether or not it worked.
+    tried: Option<Instant>,
+}
+
+/// Why `cached_key` has no key to give.
+enum KeyMiss {
+    /// Time to ask Google for its keys.
+    Fetch,
+    /// Asked moments ago; the keys we have are current and don't include it.
+    Unknown,
+    /// Asked moments ago and have no current keys: Google didn't answer.
+    Unavailable,
 }
 
 /// A URL on Google's authorization endpoint. The field is private, so the only
@@ -1003,16 +1017,19 @@ impl GoogleClient {
         expect: &PushExpectation<'_>,
     ) -> Result<(), PushRejected> {
         let kid = token_key_id(token)?;
-        let key = match self.cached_key(&kid) {
+        let unavailable = || PushRejected::KeysUnavailable("no recent answer from Google".into());
+        let key = match self.cached_key(&kid, true) {
             Ok(key) => key,
-            Err(refetch) => {
-                if refetch {
-                    let keys = self.fetch_keys().await?;
-                    let mut cache = self.keys.lock().map_err(|_| PushRejected::UnknownKey)?;
+            Err(KeyMiss::Unknown) => return Err(PushRejected::UnknownKey),
+            Err(KeyMiss::Unavailable) => return Err(unavailable()),
+            Err(KeyMiss::Fetch) => {
+                let keys = self.fetch_keys().await?;
+                {
+                    let mut cache = self.keys.lock().map_err(|_| unavailable())?;
                     cache.keys = keys;
                     cache.fetched = Some(Instant::now());
                 }
-                self.cached_key(&kid)
+                self.cached_key(&kid, false)
                     .map_err(|_| PushRejected::UnknownKey)?
             }
         };
@@ -1020,18 +1037,27 @@ impl GoogleClient {
         verify_push_jwt(token, &kid, &key, expect, now)
     }
 
-    /// The cached key `kid`, or whether the keys should be fetched (they are
-    /// stale, or `kid` is new and the last fetch wasn't just now).
-    fn cached_key(&self, kid: &str) -> Result<SigningKey, bool> {
-        let Ok(cache) = self.keys.lock() else {
-            return Err(false);
+    /// The cached key `kid`, or why there is none. With `may_fetch`, a miss
+    /// when no fetch was started in the last `KEYS_REFETCH_GAP` is
+    /// `KeyMiss::Fetch`, and counts as starting one: the caller fetches, and
+    /// requests arriving meanwhile don't.
+    fn cached_key(&self, kid: &str, may_fetch: bool) -> Result<SigningKey, KeyMiss> {
+        let Ok(mut cache) = self.keys.lock() else {
+            return Err(KeyMiss::Unavailable);
         };
-        let age = cache.fetched.map(|t| t.elapsed());
-        let fresh = age.is_some_and(|a| a < KEYS_TTL);
-        match cache.keys.get(kid) {
-            Some(key) if fresh => Ok(key.clone()),
-            _ => Err(!fresh || age.is_none_or(|a| a >= KEYS_REFETCH_GAP)),
+        let fresh = cache.fetched.is_some_and(|t| t.elapsed() < KEYS_TTL);
+        if fresh && let Some(key) = cache.keys.get(kid) {
+            return Ok(key.clone());
         }
+        if may_fetch && cache.tried.is_none_or(|t| t.elapsed() >= KEYS_REFETCH_GAP) {
+            cache.tried = Some(Instant::now());
+            return Err(KeyMiss::Fetch);
+        }
+        Err(if fresh {
+            KeyMiss::Unknown
+        } else {
+            KeyMiss::Unavailable
+        })
     }
 
     async fn fetch_keys(&self) -> Result<HashMap<String, SigningKey>, PushRejected> {

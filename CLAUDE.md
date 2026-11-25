@@ -48,7 +48,11 @@ Frontend (SolidJS):
 Auth (Google OAuth Authorization Code + PKCE, opaque server-side sessions) lives in
 `backend/src/auth/`. Keep it that way:
 - New API routes go inside a scope wrapped in `auth::require_session` and take
-  `AuthUser`. Only `/api/health` and the sign-in/register endpoints are public (3.1.1).
+  `AuthUser`. Only `/api/health`, the sign-in/register endpoints and
+  `POST /api/gmail/push` are public (3.1.1). The push route is for Google Cloud
+  Pub/Sub: it lets a request in only with a Google-signed token for our
+  subscription (`GoogleClient::verify_push_token`), and is a 404 unless
+  `GMAIL_PUSH_*` is set.
 - Every query on user data is scoped by `owner_id = user.user_id`; never trust an id or
   owner from the request (3.1.4, lint:notes-owner-scope). Return 404 for others' rows.
 - Cookies only via `auth::cookies::SetCookie` (lint:set-cookie-outside-helper).
