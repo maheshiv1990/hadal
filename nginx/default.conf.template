@@ -114,6 +114,9 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        # Also covers the live-update stream (/api/mail/events): the backend
+        # sends a ping every 20 s and `X-Accel-Buffering: no`, so it stays
+        # open and unbuffered under this timeout.
         proxy_read_timeout 30s;
 
         # nginx-generated errors (backend down) still need hardening headers.

@@ -18,6 +18,7 @@ Scanner ignores:
 | Location | Scanner | Reason |
 | --- | --- | --- |
 | `scripts/test_casa_check.py` (`hardcoded-secret` self-test case) | gitleaks (`# gitleaks:allow`) | The value `GOCSPX-abcdefgh123` is a fake sample that proves the `hardcoded-secret` rule fires. It is not a real credential and is never used at runtime. |
+| `backend/src/auth/testdata/push_signer.pk8` | none needed (binary DER, not PEM) | A 2048-bit RSA key generated for the tests only. It stands in for Google's signing key so the push-token checks are tested with real RS256 signatures. It is loaded with `include_bytes!` inside `#[cfg(test)]` only, signs nothing outside the tests, and its public half is never trusted by the running app, which only accepts keys fetched from Google. |
 
 ## Dependency policy (`backend/deny.toml`)
 
@@ -61,7 +62,38 @@ Scanner ignores:
   signature in that case. Every claim is still validated (iss, aud/azp, exp, iat,
   nonce, email_verified). If ID tokens are ever accepted from any other source
   (the browser, another service), signature verification against Google's JWKS
-  becomes mandatory.
+  becomes mandatory. That is the case for Gmail push (next item), which does
+  verify signatures.
+- **`POST /api/gmail/push` has no session (Gmail push, off unless
+  `GMAIL_PUSH_*` is set).** Google's Cloud Pub/Sub calls it, so a session
+  can't protect it. A Google-signed token does: RS256 only (`none` and HMAC
+  are refused), checked with `ring` against Google's published keys
+  (fetched from a fixed URL, cached for an hour, refetched for an unknown
+  key ID at most once a minute), with `iss` Google, `aud` our exact push URL,
+  `email` our subscription's service account and verified, and `exp`/`iat`
+  current. Any failure is a 401 and the body isn't read. A valid notification
+  only names a Gmail address; the lookup by that address
+  (`mail::watched_mailboxes`) is the one mail query not keyed by a signed-in
+  user, and it returns rows with their stored owner, which scopes everything
+  after it. The notification's history ID is ignored: each sync reads from
+  the point it stored. Replaying a genuine notification only triggers a
+  sync that finds nothing new. Rate limiting is the global per-IP limit;
+  Pub/Sub retries a 429 with backoff.
+- **Push sync runs without a request.** Watches are only kept for users who
+  signed in within `GMAIL_PUSH_ACTIVE_DAYS` (default 7): mail isn't pulled
+  in for people who stopped using Hadal, and their watches are stopped at
+  Google. One Gmail address linked by two Hadal users is synced separately
+  for each, and its watch is only stopped when neither still wants it.
+  Messages trashed in Gmail are deleted from Hadal at the next sync.
+- **Live updates (`GET /api/mail/events`, Server-Sent Events).** Inside the
+  session scope. An event carries only the changed mailbox's ID; the page
+  reloads its data through the usual owner-scoped endpoints. Each stream
+  re-checks its session every 20 s *without* sliding the idle window, so an
+  open tab neither keeps a session alive nor outlives a logout. Opening (or
+  reopening) a stream needs a live session but doesn't slide the window
+  either. At most 5
+  streams per user (one more ends that user's oldest, so reloading a page
+  never locks its owner out) and 2,000 in all (then 429).
 - **Google tokens are not stored.** Sign-in requests only `openid email profile`
   (non-sensitive: the name is stored as first/last name, nothing else), and
   Google's access and refresh tokens are dropped after the exchange. When

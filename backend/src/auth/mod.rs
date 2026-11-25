@@ -555,6 +555,12 @@ fn deny<B>(req: ServiceRequest, err: AppError) -> ServiceResponse<EitherBody<B>>
         .map_into_right_body()
 }
 
+/// The live-update stream. The page opens it by itself and the browser
+/// reopens it whenever it drops, so a request for it needs a live session
+/// like any other but doesn't count as activity: otherwise a tab left open
+/// would keep its session from ever going idle.
+const PASSIVE_PATH: &str = "/api/mail/events";
+
 /// Middleware for every authenticated route: no valid session, no access
 /// (CASA 3.1.1). Fails closed when misconfigured or when the database errors
 /// (CASA 3.1.3).
@@ -572,7 +578,12 @@ pub async fn require_session(
     let Some(token) = cookies::read(req.headers(), SESSION_COOKIE) else {
         return Ok(deny(req, AppError::Unauthorized));
     };
-    match session::resolve(&pool, &token, cfg.idle_secs).await {
+    let found = if req.path() == PASSIVE_PATH {
+        session::peek(&pool, &token, cfg.idle_secs).await
+    } else {
+        session::resolve(&pool, &token, cfg.idle_secs).await
+    };
+    match found {
         Ok(Some(user)) => {
             req.extensions_mut().insert(user);
         }

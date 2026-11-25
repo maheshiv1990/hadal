@@ -2,7 +2,9 @@ mod auth;
 mod config;
 mod crypto;
 mod error;
+mod events;
 mod mail;
+mod push;
 mod routes;
 mod security;
 #[cfg(test)]
@@ -100,9 +102,26 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let google = auth::google::GoogleClient::new(&config.oauth)
-        .context("failed to build the Google sign-in client")?;
-    let cipher = crypto::DataCipher::from_base64(config.data_encryption_key.expose())?;
+    let google = web::Data::new(
+        auth::google::GoogleClient::new(&config.oauth)
+            .context("failed to build the Google sign-in client")?,
+    );
+    let cipher = web::Data::new(crypto::DataCipher::from_base64(
+        config.data_encryption_key.expose(),
+    )?);
+    let events = web::Data::new(events::MailEvents::default());
+
+    // Gmail push notifications, when configured (GMAIL_PUSH_*).
+    let push = config.gmail_push.clone().map(|push_config| {
+        let syncer = push::Syncer {
+            pool: pool.clone(),
+            google: google.clone().into_inner(),
+            cipher: cipher.clone().into_inner(),
+            events: events.get_ref().clone(),
+        };
+        web::Data::new(push::start(syncer, push_config))
+    });
+    tracing::info!(enabled = push.is_some(), "Gmail push notifications");
 
     tracing::info!(host = %config.host, port = config.port, "starting server");
 
@@ -110,8 +129,6 @@ async fn main() -> anyhow::Result<()> {
     let limiter = web::Data::new(limiter);
     let auth_limiter = web::Data::new(auth_limiter);
     let account_limiter = web::Data::new(account_limiter);
-    let google = web::Data::new(google);
-    let cipher = web::Data::new(cipher);
     let session_config = web::Data::new(config.session.clone());
     let password_auth = web::Data::new(auth::PasswordAuth(config.password_auth_enabled));
     tracing::info!(
@@ -119,8 +136,11 @@ async fn main() -> anyhow::Result<()> {
         "local email sign-in accounts"
     );
     HttpServer::new(move || {
-        App::new()
-            .app_data(pool.clone())
+        let mut app = App::new();
+        if let Some(push) = &push {
+            app = app.app_data(push.clone());
+        }
+        app.app_data(pool.clone())
             .app_data(limiter.clone())
             .app_data(auth_limiter.clone())
             .app_data(account_limiter.clone())
@@ -128,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
             .app_data(cipher.clone())
             .app_data(session_config.clone())
             .app_data(password_auth.clone())
+            .app_data(events.clone())
             // Order: last `wrap` runs first. Headers wrap everything, including 429s.
             .wrap(middleware::from_fn(security::rate_limit))
             .wrap(TracingLogger::default())

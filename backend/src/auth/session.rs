@@ -53,6 +53,49 @@ pub async fn resolve(
     Ok(user_id.map(|user_id| AuthUser { user_id }))
 }
 
+/// Like `resolve`, but *without* sliding the idle window, for requests the
+/// page makes by itself (opening the live-update stream): they must not
+/// count as the user being active (CASA 2.2.x).
+pub async fn peek(
+    pool: &PgPool,
+    token: &str,
+    idle_secs: u32,
+) -> Result<Option<AuthUser>, AppError> {
+    let user_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT user_id FROM sessions
+          WHERE token_hash = $1
+            AND expires_at > now()
+            AND last_seen_at > now() - make_interval(secs => $2)",
+    )
+    .bind(digest(token))
+    .bind(f64::from(idle_secs))
+    .fetch_optional(pool)
+    .await?;
+    Ok(user_id.map(|user_id| AuthUser { user_id }))
+}
+
+/// The stored form of a session token: what `is_live` takes, so a
+/// long-running task needn't keep the token itself.
+pub fn token_hash(token: &str) -> Vec<u8> {
+    digest(token)
+}
+
+/// Whether the session with this token hash is still live, *without*
+/// sliding its idle window: a page left open doesn't keep a session alive
+/// by itself (an open event stream checks this).
+pub async fn is_live(pool: &PgPool, token_hash: &[u8], idle_secs: u32) -> Result<bool, AppError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM sessions
+          WHERE token_hash = $1
+            AND expires_at > now()
+            AND last_seen_at > now() - make_interval(secs => $2))",
+    )
+    .bind(token_hash)
+    .bind(f64::from(idle_secs))
+    .fetch_one(pool)
+    .await?)
+}
+
 /// Ends a session (logout). Unknown tokens are ignored.
 pub async fn revoke(pool: &PgPool, token: &str) -> Result<(), AppError> {
     sqlx::query("DELETE FROM sessions WHERE token_hash = $1")

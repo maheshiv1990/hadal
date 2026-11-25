@@ -65,6 +65,31 @@ pub async fn signed_in_user(pool: &PgPool) -> (Uuid, String) {
     (id, format!("{SESSION_COOKIE}={token}"))
 }
 
+/// The live-update hub every test app shares. Streams are per user, and
+/// each test makes its own users, so tests can't see each other's events.
+pub fn test_events() -> crate::events::MailEvents {
+    static EVENTS: std::sync::OnceLock<crate::events::MailEvents> = std::sync::OnceLock::new();
+    EVENTS.get_or_init(Default::default).clone()
+}
+
+/// The Google client as app data, from the client itself or an `Arc` the
+/// test also uses directly.
+pub trait IntoGoogleData {
+    fn into_data(self) -> web::Data<crate::auth::google::GoogleClient>;
+}
+
+impl IntoGoogleData for crate::auth::google::GoogleClient {
+    fn into_data(self) -> web::Data<crate::auth::google::GoogleClient> {
+        web::Data::new(self)
+    }
+}
+
+impl IntoGoogleData for std::sync::Arc<crate::auth::google::GoogleClient> {
+    fn into_data(self) -> web::Data<crate::auth::google::GoogleClient> {
+        web::Data::from(self)
+    }
+}
+
 /// Full API app with generous rate limits, wired like `main.rs`.
 macro_rules! test_app {
     ($pool:expr) => {
@@ -100,9 +125,12 @@ macro_rules! test_app {
                 ))
                 // The password tests need the routes; production has them off.
                 .app_data(actix_web::web::Data::new($crate::auth::PasswordAuth(true)))
-                .app_data(actix_web::web::Data::new($google))
+                .app_data($crate::test_support::IntoGoogleData::into_data($google))
                 .app_data(actix_web::web::Data::new(
                     $crate::crypto::tests::test_cipher(),
+                ))
+                .app_data(actix_web::web::Data::new(
+                    $crate::test_support::test_events(),
                 ))
                 .configure($crate::routes::configure),
         )

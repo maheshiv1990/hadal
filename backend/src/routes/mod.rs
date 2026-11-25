@@ -5,6 +5,7 @@ use crate::error::AppError;
 
 mod health;
 mod mail;
+mod push;
 
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.app_data(
@@ -30,12 +31,17 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             // Public: health check and the sign-in endpoints.
             .service(health::health)
             .configure(auth::configure)
+            // Called by Google's Pub/Sub, not a browser: no session, but
+            // only requests with a token Google signed for our
+            // subscription get past the handler's first lines (routes/push.rs).
+            .service(web::scope("/gmail").service(push::push))
             // Everything else needs a session (deny by default, CASA 3.1.1).
             .service(
                 web::scope("/mail")
                     .wrap(from_fn(auth::require_session))
                     .service(mail::accounts)
                     .service(mail::disconnect)
+                    .service(mail::live_events)
                     // Each import makes up to ~100 Google calls per mailbox,
                     // so it gets the tight per-IP limit too.
                     .service(
@@ -123,6 +129,7 @@ mod tests {
             ("POST", "/api/mail/import".to_owned()),
             ("GET", "/api/mail/messages".to_owned()),
             ("GET", format!("/api/mail/messages/{id}")),
+            ("GET", "/api/mail/events".to_owned()),
         ] {
             for cookie in [None, Some(format!("{SESSION_COOKIE}=not-a-real-token"))] {
                 let mut req = test::TestRequest::default()
@@ -483,8 +490,30 @@ mod tests {
         labels: Mutex<Vec<Value>>,
         /// How many upcoming message-list calls answer 403 rateLimitExceeded.
         rate_limited: Mutex<u32>,
+        /// The signing-key endpoint answers 503, and how often it was asked.
+        certs_down: Mutex<bool>,
+        certs_calls: Mutex<u32>,
         /// Messages whose fetch answers 403 rateLimitExceeded, every time.
         rate_limited_messages: Mutex<Vec<String>>,
+        /// The mailbox's history ID now, and its change records (each with
+        /// its own `id`), oldest first.
+        history_id: Mutex<u64>,
+        history: Mutex<Vec<Value>>,
+        /// `users.history.list` answers 404: the start is too old.
+        history_gone: Mutex<bool>,
+        watches: Mutex<u32>,
+        stops: Mutex<u32>,
+    }
+
+    impl FakeGoogle {
+        /// Records a change in the mailbox's history, like Gmail does.
+        fn record(&self, change: Value) {
+            let mut id = self.history_id.lock().unwrap();
+            *id += 1;
+            let mut change = change;
+            change["id"] = json!(id.to_string());
+            self.history.lock().unwrap().push(change);
+        }
     }
 
     fn rate_limit_exceeded() -> HttpResponse {
@@ -718,7 +747,95 @@ mod tests {
             return HttpResponse::Unauthorized().finish();
         }
         let total = st.messages.lock().unwrap().len();
-        HttpResponse::Ok().json(json!({ "emailAddress": "x@example.com", "messagesTotal": total }))
+        let history_id = st.history_id.lock().unwrap().to_string();
+        HttpResponse::Ok().json(json!({
+            "emailAddress": "x@example.com", "messagesTotal": total, "historyId": history_id,
+        }))
+    }
+
+    /// `users.history.list`: the records after `startHistoryId`, one page.
+    async fn fake_gmail_history(
+        st: web::Data<FakeGoogle>,
+        req: actix_web::HttpRequest,
+        q: web::Query<Vec<(String, String)>>,
+    ) -> HttpResponse {
+        if !bearer_ok(&req) {
+            return HttpResponse::Unauthorized().finish();
+        }
+        if *st.history_gone.lock().unwrap() {
+            return HttpResponse::NotFound()
+                .json(json!({"error": {"code": 404, "status": "NOT_FOUND"}}));
+        }
+        let start: u64 = q
+            .iter()
+            .find(|(k, _)| k == "startHistoryId")
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
+        let types: Vec<&str> = q
+            .iter()
+            .filter(|(k, _)| k == "historyTypes")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "messageAdded",
+                "messageDeleted",
+                "labelAdded",
+                "labelRemoved"
+            ]
+        );
+        let records: Vec<Value> = st
+            .history
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["id"].as_str().unwrap().parse::<u64>().unwrap() > start)
+            .cloned()
+            .collect();
+        let history_id = st.history_id.lock().unwrap().to_string();
+        if records.is_empty() {
+            return HttpResponse::Ok().json(json!({ "historyId": history_id }));
+        }
+        HttpResponse::Ok().json(json!({ "history": records, "historyId": history_id }))
+    }
+
+    async fn fake_gmail_watch(
+        st: web::Data<FakeGoogle>,
+        req: actix_web::HttpRequest,
+        body: web::Json<Value>,
+    ) -> HttpResponse {
+        if !bearer_ok(&req) {
+            return HttpResponse::Unauthorized().finish();
+        }
+        assert_eq!(body["topicName"], "projects/hadal-test/topics/gmail");
+        *st.watches.lock().unwrap() += 1;
+        let week = time::OffsetDateTime::now_utc() + time::Duration::days(7);
+        HttpResponse::Ok().json(json!({
+            "historyId": st.history_id.lock().unwrap().to_string(),
+            "expiration": (week.unix_timestamp() * 1000).to_string(),
+        }))
+    }
+
+    async fn fake_gmail_stop(
+        st: web::Data<FakeGoogle>,
+        req: actix_web::HttpRequest,
+    ) -> HttpResponse {
+        if !bearer_ok(&req) {
+            return HttpResponse::Unauthorized().finish();
+        }
+        *st.stops.lock().unwrap() += 1;
+        HttpResponse::NoContent().finish()
+    }
+
+    async fn fake_certs(st: web::Data<FakeGoogle>) -> HttpResponse {
+        *st.certs_calls.lock().unwrap() += 1;
+        if *st.certs_down.lock().unwrap() {
+            return HttpResponse::ServiceUnavailable().finish();
+        }
+        HttpResponse::Ok().json(crate::auth::google::tests::test_jwks())
     }
 
     async fn start_fake_google(st: Arc<FakeGoogle>) -> GoogleClient {
@@ -728,6 +845,13 @@ mod tests {
                 .app_data(data.clone())
                 .route("/token", web::post().to(fake_token_endpoint))
                 .route("/revoke", web::post().to(fake_revoke))
+                .route("/certs", web::get().to(fake_certs))
+                .route(
+                    "/gmail/v1/users/me/history",
+                    web::get().to(fake_gmail_history),
+                )
+                .route("/gmail/v1/users/me/watch", web::post().to(fake_gmail_watch))
+                .route("/gmail/v1/users/me/stop", web::post().to(fake_gmail_stop))
                 .route(
                     "/gmail/v1/users/me/messages",
                     web::get().to(fake_gmail_list),
@@ -1826,8 +1950,21 @@ mod tests {
         assert_eq!(body["accounts"][0]["error"], Value::Null, "{body}");
         assert_eq!(body["accounts"][0]["remaining"], true);
 
-        // Once Gmail lets up, the next round picks up where it stopped.
+        // For the next minute the mailbox is left alone, however often the
+        // page asks (a reload, say): no error, and nothing fetched.
         fake.rate_limited_messages.lock().unwrap().clear();
+        let (status, body) = import().await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["imported"], 0);
+        assert_eq!(body["accounts"][0]["error"], Value::Null, "{body}");
+        assert_eq!(body["accounts"][0]["remaining"], true);
+
+        // After that, the next round picks up where it stopped.
+        sqlx::query("UPDATE mail_accounts SET import_retry_at = now() WHERE google_sub = $1")
+            .bind(&sub)
+            .execute(pool.get_ref())
+            .await
+            .unwrap();
         let (_, body) = import().await;
         assert_eq!(body["imported"], 30);
         assert_eq!(body["accounts"][0]["error"], Value::Null);
@@ -1902,6 +2039,512 @@ mod tests {
                 .status(),
             404
         );
+    }
+
+    // ---- Gmail push notifications ------------------------------------------
+
+    /// The fake mailbox `sub` linked to a new user and imported once.
+    /// Returns the user's session, the mailbox and its owner.
+    macro_rules! imported_mailbox {
+        ($app:expr, $pool:expr, $fake:expr, $messages:expr) => {{
+            let (owner, session) = signed_in_user(&$pool).await;
+            let sub = format!("mailbox-{}", uuid::Uuid::new_v4());
+            link_mailbox!($app, $fake, session.as_str(), sub.as_str());
+            *$fake.messages.lock().unwrap() = $messages;
+            *$fake.history_id.lock().unwrap() = 100;
+            let resp = test::call_service(&$app, req!("POST", "/api/mail/import", &session)).await;
+            assert_eq!(resp.status(), 200);
+            let account: uuid::Uuid =
+                sqlx::query_scalar("SELECT id FROM mail_accounts WHERE owner_id = $1")
+                    .bind(owner)
+                    .fetch_one($pool.get_ref())
+                    .await
+                    .unwrap();
+            (session, crate::mail::MailboxRef { account, owner }, sub)
+        }};
+    }
+
+    async fn stored_mail(
+        pool: &sqlx::PgPool,
+        m: crate::mail::MailboxRef,
+    ) -> Vec<(String, Vec<String>)> {
+        sqlx::query_as(
+            "SELECT gmail_id, labels FROM mail_messages
+              WHERE owner_id = $1 AND account_id = $2 ORDER BY gmail_id",
+        )
+        .bind(m.owner)
+        .bind(m.account)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn history_id(pool: &sqlx::PgPool, m: crate::mail::MailboxRef) -> Option<String> {
+        sqlx::query_scalar("SELECT history_id FROM mail_accounts WHERE id = $1 AND owner_id = $2")
+            .bind(m.account)
+            .bind(m.owner)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn sync(
+        pool: &web::Data<sqlx::PgPool>,
+        google: &Arc<GoogleClient>,
+        m: crate::mail::MailboxRef,
+    ) -> crate::mail::Synced {
+        crate::mail::sync_account(
+            pool.get_ref(),
+            google.clone(),
+            Arc::new(crate::crypto::tests::test_cipher()),
+            m.owner,
+            m.account,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[actix_web::test]
+    async fn push_sync_applies_gmails_history_to_the_stored_mail() {
+        use crate::mail::{Synced, tests::gmail_message};
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = Arc::new(start_fake_google(fake.clone()).await);
+        let app = test_app!(pool, google.clone());
+        let messages = ["a0", "a1", "a2"]
+            .iter()
+            .map(|id| gmail_message(id, "Hello", "Body"))
+            .collect();
+        let (_, mailbox, _) = imported_mailbox!(app, pool, fake, messages);
+        // The import recorded where history starts.
+        assert_eq!(history_id(&pool, mailbox).await.as_deref(), Some("100"));
+        assert_eq!(sync(&pool, &google, mailbox).await, Synced::Unchanged);
+
+        // In Gmail: new mail, a star, a read mark, a delete and a trashing.
+        fake.messages
+            .lock()
+            .unwrap()
+            .insert(0, gmail_message("n1", "New", "Fresh"));
+        fake.record(json!({"messagesAdded": [{"message": {"id": "n1"}}]}));
+        fake.record(json!({"labelsAdded": [{"message": {"id": "a0"}, "labelIds": ["STARRED"]}]}));
+        fake.record(json!({"labelsRemoved": [{"message": {"id": "a0"}, "labelIds": ["UNREAD"]}]}));
+        fake.record(json!({"messagesDeleted": [{"message": {"id": "a1"}}]}));
+        fake.record(json!({"labelsAdded": [{"message": {"id": "a2"}, "labelIds": ["TRASH"]}]}));
+        let fetched = *fake.message_fetches.lock().unwrap();
+
+        assert_eq!(sync(&pool, &google, mailbox).await, Synced::Changed);
+        let inbox = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            stored_mail(&pool, mailbox).await,
+            vec![
+                ("a0".to_owned(), inbox(&["INBOX", "STARRED"])),
+                ("n1".to_owned(), inbox(&["INBOX", "UNREAD"])),
+            ]
+        );
+        assert_eq!(
+            *fake.message_fetches.lock().unwrap(),
+            fetched + 1,
+            "only the new mail"
+        );
+        assert_eq!(history_id(&pool, mailbox).await.as_deref(), Some("105"));
+        // Read again from there: nothing new.
+        assert_eq!(sync(&pool, &google, mailbox).await, Synced::Unchanged);
+    }
+
+    #[actix_web::test]
+    async fn push_sync_imports_when_gmails_history_is_too_old() {
+        use crate::mail::{Synced, tests::gmail_message};
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = Arc::new(start_fake_google(fake.clone()).await);
+        let app = test_app!(pool, google.clone());
+        let (_, mailbox, _) =
+            imported_mailbox!(app, pool, fake, vec![gmail_message("a0", "s", "b")]);
+        fake.messages
+            .lock()
+            .unwrap()
+            .insert(0, gmail_message("n1", "New", "Fresh"));
+        *fake.history_id.lock().unwrap() = 500;
+        *fake.history_gone.lock().unwrap() = true;
+
+        assert_eq!(sync(&pool, &google, mailbox).await, Synced::Changed);
+        let ids: Vec<String> = stored_mail(&pool, mailbox)
+            .await
+            .into_iter()
+            .map(|m| m.0)
+            .collect();
+        assert_eq!(ids, ["a0", "n1"]);
+        assert_eq!(history_id(&pool, mailbox).await.as_deref(), Some("500"));
+    }
+
+    #[actix_web::test]
+    async fn push_sync_waits_for_a_running_import() {
+        use crate::mail::{Synced, tests::gmail_message};
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = Arc::new(start_fake_google(fake.clone()).await);
+        let app = test_app!(pool, google.clone());
+        let (_, mailbox, _) =
+            imported_mailbox!(app, pool, fake, vec![gmail_message("a0", "s", "b")]);
+        sqlx::query(
+            "UPDATE mail_accounts SET import_started_at = now() WHERE id = $1 AND owner_id = $2",
+        )
+        .bind(mailbox.account)
+        .bind(mailbox.owner)
+        .execute(pool.get_ref())
+        .await
+        .unwrap();
+        assert_eq!(sync(&pool, &google, mailbox).await, Synced::Busy);
+        let gone = crate::mail::MailboxRef {
+            account: uuid::Uuid::new_v4(),
+            owner: mailbox.owner,
+        };
+        assert_eq!(sync(&pool, &google, gone).await, Synced::Skipped);
+    }
+
+    /// A push app: `test_app` plus push turned on, with the queue readable.
+    macro_rules! push_app {
+        ($pool:expr, $google:expr, $push:expr) => {{
+            use crate::security::Limiter;
+            use crate::test_support::nz;
+            test::init_service(
+                App::new()
+                    .wrap(crate::security::security_headers())
+                    .app_data($pool.clone())
+                    .app_data(web::Data::new(Limiter::new(nz(1000), nz(1000), false)))
+                    .app_data(web::Data::new($google))
+                    .app_data(web::Data::new($push))
+                    .configure(configure),
+            )
+            .await
+        }};
+    }
+
+    fn push_request(token: Option<&str>, email: &str) -> test::TestRequest {
+        use base64::Engine;
+        let note = json!({"emailAddress": email, "historyId": 12345}).to_string();
+        let data = base64::engine::general_purpose::STANDARD.encode(note);
+        let mut req = test::TestRequest::post()
+            .uri("/api/gmail/push")
+            .set_json(json!({
+                "message": {"data": data, "messageId": "1", "publishTime": "2026-11-24T10:00:00Z"},
+                "subscription": "projects/hadal-test/subscriptions/gmail-push",
+            }));
+        if let Some(token) = token {
+            req = req.insert_header(("authorization", format!("Bearer {token}")));
+        }
+        req
+    }
+
+    #[actix_web::test]
+    async fn push_endpoint_needs_googles_signed_token_and_queues_watched_mailboxes() {
+        use crate::auth::google::tests::{TEST_KID, push_claims, push_token, sign_token};
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        // Push off: the route doesn't exist.
+        let app = test_app!(pool, google);
+        let resp = test::call_service(&app, push_request(None, "a@example.com").to_request()).await;
+        assert_eq!(resp.status(), 404);
+
+        let google = Arc::new(start_fake_google(fake.clone()).await);
+        let app = test_app!(pool, google.clone());
+        let (_, mailbox, sub) =
+            imported_mailbox!(app, pool, fake, vec![gmail_message("a0", "s", "b")]);
+        let email = format!("{sub}@EXAMPLE.com");
+        let (push, mut queue) =
+            crate::push::Push::for_test(crate::config::tests::test_push_config());
+        let app = push_app!(pool, start_fake_google(fake.clone()).await, push);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+        // No token, junk, someone else's audience, or a token we didn't
+        // get from Google: 401, and nothing queued.
+        let mut wrong_aud = push_claims(now);
+        wrong_aud["aud"] = json!("https://evil.example.com/api/gmail/push");
+        for token in [
+            None,
+            Some("junk".to_owned()),
+            Some(sign_token(
+                &json!({"alg": "RS256", "kid": TEST_KID}),
+                &wrong_aud,
+            )),
+            Some(sign_token(
+                &json!({"alg": "RS256", "kid": "forged"}),
+                &push_claims(now),
+            )),
+        ] {
+            let (status, body) = json_body(
+                test::call_service(&app, push_request(token.as_deref(), &email).to_request()).await,
+            )
+            .await;
+            assert_eq!(
+                (status, body),
+                (401, json!({"error": "authentication required"}))
+            );
+        }
+        assert!(queue.try_recv().is_err());
+
+        // Genuine, but the mailbox isn't watched (or isn't ours at all):
+        // acknowledged, nothing to sync.
+        let token = push_token(now);
+        for who in [email.as_str(), "stranger@example.com"] {
+            let resp = test::call_service(&app, push_request(Some(&token), who).to_request()).await;
+            assert_eq!(resp.status(), 204);
+        }
+        assert!(queue.try_recv().is_err());
+
+        // Watched: queued for a sync of that row, with its own owner.
+        sqlx::query(
+            "UPDATE mail_accounts SET watch_expires_at = now() + interval '7 days'
+              WHERE id = $1 AND owner_id = $2",
+        )
+        .bind(mailbox.account)
+        .bind(mailbox.owner)
+        .execute(pool.get_ref())
+        .await
+        .unwrap();
+        let resp = test::call_service(&app, push_request(Some(&token), &email).to_request()).await;
+        assert_eq!(resp.status(), 204);
+        assert_eq!(queue.try_recv().unwrap(), mailbox);
+        // A notification it can't read is acknowledged too, so Pub/Sub
+        // doesn't redeliver it for days.
+        let junk = test::TestRequest::post()
+            .uri("/api/gmail/push")
+            .insert_header(("authorization", format!("Bearer {token}")))
+            .set_json(json!({"message": {"data": "not base64!"}}))
+            .to_request();
+        assert_eq!(test::call_service(&app, junk).await.status(), 204);
+        assert!(queue.try_recv().is_err());
+    }
+
+    #[actix_web::test]
+    async fn only_recently_active_users_mailboxes_are_watched() {
+        use crate::mail::tests::gmail_message;
+        let pool = test_db().await;
+        let fake = Arc::new(FakeGoogle::default());
+        let google = Arc::new(start_fake_google(fake.clone()).await);
+        let app = test_app!(pool, google.clone());
+        let (session, mailbox, _) =
+            imported_mailbox!(app, pool, fake, vec![gmail_message("a0", "s", "b")]);
+        let cipher = crate::crypto::tests::test_cipher();
+        let push = crate::config::tests::test_push_config();
+        let renew = || {
+            crate::mail::renew_watches(
+                pool.get_ref(),
+                &google,
+                &cipher,
+                &push.topic,
+                push.active_days,
+                Some(mailbox.owner),
+            )
+        };
+        let expiry = || async {
+            sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(
+                "SELECT watch_expires_at FROM mail_accounts WHERE id = $1 AND owner_id = $2",
+            )
+            .bind(mailbox.account)
+            .bind(mailbox.owner)
+            .fetch_one(pool.get_ref())
+            .await
+            .unwrap()
+        };
+
+        // Signed in just now: watched, and imported already, so no sync due.
+        assert!(renew().await.unwrap().is_empty());
+        assert_eq!(*fake.watches.lock().unwrap(), 1);
+        assert!(
+            expiry().await.unwrap() > time::OffsetDateTime::now_utc() + time::Duration::days(6)
+        );
+        // Not due again for days: no second call to Gmail.
+        renew().await.unwrap();
+        assert_eq!(*fake.watches.lock().unwrap(), 1);
+
+        // Away for longer than the window: the watch stops.
+        sqlx::query("UPDATE users SET last_login_at = now() - interval '30 days' WHERE id = $1")
+            .bind(mailbox.owner)
+            .execute(pool.get_ref())
+            .await
+            .unwrap();
+        crate::mail::stop_idle_watches(pool.get_ref(), &google, &cipher, push.active_days)
+            .await
+            .unwrap();
+        assert!(expiry().await.is_none());
+        assert!(*fake.stops.lock().unwrap() >= 1);
+        renew().await.unwrap();
+        assert_eq!(
+            *fake.watches.lock().unwrap(),
+            1,
+            "an idle user's mailbox isn't watched"
+        );
+
+        // Back, and watched again; disconnecting stops it before revoking.
+        sqlx::query("UPDATE users SET last_login_at = now() WHERE id = $1")
+            .bind(mailbox.owner)
+            .execute(pool.get_ref())
+            .await
+            .unwrap();
+        renew().await.unwrap();
+        assert!(expiry().await.is_some());
+        let stops = *fake.stops.lock().unwrap();
+        let uri = format!("/api/mail/accounts/{}", mailbox.account);
+        assert_eq!(
+            test::call_service(&app, req!("DELETE", &uri, &session))
+                .await
+                .status(),
+            204
+        );
+        assert_eq!(*fake.stops.lock().unwrap(), stops + 1);
+    }
+
+    #[actix_web::test]
+    async fn live_events_reach_the_owner_and_end_with_the_session() {
+        use actix_web::body::MessageBody;
+        let pool = test_db().await;
+        let app = test_app!(pool);
+        let (owner, session) = signed_in_user(&pool).await;
+        let (other, _) = signed_in_user(&pool).await;
+        let resp = test::call_service(&app, req!("GET", "/api/mail/events", &session)).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(resp.headers().get("x-accel-buffering").unwrap(), "no");
+        let mut body = Box::pin(resp.into_body());
+        let mut next = async || {
+            let chunk = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                std::future::poll_fn(|cx| body.as_mut().poll_next(cx)),
+            )
+            .await
+            .expect("stream stalled");
+            chunk.map(|c| String::from_utf8(c.unwrap().to_vec()).unwrap())
+        };
+        assert_eq!(next().await.unwrap(), "retry: 5000\n\n");
+
+        let account = uuid::Uuid::new_v4();
+        crate::test_support::test_events().publish(other, uuid::Uuid::new_v4());
+        crate::test_support::test_events().publish(owner, account);
+        let event = loop {
+            let chunk = next().await.unwrap();
+            if chunk != ": ping\n\n" {
+                break chunk;
+            }
+        };
+        assert_eq!(
+            event,
+            format!("event: mail\ndata: {{\"account\":\"{account}\"}}\n\n")
+        );
+
+        // Signing out ends the open stream too.
+        let resp = test::call_service(&app, req!("POST", "/api/auth/logout", &session)).await;
+        assert_eq!(resp.status(), 204);
+        loop {
+            match next().await {
+                None => break,
+                Some(chunk) => assert_eq!(chunk, ": ping\n\n"),
+            }
+        }
+    }
+
+    #[actix_web::test]
+    async fn opening_the_live_stream_does_not_count_as_activity() {
+        // CASA 2.2.x: the browser reopens a dropped stream by itself, so
+        // that must not keep an unattended session from going idle.
+        let pool = test_db().await;
+        let app = test_app!(pool);
+        let (user, session) = signed_in_user(&pool).await;
+        let set_last_seen = |minutes: i32| {
+            sqlx::query(
+                "UPDATE sessions SET last_seen_at = now() - make_interval(mins => $2)
+                  WHERE user_id = $1",
+            )
+            .bind(user)
+            .bind(minutes)
+            .execute(pool.get_ref())
+        };
+        let idle_minutes = || async {
+            sqlx::query_scalar::<_, f64>(
+                "SELECT (extract(epoch FROM now() - last_seen_at) / 60)::float8
+                   FROM sessions WHERE user_id = $1",
+            )
+            .bind(user)
+            .fetch_one(pool.get_ref())
+            .await
+            .unwrap()
+        };
+        set_last_seen(20).await.unwrap();
+        let resp = test::call_service(&app, req!("GET", "/api/mail/events", &session)).await;
+        assert_eq!(resp.status(), 200);
+        assert!(
+            idle_minutes().await > 19.0,
+            "the stream slid the idle window"
+        );
+        // Any other request is the user being there.
+        let resp = test::call_service(&app, req!("GET", "/api/auth/me", &session)).await;
+        assert_eq!(resp.status(), 200);
+        assert!(idle_minutes().await < 1.0);
+        // Idle for longer than allowed (30 minutes): no stream either.
+        set_last_seen(31).await.unwrap();
+        let resp = test::call_service(&app, req!("GET", "/api/mail/events", &session)).await;
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[actix_web::test]
+    async fn googles_signing_keys_are_asked_for_once_while_google_is_down() {
+        // CASA 1.1.1 / 5.1.5: the push endpoint is public, so requests to it
+        // must not be able to make the backend call Google each time.
+        use crate::auth::google::tests::push_token;
+        use crate::auth::google::{PushExpectation, PushRejected};
+        let fake = Arc::new(FakeGoogle::default());
+        let google = start_fake_google(fake.clone()).await;
+        let config = crate::config::tests::test_push_config();
+        let expect = PushExpectation {
+            audience: &config.audience,
+            service_account: &config.service_account,
+        };
+        let token = push_token(time::OffsetDateTime::now_utc().unix_timestamp());
+        *fake.certs_down.lock().unwrap() = true;
+        for _ in 0..5 {
+            let refused = google.verify_push_token(&token, &expect).await;
+            assert!(
+                matches!(refused, Err(PushRejected::KeysUnavailable(_))),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(*fake.certs_calls.lock().unwrap(), 1);
+    }
+
+    #[actix_web::test]
+    async fn reloading_the_page_many_times_still_gets_a_live_stream() {
+        use actix_web::body::MessageBody;
+        let pool = test_db().await;
+        let app = test_app!(pool);
+        let (_, session) = signed_in_user(&pool).await;
+        // Each reload opens a stream while the old ones are still registered.
+        let mut bodies = Vec::new();
+        for _ in 0..8 {
+            let resp = test::call_service(&app, req!("GET", "/api/mail/events", &session)).await;
+            assert_eq!(resp.status(), 200);
+            bodies.push(Box::pin(resp.into_body()));
+        }
+        // The first one was replaced: it says so, then ends.
+        let oldest = &mut bodies[0];
+        let mut seen = String::new();
+        loop {
+            let chunk = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                std::future::poll_fn(|cx| oldest.as_mut().poll_next(cx)),
+            )
+            .await
+            .expect("stream stalled");
+            match chunk {
+                Some(c) => seen.push_str(std::str::from_utf8(&c.unwrap()).unwrap()),
+                None => break,
+            }
+        }
+        assert!(seen.ends_with("event: replaced\ndata: {}\n\n"), "{seen}");
     }
 
     #[actix_web::test]

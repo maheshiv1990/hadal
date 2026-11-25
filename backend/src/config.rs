@@ -44,6 +44,22 @@ pub struct SessionConfig {
     pub absolute_secs: u32,
 }
 
+/// Gmail push notifications (`users.watch` through Cloud Pub/Sub). Off
+/// unless every `GMAIL_PUSH_*` setting is given.
+#[derive(Clone, Debug)]
+pub struct GmailPushConfig {
+    /// The Pub/Sub topic Gmail publishes to: `projects/<project>/topics/<name>`.
+    pub topic: String,
+    /// The push subscription's audience: the exact HTTPS URL of
+    /// `/api/gmail/push` it delivers to. Its signed tokens must carry it.
+    pub audience: String,
+    /// The service account the subscription signs its tokens as.
+    pub service_account: String,
+    /// Only mailboxes of users who signed in within this many days are
+    /// watched (data minimisation): others are imported only when used.
+    pub active_days: u32,
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: Secret,
@@ -64,6 +80,7 @@ pub struct Config {
     /// Off, Hadal is Google-only: registration, password sign-in and
     /// password change don't exist.
     pub password_auth_enabled: bool,
+    pub gmail_push: Option<GmailPushConfig>,
 }
 
 // Hand-written so the connection string (which carries the DB password) can
@@ -87,6 +104,7 @@ impl std::fmt::Debug for Config {
             .field("session", &self.session)
             .field("data_encryption_key", &self.data_encryption_key)
             .field("password_auth_enabled", &self.password_auth_enabled)
+            .field("gmail_push", &self.gmail_push)
             .finish()
     }
 }
@@ -136,6 +154,7 @@ impl Config {
             session,
             data_encryption_key: Secret::new(required("DATA_ENCRYPTION_KEY")?),
             password_auth_enabled: env_or("PASSWORD_AUTH_ENABLED", "false")?,
+            gmail_push: gmail_push_from_env()?,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -156,8 +175,82 @@ impl Config {
         if s.idle_secs > s.absolute_secs {
             bail!("SESSION_IDLE_SECS must not exceed SESSION_ABSOLUTE_SECS");
         }
+        if let Some(push) = &self.gmail_push {
+            validate_gmail_push(push)?;
+        }
         Ok(())
     }
+}
+
+/// All of `GMAIL_PUSH_TOPIC`, `GMAIL_PUSH_AUDIENCE` and
+/// `GMAIL_PUSH_SERVICE_ACCOUNT`, or none of them (push off). Half a setup is
+/// an error, not a silent "off".
+fn gmail_push_from_env() -> Result<Option<GmailPushConfig>> {
+    let var = |key: &str| std::env::var(key).ok().filter(|v| !v.trim().is_empty());
+    let (topic, audience, account) = (
+        var("GMAIL_PUSH_TOPIC"),
+        var("GMAIL_PUSH_AUDIENCE"),
+        var("GMAIL_PUSH_SERVICE_ACCOUNT"),
+    );
+    match (topic, audience, account) {
+        (None, None, None) => Ok(None),
+        (Some(topic), Some(audience), Some(service_account)) => Ok(Some(GmailPushConfig {
+            topic,
+            audience,
+            service_account,
+            active_days: env_or("GMAIL_PUSH_ACTIVE_DAYS", "7")?,
+        })),
+        _ => bail!(
+            "set all of GMAIL_PUSH_TOPIC, GMAIL_PUSH_AUDIENCE and GMAIL_PUSH_SERVICE_ACCOUNT, or none"
+        ),
+    }
+}
+
+/// The topic is a Pub/Sub topic name, the audience our push URL over HTTPS
+/// (Pub/Sub only delivers to HTTPS), the signer a service account.
+fn validate_gmail_push(push: &GmailPushConfig) -> Result<()> {
+    let topic_ok = push
+        .topic
+        .strip_prefix("projects/")
+        .and_then(|rest| rest.split_once("/topics/"))
+        .is_some_and(|(project, name)| {
+            (6..=30).contains(&project.len())
+                && project
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && (3..=255).contains(&name.len())
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.~+%".contains(&b))
+        });
+    if !topic_ok {
+        bail!("GMAIL_PUSH_TOPIC must look like projects/<project>/topics/<name>");
+    }
+    let audience = Url::parse(&push.audience).context("GMAIL_PUSH_AUDIENCE is not a valid URL")?;
+    if audience.scheme() != "https"
+        || audience.path() != "/api/gmail/push"
+        || audience.query().is_some()
+        || audience.fragment().is_some()
+    {
+        bail!("GMAIL_PUSH_AUDIENCE must be the https URL of /api/gmail/push");
+    }
+    let account_ok = push
+        .service_account
+        .split_once('@')
+        .is_some_and(|(name, domain)| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && domain.ends_with(".iam.gserviceaccount.com")
+        });
+    if !account_ok {
+        bail!("GMAIL_PUSH_SERVICE_ACCOUNT must be a service account email");
+    }
+    if !(1..=30).contains(&push.active_days) {
+        bail!("GMAIL_PUSH_ACTIVE_DAYS must be between 1 and 30");
+    }
+    Ok(())
 }
 
 /// The redirect URI must be https (plain http only for a loopback dev host),
@@ -224,6 +317,39 @@ pub(crate) mod tests {
             },
             data_encryption_key: Secret::new(crate::crypto::tests::test_key()),
             password_auth_enabled: false,
+            gmail_push: None,
+        }
+    }
+
+    pub(crate) fn test_push_config() -> GmailPushConfig {
+        GmailPushConfig {
+            topic: "projects/hadal-test/topics/gmail".into(),
+            audience: "https://hadal.example.com/api/gmail/push".into(),
+            service_account: "pubsub-push@hadal-test.iam.gserviceaccount.com".into(),
+            active_days: 7,
+        }
+    }
+
+    #[test]
+    fn gmail_push_settings_are_checked() {
+        let mut cfg = test_config();
+        cfg.gmail_push = Some(test_push_config());
+        cfg.validate().unwrap();
+        let bad: [fn(&mut GmailPushConfig); 7] = [
+            |p| p.topic = "gmail".into(),
+            |p| p.topic = "projects/Hadal/topics/gmail".into(),
+            |p| p.audience = "http://hadal.example.com/api/gmail/push".into(),
+            |p| p.audience = "https://hadal.example.com/api/other".into(),
+            |p| p.audience = "https://hadal.example.com/api/gmail/push?x=1".into(),
+            |p| p.service_account = "someone@gmail.com".into(),
+            |p| p.active_days = 0,
+        ];
+        for change in bad {
+            let mut push = test_push_config();
+            change(&mut push);
+            let mut cfg = test_config();
+            cfg.gmail_push = Some(push.clone());
+            assert!(cfg.validate().is_err(), "accepted {push:?}");
         }
     }
 
