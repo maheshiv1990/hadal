@@ -189,7 +189,6 @@ button.folder.active .count { color: inherit; font-weight: 600; }
   margin: 0; padding: 0 0.75rem;
   font-size: 0.85rem; font-weight: 600; color: var(--muted);
 }
-.m-star { color: #e3a008; font-size: 0.9rem; }
 button.more-toggle { color: var(--muted); }
 button.more-toggle:disabled { opacity: 1; cursor: default; }
 .labels-heading { margin-top: 0.9rem; }
@@ -211,6 +210,7 @@ button.more-toggle:disabled { opacity: 1; cursor: default; }
   min-height: 2.75rem; padding: 0.25rem 0.75rem; border-bottom: 1px solid var(--border);
 }
 .toolbar-group { display: flex; align-items: center; gap: 0.25rem; }
+.toolbar-end { margin-left: auto; }
 .inbox-toolbar button { white-space: nowrap; }
 .toolbar-status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 button.ghost { background: transparent; border-color: transparent; color: inherit; padding: 0.3rem 0.6rem; font-size: 0.9rem; }
@@ -221,9 +221,25 @@ button.ghost.danger { color: var(--danger); }
 
 .message-list { list-style: none; margin: 0; padding: 0; }
 .message-list li + li { border-top: 1px solid var(--border); }
+/* Each row has a checkbox in front of it. It sits over the row's left
+   padding, not inside the row, which is a button. */
+.message-list li { position: relative; }
+.message-list li.selected { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.m-check {
+  position: absolute; left: 0.75rem; top: 0.72rem; z-index: 1;
+  width: 1rem; height: 1rem; margin: 0; padding: 0;
+  accent-color: var(--accent); cursor: pointer;
+}
+/* Gmail's star, after the checkbox: an outline, filled when starred. */
+.row-star {
+  position: absolute; left: 2.25rem; top: 0.66rem; z-index: 1;
+  width: 1.1rem; height: 1.1rem; pointer-events: none;
+  fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linejoin: round; opacity: 0.6;
+}
+.row-star.on { fill: #e3a008; stroke: #e3a008; opacity: 1; }
 .message-row {
   display: grid; grid-template-columns: 190px minmax(0, 1fr) auto; align-items: center; gap: 1rem;
-  width: 100%; padding: 0.55rem 0.75rem;
+  width: 100%; padding: 0.55rem 0.75rem 0.55rem 4rem;
   background: transparent; border: 0; border-radius: 0; color: inherit;
   text-align: left; font-size: 0.9rem;
 }
@@ -245,7 +261,7 @@ button.ghost.danger { color: var(--danger); }
 .m-clip { font-size: 0.8rem; opacity: 0.7; }
 .m-chips {
   display: flex; flex-wrap: wrap; gap: 0.4rem;
-  padding: 0 0.75rem 0.6rem calc(0.75rem + 190px + 1rem);
+  padding: 0 0.75rem 0.6rem calc(4rem + 190px + 1rem);
 }
 button.chip {
   display: inline-flex; align-items: center; gap: 0.4rem; max-width: 220px;
@@ -300,6 +316,11 @@ a.address-link:hover { text-decoration: underline; }
 .avatar-6 { background: #0f7b8a; }
 .avatar-7 { background: #5b6472; }
 .reader-meta time { white-space: nowrap; }
+/* The message's text sits in its own block, apart from who sent it. */
+.reader-body {
+  padding: 1.1rem 1.25rem; border: 1px solid var(--border); border-radius: 10px;
+  background: color-mix(in srgb, var(--fg) 3%, var(--bg));
+}
 .reader pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 0.95rem; line-height: 1.6; }
 
 @media (max-width: 760px) {
@@ -314,7 +335,7 @@ a.address-link:hover { text-decoration: underline; }
   button.mailbox, a.add-account { flex-shrink: 0; border-radius: 999px; white-space: nowrap; }
   .message-row { grid-template-columns: minmax(0, 1fr) auto; row-gap: 0.15rem; }
   .m-text { grid-column: 1 / -1; grid-row: 2; }
-  .m-chips { padding-left: 0.75rem; }
+  .m-chips { padding-left: 4rem; }
   .reader-meta { flex-direction: column; }
 }
 

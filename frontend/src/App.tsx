@@ -1,4 +1,4 @@
-import { createEffect, createResource, createSignal, For, Match, onCleanup, Show, Switch } from 'solid-js'
+import { batch, createEffect, createResource, createSignal, For, Match, onCleanup, Show, Switch } from 'solid-js'
 import {
   api,
   downloadAttachment,
@@ -11,6 +11,7 @@ import {
   type OutgoingMail,
   type MailAccount,
   type MailAttachment,
+  type MailMessageDetail,
   type Me,
 } from './api'
 
@@ -274,6 +275,45 @@ const MAX_RECIPIENTS = 50
 const MAX_SUBJECT_CHARS = 255
 const MAX_BODY_CHARS = 100_000
 
+/** What a new message starts with. */
+interface Draft {
+  to: string
+  subject: string
+  body: string
+}
+const NEW_MESSAGE: Draft = { to: '', subject: '', body: '' }
+
+/** "Re: x", without stacking a second "Re:" on a reply to a reply. */
+const prefixed = (prefix: string, already: RegExp, subject: string) =>
+  (already.test(subject) ? subject : `${prefix} ${subject}`.trim()).slice(0, MAX_SUBJECT_CHARS)
+
+/** A reply to `m`: to its sender, with its text quoted below. */
+const replyTo = (m: MailMessageDetail): Draft => {
+  const quoted = m.body.replace(/^/gm, '> ')
+  return {
+    to: looksLikeAddress(senderAddress(m.from)) ? senderAddress(m.from) : '',
+    subject: prefixed('Re:', /^\s*re:/i, m.subject),
+    body: `\n\nOn ${formatDate(m.received_at)}, ${m.from} wrote:\n${quoted}`.slice(0, MAX_BODY_CHARS),
+  }
+}
+
+/** `m` forwarded: no recipient yet, its text below a header block. Files are not sent along. */
+const forwardOf = (m: MailMessageDetail): Draft => ({
+  to: '',
+  subject: prefixed('Fwd:', /^\s*fwd?:/i, m.subject),
+  body: [
+    '\n\n---------- Forwarded message ----------',
+    `From: ${m.from}`,
+    `Date: ${formatDate(m.received_at)}`,
+    `Subject: ${m.subject}`,
+    `To: ${m.to}`,
+    '',
+    m.body,
+  ]
+    .join('\n')
+    .slice(0, MAX_BODY_CHARS),
+})
+
 /** Addresses typed into To, Cc or Bcc: split on commas, semicolons, spaces. */
 const splitAddresses = (text: string) => text.split(/[\s,;]+/).filter(Boolean)
 /** A rough check for a typo; the server decides what it accepts. */
@@ -289,8 +329,8 @@ function Compose(props: {
   senders: MailAccount[]
   /** The mailbox being viewed, used as the sender when it may send. */
   preferred: string | undefined
-  /** An address to start the To field with. */
-  to: string
+  /** What the form starts with: empty, an address, a reply or a forward. */
+  draft: Draft
   onSent: () => void
   onDiscard: () => void
   onSignedOut: () => void
@@ -298,12 +338,12 @@ function Compose(props: {
   const [from, setFrom] = createSignal(
     props.senders.find((a) => a.id === props.preferred)?.id ?? props.senders[0].id,
   )
-  const [to, setTo] = createSignal(props.to)
+  const [to, setTo] = createSignal(props.draft.to)
   const [cc, setCc] = createSignal('')
   const [bcc, setBcc] = createSignal('')
   const [showCopies, setShowCopies] = createSignal(false)
-  const [subject, setSubject] = createSignal('')
-  const [body, setBody] = createSignal('')
+  const [subject, setSubject] = createSignal(props.draft.subject)
+  const [body, setBody] = createSignal(props.draft.body)
   const [sending, setSending] = createSignal(false)
   const [error, setError] = createSignal<string | null>(null)
 
@@ -658,6 +698,53 @@ const MORE_FOLDERS: Folder[] = [
   { label: 'CATEGORY_PROMOTIONS', name: 'Promotions' },
 ]
 
+/** Where the user is in their mail. */
+interface Place {
+  /** Null means the primary mailbox. */
+  mailbox: string | null
+  folder: FolderLabel
+  page: number
+  /** The open message, if one is. */
+  message: string | null
+}
+
+const UUID = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
+
+/**
+ * A place as the part of the URL after `#`, such as
+ * `folder=SENT&page=2&message=<id>`. Only IDs and a page number go in it:
+ * no address, subject or other mail content (CASA 2.1.1). The usual place
+ * (primary mailbox, Inbox, first page, nothing open) is an empty string.
+ */
+const hashOfPlace = (place: Place) => {
+  const params = new URLSearchParams()
+  if (place.mailbox) params.set('mailbox', place.mailbox)
+  if (place.folder !== 'INBOX') params.set('folder', place.folder)
+  if (place.page > 0) params.set('page', String(place.page))
+  if (place.message) params.set('message', place.message)
+  return params.toString()
+}
+
+/** The place a URL hash names. Anything it gets wrong falls back to the usual place. */
+const placeFromHash = (hash: string): Place => {
+  const params = new URLSearchParams(hash.replace(/^#/, ''))
+  const id = (name: string) => {
+    const value = params.get(name)
+    return value && UUID.test(value) ? value : null
+  }
+  const folder = params.get('folder')
+  const page = Number(params.get('page') ?? 0)
+  return {
+    mailbox: id('mailbox'),
+    folder: folder && /^[A-Za-z0-9_]{1,80}$/.test(folder) ? folder : 'INBOX',
+    page: Number.isInteger(page) && page >= 0 && page <= MAX_PAGE ? page : 0,
+    message: id('message'),
+  }
+}
+
+/** The last page the server lists (`mail::MAX_PAGE`). */
+const MAX_PAGE = 20_000
+
 /** Attachment chips shown under a message row. */
 const MAX_ROW_CHIPS = 3
 
@@ -677,9 +764,12 @@ function Mail(props: {
 }) {
   const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
   /** The mailbox the user picked; null (or one since disconnected) means the primary one. */
-  const [mailbox, setMailbox] = createSignal<string | null>(null)
-  const [folder, setFolder] = createSignal<FolderLabel>('INBOX')
-  const [openId, setOpenId] = createSignal<string | null>(null)
+  // Where the user is (mailbox, folder, page, open message) starts from the
+  // address bar, so a reload or a bookmark comes back to the same place.
+  const start = placeFromHash(window.location.hash)
+  const [mailbox, setMailbox] = createSignal<string | null>(start.mailbox)
+  const [folder, setFolder] = createSignal<FolderLabel>(start.folder)
+  const [openId, setOpenId] = createSignal<string | null>(start.message)
   const [detail] = createResource(openId, api.getMessage)
   const [problems, setProblems] = createSignal<string[]>([])
   const [error, setError] = createSignal<string | null>(null)
@@ -687,15 +777,18 @@ function Mail(props: {
   const [composing, setComposing] = createSignal(false)
   /** "Message sent." is shown until the user moves on. */
   const [sent, setSent] = createSignal(false)
+  /** The open message, once it has loaded. */
+  const opened = () => (!detail.loading && detail()?.id === openId() ? detail() : undefined)
+  const composeTo = (to: string) => compose({ ...NEW_MESSAGE, to })
   /** Mailboxes the user allowed sending from. */
   const senders = () => (accounts() ?? []).filter((a) => a.can_send)
   /** The address the new message starts with, when one was clicked. */
-  const [composeTo, setComposeTo] = createSignal('')
-  const compose = (to = '') => {
+  const [draft, setDraft] = createSignal<Draft>(NEW_MESSAGE)
+  const compose = (start: Draft = NEW_MESSAGE) => {
     setSent(false)
     setError(null)
     setOpenId(null)
-    setComposeTo(to)
+    setDraft(start)
     setComposing(true)
   }
 
@@ -733,7 +826,27 @@ function Mail(props: {
     return account && !isPrimary(account) ? account : undefined
   }
   /** Page of the list being shown, counted from 0; back to 0 on a new folder. */
-  const [page, setPage] = createSignal(0)
+  const [page, setPage] = createSignal(start.page)
+  // Keep the address bar in step with where the user is: each move is a
+  // history entry, so the browser's Back button steps through them too.
+  createEffect(() => {
+    const hash = hashOfPlace({ mailbox: mailbox(), folder: folder(), page: page(), message: openId() })
+    if (hash !== window.location.hash.replace(/^#/, '')) {
+      window.history.pushState(null, '', window.location.pathname + (hash ? `#${hash}` : ''))
+    }
+  })
+  const onMoved = () => {
+    const place = placeFromHash(window.location.hash)
+    batch(() => {
+      setMailbox(place.mailbox)
+      setFolder(place.folder)
+      setPage(place.page)
+      setOpenId(place.message)
+      if (place.message) setComposing(false)
+    })
+  }
+  window.addEventListener('popstate', onMoved)
+  onCleanup(() => window.removeEventListener('popstate', onMoved))
   // The shown page of the selected mailbox's open folder, fetched from the server.
   const [messages, { refetch: refetchMessages }] = createResource(
     () => {
@@ -765,20 +878,23 @@ function Mail(props: {
   /** Sent mail and drafts are listed by recipient, the rest by sender. */
   const byRecipient = () => folder() === 'SENT' || folder() === 'DRAFT'
 
-  const showMailbox = (id: string | null) => {
-    setMailbox(id)
-    setOpenId(null)
-    setPage(0)
-    // A user label belongs to one mailbox; another one starts at its Inbox.
-    if (folder().startsWith('Label_')) setFolder('INBOX')
-  }
-  const showFolder = (label: FolderLabel) => {
-    setComposing(false)
-    setSent(false)
-    setFolder(label)
-    setOpenId(null)
-    setPage(0)
-  }
+  // One step each, so the address bar gets one history entry per move.
+  const showMailbox = (id: string | null) =>
+    batch(() => {
+      setMailbox(id)
+      setOpenId(null)
+      setPage(0)
+      // A user label belongs to one mailbox; another one starts at its Inbox.
+      if (folder().startsWith('Label_')) setFolder('INBOX')
+    })
+  const showFolder = (label: FolderLabel) =>
+    batch(() => {
+      setComposing(false)
+      setSent(false)
+      setFolder(label)
+      setOpenId(null)
+      setPage(0)
+    })
 
   /** Messages in the open folder, for "1–50 of N" and the page buttons. */
   const total = () => countOf(folder())
@@ -788,6 +904,20 @@ function Mail(props: {
   const hasNext = () => (page() + 1) * PAGE_SIZE < importedOf(folder())
   /** Page buttons only when the folder doesn't fit on one page. */
   const paged = () => page() > 0 || total() > PAGE_SIZE
+  /** IDs of the rows ticked on the shown page. */
+  const [selected, setSelected] = createSignal<ReadonlySet<string>>(new Set())
+  const toggleSelected = (id: string) => {
+    const next = new Set(selected())
+    if (!next.delete(id)) next.add(id)
+    setSelected(next)
+  }
+  // Ticks belong to the page they were made on: another mailbox, folder or
+  // page starts with none.
+  createEffect(() => {
+    void [selectedAccount()?.id, folder(), page()]
+    setSelected(new Set<string>())
+  })
+
   const turnPage = (to: number) => {
     setPage(to)
     document.querySelector('.inbox-main')?.scrollIntoView({ block: 'nearest' })
@@ -1072,6 +1202,18 @@ function Mail(props: {
                 <button class="ghost" onClick={() => setOpenId(null)} aria-label="Back to the list">
                   ← Back
                 </button>
+                <Show when={opened()}>
+                  {(m) => (
+                    <div class="toolbar-group toolbar-end">
+                      <button class="ghost" onClick={() => compose(replyTo(m()))}>
+                        ↩ Reply
+                      </button>
+                      <button class="ghost" onClick={() => compose(forwardOf(m()))}>
+                        ↪ Forward
+                      </button>
+                    </div>
+                  )}
+                </Show>
               </Show>
             </Show>
           </div>
@@ -1122,7 +1264,7 @@ function Mail(props: {
             <Compose
               senders={senders()}
               preferred={selectedAccount()?.id}
-              to={composeTo()}
+              draft={draft()}
               onSignedOut={props.onSignedOut}
               onDiscard={() => setComposing(false)}
               onSent={() => {
@@ -1158,7 +1300,26 @@ function Mail(props: {
                   <ul class="message-list">
                     <For each={visible()}>
                       {(m) => (
-                        <li>
+                        <li classList={{ selected: selected().has(m.id) }}>
+                          <input
+                            type="checkbox"
+                            class="m-check"
+                            checked={selected().has(m.id)}
+                            onChange={() => toggleSelected(m.id)}
+                            aria-label={`Select: ${m.subject || '(no subject)'}`}
+                          />
+                          {/* Shows Gmail's star. Not a button: Hadal can't
+                              change mail in Gmail (read and send only). */}
+                          <svg
+                            class="row-star"
+                            classList={{ on: m.labels.includes('STARRED') }}
+                            viewBox="0 0 24 24"
+                            role="img"
+                            aria-label={m.labels.includes('STARRED') ? 'Starred' : 'Not starred'}
+                          >
+                            <title>{m.labels.includes('STARRED') ? 'Starred in Gmail' : 'Not starred'}</title>
+                            <path d="m12 3.5 2.6 5.4 5.9.8-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.8z" />
+                          </svg>
                           <button
                             class="message-row"
                             classList={{ unread: m.labels.includes('UNREAD') }}
@@ -1196,11 +1357,6 @@ function Mail(props: {
                               </Show>
                             </span>
                             <span class="m-end">
-                              <Show when={m.labels.includes('STARRED')}>
-                                <span class="m-star" role="img" aria-label="Starred" title="Starred">
-                                  ★
-                                </span>
-                              </Show>
                               <Show when={m.attachments.length}>
                                 <span
                                   class="m-clip"
@@ -1247,7 +1403,7 @@ function Mail(props: {
             >
               <Show when={!detail.error} fallback={<p class="error inbox-empty">Could not open this message.</p>}>
                 <Show
-                  when={!detail.loading && detail()?.id === openId() ? detail() : undefined}
+                  when={opened()}
                   fallback={<p class="muted inbox-empty">Loading…</p>}
                 >
                   {(d) => (
@@ -1260,7 +1416,7 @@ function Mail(props: {
                             <strong>{senderName(d().from)}</strong>{' '}
                             <span class="muted">
                               &lt;
-                              <AddressLink address={senderAddress(d().from)} onCompose={compose} />
+                              <AddressLink address={senderAddress(d().from)} onCompose={composeTo} />
                               &gt;
                             </span>
                             <div class="muted">
@@ -1272,7 +1428,7 @@ function Mail(props: {
                                     <AddressLink
                                       address={senderAddress(person)}
                                       text={person}
-                                      onCompose={compose}
+                                      onCompose={composeTo}
                                     />
                                   </>
                                 )}
@@ -1284,7 +1440,9 @@ function Mail(props: {
                           {readerDate(d().received_at)}
                         </time>
                       </div>
-                      <pre>{d().body || '(This message has no text.)'}</pre>
+                      <div class="reader-body">
+                        <pre>{d().body || '(This message has no text.)'}</pre>
+                      </div>
                       <Show when={d().attachments.length}>
                         <section class="attachments" aria-label="Attachments">
                           <h3>{plural(d().attachments.length, 'attachment', 'attachments')}</h3>
