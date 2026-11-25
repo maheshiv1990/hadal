@@ -1308,6 +1308,18 @@ function Mail(props: {
                             onChange={() => toggleSelected(m.id)}
                             aria-label={`Select: ${m.subject || '(no subject)'}`}
                           />
+                          {/* Shows Gmail's star. Not a button: Hadal can't
+                              change mail in Gmail (read and send only). */}
+                          <svg
+                            class="row-star"
+                            classList={{ on: m.labels.includes('STARRED') }}
+                            viewBox="0 0 24 24"
+                            role="img"
+                            aria-label={m.labels.includes('STARRED') ? 'Starred' : 'Not starred'}
+                          >
+                            <title>{m.labels.includes('STARRED') ? 'Starred in Gmail' : 'Not starred'}</title>
+                            <path d="m12 3.5 2.6 5.4 5.9.8-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.8z" />
+                          </svg>
                           <button
                             class="message-row"
                             classList={{ unread: m.labels.includes('UNREAD') }}
@@ -1345,11 +1357,6 @@ function Mail(props: {
                               </Show>
                             </span>
                             <span class="m-end">
-                              <Show when={m.labels.includes('STARRED')}>
-                                <span class="m-star" role="img" aria-label="Starred" title="Starred">
-                                  ★
-                                </span>
-                              </Show>
                               <Show when={m.attachments.length}>
                                 <span
                                   class="m-clip"
@@ -1433,7 +1440,9 @@ function Mail(props: {
                           {readerDate(d().received_at)}
                         </time>
                       </div>
-                      <pre>{d().body || '(This message has no text.)'}</pre>
+                      <div class="reader-body">
+                        <pre>{d().body || '(This message has no text.)'}</pre>
+                      </div>
                       <Show when={d().attachments.length}>
                         <section class="attachments" aria-label="Attachments">
                           <h3>{plural(d().attachments.length, 'attachment', 'attachments')}</h3>
