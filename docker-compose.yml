@@ -46,6 +46,12 @@ services:
       DATA_ENCRYPTION_KEY: ${DATA_ENCRYPTION_KEY:?set DATA_ENCRYPTION_KEY in .env (openssl rand -base64 32)}
       SESSION_IDLE_SECS: ${SESSION_IDLE_SECS:-1800}
       SESSION_ABSOLUTE_SECS: ${SESSION_ABSOLUTE_SECS:-43200}
+      # Gmail push notifications (Cloud Pub/Sub). Empty: off, and new mail
+      # arrives with the next import. See .env.example.
+      GMAIL_PUSH_TOPIC: ${GMAIL_PUSH_TOPIC:-}
+      GMAIL_PUSH_AUDIENCE: ${GMAIL_PUSH_AUDIENCE:-}
+      GMAIL_PUSH_SERVICE_ACCOUNT: ${GMAIL_PUSH_SERVICE_ACCOUNT:-}
+      GMAIL_PUSH_ACTIVE_DAYS: ${GMAIL_PUSH_ACTIVE_DAYS:-7}
     volumes:
       - ./certs/db/ca.crt:/etc/hadal/db-ca.crt:ro
     depends_on:

@@ -29,8 +29,8 @@ use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::auth::google::{
-    GoogleApiError, GoogleClient, Identity, LabelCounts, UserLabel, valid_attachment_id,
-    valid_gmail_id, valid_user_label_id,
+    GoogleApiError, GoogleClient, HistoryChange, Identity, LabelCounts, UserLabel,
+    valid_attachment_id, valid_gmail_id, valid_history_id, valid_user_label_id,
 };
 use crate::config::Secret;
 use crate::crypto::DataCipher;
@@ -357,8 +357,12 @@ pub async fn list_accounts(
 
 pub enum Unlinked {
     /// Removed with its mail. Carries its refresh token (if it still
-    /// decrypts) so the caller can revoke it at Google.
-    Removed(Option<Secret>),
+    /// decrypts) so the caller can revoke it at Google, and whether Gmail was
+    /// sending notifications for it.
+    Removed {
+        grant: Option<Secret>,
+        watched: bool,
+    },
     /// The mailbox for the email the user signs in with: never unlinked.
     SignInAccount,
     /// Not one of the caller's mailboxes.
@@ -373,22 +377,26 @@ pub async fn delete_account(
     owner: Uuid,
     id: Uuid,
 ) -> Result<Unlinked, AppError> {
-    let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+    let row: Option<(String, Vec<u8>, String, bool)> = sqlx::query_as(
         "DELETE FROM mail_accounts a
           WHERE a.id = $1 AND a.owner_id = $2
             AND lower(a.email) <> (SELECT lower(u.email) FROM users u WHERE u.id = $2)
-         RETURNING a.google_sub, a.refresh_token_enc",
+         RETURNING a.google_sub, a.refresh_token_enc, a.email, a.watch_expires_at IS NOT NULL",
     )
     .bind(id)
     .bind(owner)
     .fetch_optional(pool)
     .await?;
-    if let Some((sub, sealed)) = row {
+    if let Some((sub, sealed, email, watched)) = row {
+        // Another Hadal user with the same mailbox still wants its
+        // notifications: stopping the watch would stop theirs too.
+        let watched = watched && !watched_elsewhere(pool, owner, &email).await?;
         // The mailbox is already gone; a token that won't decrypt just can't
         // be revoked from here.
-        return Ok(Unlinked::Removed(
-            open_token(cipher, owner, &sub, &sealed).ok(),
-        ));
+        return Ok(Unlinked::Removed {
+            grant: open_token(cipher, owner, &sub, &sealed).ok(),
+            watched,
+        });
     }
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM mail_accounts WHERE id = $1 AND owner_id = $2)",
@@ -741,6 +749,10 @@ pub struct AccountImport {
     /// Older mail is still to be imported; the next import continues.
     pub remaining: bool,
     pub error: Option<&'static str>,
+    /// Gmail's history ID from before this import read the mailbox: changes
+    /// after it are what push sync reads next.
+    #[serde(skip)]
+    history_id: Option<String>,
 }
 
 pub enum ImportOutcome {
@@ -862,17 +874,19 @@ pub async fn import_all(
         tasks.spawn(async move {
             let counts = Counts::default();
             let run = import_account(&pool, &google, &cipher, owner, &account, deadline, &counts);
-            let (remaining, error) = match tokio::time::timeout(IMPORT_BUDGET, run).await {
-                Ok(Ok(remaining)) => (remaining, None),
-                Ok(Err(e)) => {
-                    tracing::warn!(account = %account.id, error = %e, "mailbox import failed");
-                    (true, Some(e.user_message()))
-                }
-                Err(_) => (
-                    true,
-                    Some("Import ran out of time. Run it again to continue."),
-                ),
-            };
+            let (remaining, error, history_id) =
+                match tokio::time::timeout(IMPORT_BUDGET, run).await {
+                    Ok(Ok((remaining, history_id))) => (remaining, None, history_id),
+                    Ok(Err(e)) => {
+                        tracing::warn!(account = %account.id, error = %e, "mailbox import failed");
+                        (true, Some(e.user_message()), None)
+                    }
+                    Err(_) => (
+                        true,
+                        Some("Import ran out of time. Run it again to continue."),
+                        None,
+                    ),
+                };
             AccountImport {
                 id: account.id,
                 email: account.email,
@@ -880,6 +894,7 @@ pub async fn import_all(
                 skipped: counts.skipped.load(Ordering::Relaxed),
                 remaining,
                 error,
+                history_id,
             }
         });
     }
@@ -908,6 +923,21 @@ pub async fn import_all(
     .bind(&finished)
     .execute(pool)
     .await?;
+    // Push sync reads history from here, unless it already reads from an
+    // earlier point: moving that later would skip the changes in between.
+    for r in results.iter().filter(|r| r.error.is_none()) {
+        if let Some(history_id) = &r.history_id {
+            sqlx::query(
+                "UPDATE mail_accounts SET history_id = coalesce(history_id, $3)
+                  WHERE id = $1 AND owner_id = $2",
+            )
+            .bind(r.id)
+            .bind(owner)
+            .bind(history_id)
+            .execute(pool)
+            .await?;
+        }
+    }
 
     results.sort_by(|a, b| a.email.cmp(&b.email));
     Ok(ImportOutcome::Done(results))
@@ -919,7 +949,8 @@ struct Counts {
     skipped: AtomicU32,
 }
 
-/// Returns whether older mail is still left to import.
+/// Returns whether older mail is still left to import, and Gmail's history
+/// ID from before the mailbox was read (if Gmail gave it).
 async fn import_account(
     pool: &PgPool,
     google: &Arc<GoogleClient>,
@@ -928,9 +959,36 @@ async fn import_account(
     account: &Claimed,
     deadline: tokio::time::Instant,
     counts: &Counts,
-) -> Result<bool, ImportFailure> {
+) -> Result<(bool, Option<String>), ImportFailure> {
     let refresh = open_token(cipher, owner, &account.google_sub, &account.sealed_token)?;
     let access = google.refresh_access_token(&refresh).await?;
+    let remaining = import_with(
+        pool, google, cipher, owner, account, &access, deadline, counts,
+    );
+    // Read first: whatever changes after it, the next history read returns.
+    let history_id = match google.history_id(&access).await {
+        Ok(id) => Some(id),
+        Err(GoogleApiError::Revoked) => return Err(GoogleApiError::Revoked.into()),
+        Err(e) => {
+            tracing::warn!(account = %account.id, error = %e, "Gmail history ID unavailable");
+            None
+        }
+    };
+    Ok((remaining.await?, history_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn import_with(
+    pool: &PgPool,
+    google: &Arc<GoogleClient>,
+    cipher: &DataCipher,
+    owner: Uuid,
+    account: &Claimed,
+    access: &Secret,
+    deadline: tokio::time::Instant,
+    counts: &Counts,
+) -> Result<bool, ImportFailure> {
+    let access = access.clone();
     let user_labels = google.list_user_labels(&access, MAX_USER_LABELS).await?;
     store_labels(pool, cipher, owner, account.id, &user_labels).await?;
     store_gmail_totals(pool, google, &access, owner, account.id, &user_labels).await?;
@@ -1448,6 +1506,467 @@ async fn fill_details(
     Ok(())
 }
 
+// ---- push sync: Gmail notifications --------------------------------------
+
+/// Most history pages read in one sync (500 changes each). A mailbox that
+/// changed more than that since the last sync is imported instead.
+const MAX_HISTORY_PAGES: usize = 10;
+/// Watches are renewed when they have less than this left. Gmail's last 7
+/// days, so this renews about once a day, as Gmail recommends.
+const WATCH_RENEW_DAYS: i32 = 6;
+
+/// How a sync ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Synced {
+    /// Mail was added, removed or relabelled.
+    Changed,
+    Unchanged,
+    /// An import or another sync has the mailbox: try again shortly.
+    Busy,
+    /// The mailbox was disconnected, or failed (logged): nothing to do now.
+    Skipped,
+}
+
+/// Brings one mailbox up to date after Gmail said it changed: reads the
+/// changes since the last sync from Gmail's history and applies them. With
+/// no usable history (never imported, or too old for Gmail to read from),
+/// it imports instead, the same import a click starts.
+///
+/// `owner` comes from our own mailbox row, never from the notification.
+pub async fn sync_account(
+    pool: &PgPool,
+    google: Arc<GoogleClient>,
+    cipher: Arc<DataCipher>,
+    owner: Uuid,
+    account_id: Uuid,
+) -> Result<Synced, AppError> {
+    #[allow(clippy::type_complexity)]
+    let claimed: Option<(
+        String,
+        String,
+        Vec<u8>,
+        Option<String>,
+        bool,
+        Option<String>,
+    )> = sqlx::query_as(
+        "UPDATE mail_accounts SET import_started_at = now()
+              WHERE id = $1 AND owner_id = $2
+                AND (import_started_at IS NULL
+                     OR import_started_at < now() - make_interval(secs => $3))
+              RETURNING google_sub, email, refresh_token_enc,
+                        backfill_page_token, backfill_done, history_id",
+    )
+    .bind(account_id)
+    .bind(owner)
+    .bind(STALE_CLAIM_SECS)
+    .fetch_optional(pool)
+    .await?;
+    let Some((google_sub, email, sealed_token, backfill_page_token, backfill_done, history_id)) =
+        claimed
+    else {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM mail_accounts WHERE id = $1 AND owner_id = $2)",
+        )
+        .bind(account_id)
+        .bind(owner)
+        .fetch_one(pool)
+        .await?;
+        return Ok(if exists {
+            Synced::Busy
+        } else {
+            Synced::Skipped
+        });
+    };
+    let account = Claimed {
+        id: account_id,
+        google_sub,
+        email,
+        sealed_token,
+        backfill_page_token,
+        backfill_done,
+    };
+    let run = sync_claimed(pool, &google, &cipher, owner, &account, history_id);
+    let outcome = match tokio::time::timeout(IMPORT_BUDGET, run).await {
+        Ok(Ok(changed)) => Some(changed),
+        Ok(Err(e)) => {
+            tracing::warn!(account = %account_id, error = %e, "mailbox sync failed");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(account = %account_id, "mailbox sync ran out of time");
+            None
+        }
+    };
+    sqlx::query(
+        "UPDATE mail_accounts SET
+             import_started_at = NULL,
+             last_import_at = CASE WHEN $3 THEN now() ELSE last_import_at END
+          WHERE id = $1 AND owner_id = $2",
+    )
+    .bind(account_id)
+    .bind(owner)
+    .bind(outcome.is_some())
+    .execute(pool)
+    .await?;
+    Ok(match outcome {
+        Some(true) => Synced::Changed,
+        Some(false) => Synced::Unchanged,
+        None => Synced::Skipped,
+    })
+}
+
+/// What a run of history says to do, in order of application.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HistoryPlan {
+    /// (message, label, added?) for messages we hold, in Gmail's order.
+    relabel: Vec<(String, String, bool)>,
+    /// Deleted for good, or moved to Trash: removed here.
+    remove: Vec<String>,
+    /// New, or back from Trash: imported if we don't hold them.
+    fetch: Vec<String>,
+}
+
+impl HistoryPlan {
+    fn from_changes(changes: &[HistoryChange]) -> Self {
+        let mut plan = HistoryPlan::default();
+        let fetch = |plan: &mut HistoryPlan, id: &str, wanted: bool| {
+            plan.fetch.retain(|f| f != id);
+            plan.remove.retain(|r| r != id);
+            if wanted {
+                plan.fetch.push(id.to_owned());
+            } else {
+                plan.remove.push(id.to_owned());
+            }
+        };
+        for change in changes {
+            match change {
+                HistoryChange::Added(id) => fetch(&mut plan, id, true),
+                HistoryChange::Deleted(id) => fetch(&mut plan, id, false),
+                HistoryChange::LabelsAdded(id, labels)
+                | HistoryChange::LabelsRemoved(id, labels) => {
+                    let added = matches!(change, HistoryChange::LabelsAdded(..));
+                    if labels.iter().any(|l| l == "TRASH") {
+                        fetch(&mut plan, id, !added);
+                    }
+                    for label in labels.iter().filter(|l| kept_label(l)) {
+                        plan.relabel.push((id.clone(), label.clone(), added));
+                    }
+                }
+            }
+        }
+        plan
+    }
+}
+
+/// The work of `sync_account` once the mailbox is claimed. Returns whether
+/// anything changed.
+async fn sync_claimed(
+    pool: &PgPool,
+    google: &Arc<GoogleClient>,
+    cipher: &DataCipher,
+    owner: Uuid,
+    account: &Claimed,
+    history_id: Option<String>,
+) -> Result<bool, ImportFailure> {
+    let refresh = open_token(cipher, owner, &account.google_sub, &account.sealed_token)?;
+    let access = google.refresh_access_token(&refresh).await?;
+
+    let mut read = None;
+    if let Some(start) = history_id.filter(|h| valid_history_id(h)) {
+        read = read_history(google, &access, &start).await?;
+    }
+    let Some((changes, latest)) = read else {
+        // No history to read: import, then read history from before it.
+        let latest = google.history_id(&access).await?;
+        let counts = Counts::default();
+        let deadline = tokio::time::Instant::now() + BACKFILL_DEADLINE;
+        import_with(
+            pool, google, cipher, owner, account, &access, deadline, &counts,
+        )
+        .await?;
+        save_history_id(pool, owner, account.id, &latest).await?;
+        return Ok(true);
+    };
+    if changes.is_empty() {
+        save_history_id(pool, owner, account.id, &latest).await?;
+        return Ok(false);
+    }
+
+    let plan = HistoryPlan::from_changes(&changes);
+    for (gmail_id, label, added) in &plan.relabel {
+        relabel(pool, owner, account.id, gmail_id, label, *added).await?;
+    }
+    sqlx::query(
+        "DELETE FROM mail_messages
+          WHERE owner_id = $1 AND account_id = $2 AND gmail_id = ANY($3)",
+    )
+    .bind(owner)
+    .bind(account.id)
+    .bind(&plan.remove)
+    .execute(pool)
+    .await?;
+    let stored: Vec<String> = sqlx::query_scalar(
+        "SELECT gmail_id FROM mail_messages
+          WHERE owner_id = $1 AND account_id = $2 AND gmail_id = ANY($3)",
+    )
+    .bind(owner)
+    .bind(account.id)
+    .bind(&plan.fetch)
+    .fetch_all(pool)
+    .await?;
+    let new: Vec<String> = plan
+        .fetch
+        .into_iter()
+        .filter(|id| !stored.contains(id))
+        .collect();
+    let counts = Counts::default();
+    let run = Fetch {
+        pool,
+        google,
+        cipher,
+        owner,
+        account,
+        access: &access,
+        counts: &counts,
+        pace: RateLimiter::direct(Quota::per_second(FETCHES_PER_SECOND)),
+    };
+    let deadline = tokio::time::Instant::now() + BACKFILL_DEADLINE;
+    match run
+        .fetch_and_store(new, &HashMap::new(), Some(deadline))
+        .await?
+    {
+        // Everything is in: the next sync starts after these changes.
+        Fetched::All => save_history_id(pool, owner, account.id, &latest).await?,
+        // Some new mail isn't in yet. The history point stays, so the next
+        // sync reads these changes again; applying them twice is harmless.
+        Fetched::OutOfTime | Fetched::Failed(_) => {}
+    }
+
+    // Labels and Gmail's counts may have changed with the mail.
+    let user_labels = google.list_user_labels(&access, MAX_USER_LABELS).await?;
+    store_labels(pool, cipher, owner, account.id, &user_labels).await?;
+    store_gmail_totals(pool, google, &access, owner, account.id, &user_labels).await?;
+    Ok(true)
+}
+
+/// Every change since `start`, and the history ID they run up to. `None`
+/// when Gmail can't read from `start` any more (404), or there are more
+/// changes than a sync reads: then the mailbox is imported instead.
+async fn read_history(
+    google: &GoogleClient,
+    access: &Secret,
+    start: &str,
+) -> Result<Option<(Vec<HistoryChange>, String)>, ImportFailure> {
+    let mut changes = Vec::new();
+    let mut page = None;
+    for _ in 0..MAX_HISTORY_PAGES {
+        let read = match google.list_history(access, start, page.as_deref()).await {
+            Ok(read) => read,
+            Err(GoogleApiError::Status(404, _)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        changes.extend(read.changes);
+        match read.next {
+            Some(next) => page = Some(next),
+            None => return Ok(Some((changes, read.history_id))),
+        }
+    }
+    Ok(None)
+}
+
+async fn save_history_id(
+    pool: &PgPool,
+    owner: Uuid,
+    account_id: Uuid,
+    history_id: &str,
+) -> Result<(), AppError> {
+    sqlx::query("UPDATE mail_accounts SET history_id = $3 WHERE id = $1 AND owner_id = $2")
+        .bind(account_id)
+        .bind(owner)
+        .bind(history_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Puts `label` on, or takes it off, one stored message. Messages stored
+/// before labels were recorded keep NULL until an import fills them in.
+async fn relabel(
+    pool: &PgPool,
+    owner: Uuid,
+    account_id: Uuid,
+    gmail_id: &str,
+    label: &str,
+    added: bool,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE mail_messages SET labels = CASE
+                 WHEN $5 AND NOT ($4 = ANY(labels)) THEN array_append(labels, $4)
+                 WHEN $5 THEN labels
+                 ELSE array_remove(labels, $4)
+             END
+          WHERE owner_id = $1 AND account_id = $2 AND gmail_id = $3
+            AND labels IS NOT NULL",
+    )
+    .bind(owner)
+    .bind(account_id)
+    .bind(gmail_id)
+    .bind(label)
+    .bind(added)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ---- push sync: watches ----------------------------------------------------
+
+/// A mailbox a notification is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MailboxRef {
+    pub account: Uuid,
+    pub owner: Uuid,
+}
+
+/// The watched mailboxes for the Gmail address a notification names. One
+/// address can be linked by several Hadal users: each gets its own sync, of
+/// its own row. Mailboxes that aren't watched (their owner hasn't signed in
+/// lately) are left alone.
+pub async fn watched_mailboxes(pool: &PgPool, email: &str) -> Result<Vec<MailboxRef>, AppError> {
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT id, owner_id FROM mail_accounts
+          WHERE lower(email) = lower($1) AND watch_expires_at IS NOT NULL",
+    )
+    .bind(email)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(account, owner)| MailboxRef { account, owner })
+        .collect())
+}
+
+/// Whether a user other than `owner` has this mailbox watched.
+async fn watched_elsewhere(pool: &PgPool, owner: Uuid, email: &str) -> Result<bool, AppError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM mail_accounts
+          WHERE lower(email) = lower($1) AND owner_id <> $2 AND watch_expires_at IS NOT NULL)",
+    )
+    .bind(email)
+    .bind(owner)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Starts or renews the watch of every mailbox whose owner signed in within
+/// `active_days` and whose watch is missing or due (only `owner`'s, if
+/// given). Returns the ones never imported, so the caller can sync them.
+pub async fn renew_watches(
+    pool: &PgPool,
+    google: &GoogleClient,
+    cipher: &DataCipher,
+    topic: &str,
+    active_days: u32,
+    only_owner: Option<Uuid>,
+) -> Result<Vec<MailboxRef>, AppError> {
+    let due: Vec<(Uuid, Uuid, String, Vec<u8>, bool)> = sqlx::query_as(
+        "SELECT a.id, a.owner_id, a.google_sub, a.refresh_token_enc, a.history_id IS NULL
+           FROM mail_accounts a
+           JOIN users u ON u.id = a.owner_id
+          WHERE u.last_login_at > now() - make_interval(days => $1)
+            AND (a.watch_expires_at IS NULL
+                 OR a.watch_expires_at < now() + make_interval(days => $2))
+            AND ($3::uuid IS NULL OR a.owner_id = $3)",
+    )
+    .bind(i32::try_from(active_days).unwrap_or(i32::MAX))
+    .bind(WATCH_RENEW_DAYS)
+    .bind(only_owner)
+    .fetch_all(pool)
+    .await?;
+    let mut unsynced = Vec::new();
+    for (account, owner, sub, sealed, never_synced) in due {
+        let watched = async {
+            let refresh = open_token(cipher, owner, &sub, &sealed).map_err(ImportFailure::App)?;
+            let access = google.refresh_access_token(&refresh).await?;
+            Ok::<_, ImportFailure>(google.watch(&access, topic).await?)
+        };
+        match watched.await {
+            Ok(watch) => {
+                sqlx::query(
+                    "UPDATE mail_accounts SET watch_expires_at = $3
+                      WHERE id = $1 AND owner_id = $2",
+                )
+                .bind(account)
+                .bind(owner)
+                .bind(watch.expires_at)
+                .execute(pool)
+                .await?;
+                if never_synced {
+                    unsynced.push(MailboxRef { account, owner });
+                }
+            }
+            Err(e) => tracing::warn!(%account, error = %e, "Gmail watch failed"),
+        }
+    }
+    Ok(unsynced)
+}
+
+/// Stops watching the mailboxes of users who haven't signed in within
+/// `active_days`: their mail is no longer pulled in while they're away.
+/// Their next import or sign-in starts it again.
+pub async fn stop_idle_watches(
+    pool: &PgPool,
+    google: &GoogleClient,
+    cipher: &DataCipher,
+    active_days: u32,
+) -> Result<(), AppError> {
+    let idle: Vec<(Uuid, Uuid, String, Vec<u8>, String)> = sqlx::query_as(
+        "UPDATE mail_accounts a SET watch_expires_at = NULL
+           FROM users u
+          WHERE u.id = a.owner_id
+            AND a.watch_expires_at IS NOT NULL
+            AND u.last_login_at <= now() - make_interval(days => $1)
+         RETURNING a.id, a.owner_id, a.google_sub, a.refresh_token_enc, a.email",
+    )
+    .bind(i32::try_from(active_days).unwrap_or(i32::MAX))
+    .fetch_all(pool)
+    .await?;
+    for (account, owner, sub, sealed, email) in idle {
+        if watched_elsewhere(pool, owner, &email).await? {
+            continue;
+        }
+        let Ok(refresh) = open_token(cipher, owner, &sub, &sealed) else {
+            continue;
+        };
+        if let Err(e) = stop_watch(google, &refresh).await {
+            tracing::warn!(%account, error = %e, "could not stop a Gmail watch");
+        }
+    }
+    Ok(())
+}
+
+/// Stops Gmail's notifications for the mailbox this grant is for.
+pub async fn stop_watch(google: &GoogleClient, refresh: &Secret) -> Result<(), GoogleApiError> {
+    let access = google.refresh_access_token(refresh).await?;
+    google.stop_watch(&access).await
+}
+
+/// Watched mailboxes with no sync for `quiet_secs`. Gmail may drop or delay
+/// notifications; these get a sync anyway, as Gmail recommends.
+pub async fn quiet_mailboxes(pool: &PgPool, quiet_secs: f64) -> Result<Vec<MailboxRef>, AppError> {
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT id, owner_id FROM mail_accounts
+          WHERE watch_expires_at IS NOT NULL
+            AND (last_import_at IS NULL OR last_import_at < now() - make_interval(secs => $1))",
+    )
+    .bind(quiet_secs)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(account, owner)| MailboxRef { account, owner })
+        .collect())
+}
+
 // ---- parsing Gmail messages -------------------------------------------------
 
 #[derive(Debug)]
@@ -1927,6 +2446,38 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(p.body, "hi");
+    }
+
+    #[test]
+    fn history_becomes_a_plan_in_gmails_order() {
+        use HistoryChange::*;
+        let ids = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let plan = HistoryPlan::from_changes(&[
+            Added("new".into()),
+            LabelsAdded("old".into(), ids(&["STARRED", "CHAT"])),
+            LabelsRemoved("old".into(), ids(&["UNREAD"])),
+            // Trashed: removed here, like a delete.
+            LabelsAdded("binned".into(), ids(&["TRASH"])),
+            Deleted("gone".into()),
+            // Arrived and deleted again before the sync: nothing to fetch.
+            Added("draft1".into()),
+            Deleted("draft1".into()),
+            // Trashed, then restored: fetched again.
+            LabelsAdded("back".into(), ids(&["TRASH", "INBOX"])),
+            LabelsRemoved("back".into(), ids(&["TRASH"])),
+        ]);
+        assert_eq!(
+            plan,
+            HistoryPlan {
+                relabel: vec![
+                    ("old".into(), "STARRED".into(), true),
+                    ("old".into(), "UNREAD".into(), false),
+                    ("back".into(), "INBOX".into(), true),
+                ],
+                remove: ids(&["binned", "gone", "draft1"]),
+                fetch: ids(&["new", "back"]),
+            }
+        );
     }
 
     #[test]

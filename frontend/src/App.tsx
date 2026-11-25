@@ -6,6 +6,7 @@ import {
   LOGIN_PATH,
   PAGE_SIZE,
   UnauthorizedError,
+  watchMail,
   type FolderLabel,
   type MailAccount,
   type MailAttachment,
@@ -264,6 +265,8 @@ const formatDate = (iso: string) => new Date(iso).toLocaleString()
 const BUSY_RETRY_MS = 20_000
 /** How long to wait after an import round that Gmail slowed to nothing. */
 const SLOW_DOWN_MS = 10_000
+/** How long a burst of live changes is gathered before the list reloads once. */
+const LIVE_RELOAD_MS = 1_000
 
 /**
  * The number next to a folder, as Gmail's sidebar shows it: unread
@@ -603,6 +606,30 @@ function Mail(props: {
       handle(err)
     }
   }
+
+  // New mail as it arrives: Gmail tells the server, the server tells this
+  // page, and the page reloads the list. Changes close together reload once.
+  let reloadTimer: ReturnType<typeof setTimeout> | undefined
+  const reloadSoon = () => {
+    if (reloadTimer !== undefined) return
+    reloadTimer = setTimeout(async () => {
+      reloadTimer = undefined
+      if (stopped) return
+      try {
+        await Promise.all([refetchAccounts(), refetchMessages()])
+      } catch (err) {
+        handle(err)
+      }
+    }, LIVE_RELOAD_MS)
+  }
+  const stopWatching = watchMail(reloadSoon, () => {
+    // The stream can't reconnect: usually the session ended. Check.
+    api.me().then((me) => me ?? props.onSignedOut(), () => {})
+  })
+  onCleanup(() => {
+    stopWatching()
+    if (reloadTimer !== undefined) clearTimeout(reloadTimer)
+  })
 
   // Import automatically once per page load, as soon as there is an account.
   let autoImported = false

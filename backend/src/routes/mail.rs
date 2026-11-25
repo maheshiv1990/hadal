@@ -6,17 +6,22 @@
 use actix_web::http::header::{
     Charset, ContentDisposition, DispositionParam, DispositionType, ExtendedValue,
 };
-use actix_web::{HttpResponse, delete, get, post, web};
+use actix_web::{HttpRequest, HttpResponse, delete, get, post, web};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
+use crate::auth::cookies::{self, SESSION_COOKIE};
 use crate::auth::google::GoogleClient;
+use crate::auth::session;
+use crate::config::SessionConfig;
 use crate::crypto::DataCipher;
 use crate::error::AppError;
+use crate::events::{MailEvents, open_stream};
 use crate::mail::{self, ImportOutcome};
+use crate::push::{self, Push, Syncer};
 
 #[get("/accounts")]
 pub async fn accounts(
@@ -35,20 +40,25 @@ pub async fn disconnect(
     cipher: web::Data<DataCipher>,
     id: web::Path<Uuid>,
 ) -> Result<HttpResponse, AppError> {
-    let grant = match mail::delete_account(&pool, &cipher, user.user_id, id.into_inner()).await? {
-        mail::Unlinked::Removed(grant) => grant,
-        mail::Unlinked::SignInAccount => {
-            return Err(AppError::Conflict(
-                "This is the account you sign in with, so it can't be disconnected.",
-            ));
+    let (grant, watched) =
+        match mail::delete_account(&pool, &cipher, user.user_id, id.into_inner()).await? {
+            mail::Unlinked::Removed { grant, watched } => (grant, watched),
+            mail::Unlinked::SignInAccount => {
+                return Err(AppError::Conflict(
+                    "This is the account you sign in with, so it can't be disconnected.",
+                ));
+            }
+            mail::Unlinked::NotFound => return Err(AppError::NotFound),
+        };
+    // Best effort: the mailbox and its mail are already deleted here. Gmail's
+    // notifications stop first, while the grant still works.
+    if let Some(grant) = grant {
+        if watched && let Err(e) = mail::stop_watch(&google, &grant).await {
+            tracing::warn!(error = %e, "could not stop Gmail notifications for an unlinked mailbox");
         }
-        mail::Unlinked::NotFound => return Err(AppError::NotFound),
-    };
-    // Best effort: the mailbox and its mail are already deleted here.
-    if let Some(grant) = grant
-        && let Err(e) = google.revoke(&grant).await
-    {
-        tracing::warn!(error = %e, "could not revoke Google access for an unlinked mailbox");
+        if let Err(e) = google.revoke(&grant).await {
+            tracing::warn!(error = %e, "could not revoke Google access for an unlinked mailbox");
+        }
     }
     Ok(HttpResponse::NoContent().finish())
 }
@@ -65,22 +75,62 @@ pub async fn import(
     pool: web::Data<PgPool>,
     google: web::Data<GoogleClient>,
     cipher: web::Data<DataCipher>,
+    push: Option<web::Data<Push>>,
+    hub: web::Data<MailEvents>,
     _body: web::Json<ImportRequest>,
 ) -> Result<HttpResponse, AppError> {
-    match mail::import_all(
-        &pool,
-        google.into_inner(),
-        cipher.into_inner(),
-        user.user_id,
-    )
-    .await?
-    {
+    let (google, cipher) = (google.into_inner(), cipher.into_inner());
+    let outcome = mail::import_all(&pool, google.clone(), cipher.clone(), user.user_id).await?;
+    // Someone importing is using Hadal: from now on Gmail tells us about
+    // their new mail, instead of waiting for the next import.
+    if let Some(push) = push {
+        let syncer = Syncer {
+            pool: pool.get_ref().clone(),
+            google,
+            cipher,
+            events: hub.get_ref().clone(),
+        };
+        actix_web::rt::spawn(async move {
+            push::watch_owner(&syncer, &push, user.user_id).await;
+        });
+    }
+    match outcome {
         ImportOutcome::Done(results) => {
             let imported: u32 = results.iter().map(|a| a.imported).sum();
             Ok(HttpResponse::Ok().json(json!({ "imported": imported, "accounts": results })))
         }
         ImportOutcome::Busy => Err(AppError::Conflict("an import is already running")),
     }
+}
+
+/// Live updates for the signed-in user's open page: a Server-Sent Events
+/// stream with an `event: mail` (data `{"account": "<mailbox id>"}`) each
+/// time a mailbox of theirs changes, and a `: ping` comment line every 20 s.
+/// The stream ends when the session does; the browser then reconnects
+/// through `require_session` like any other request.
+#[get("/events")]
+pub async fn live_events(
+    user: AuthUser,
+    req: HttpRequest,
+    pool: web::Data<PgPool>,
+    hub: web::Data<MailEvents>,
+    sessions: web::Data<SessionConfig>,
+) -> Result<HttpResponse, AppError> {
+    // `require_session` already checked this cookie.
+    let token = cookies::read(req.headers(), SESSION_COOKIE).ok_or(AppError::Unauthorized)?;
+    let stream = open_stream(
+        &hub,
+        pool.get_ref().clone(),
+        user.user_id,
+        session::token_hash(&token),
+        sessions.idle_secs,
+    )
+    .ok_or(AppError::TooManyRequests)?;
+    Ok(HttpResponse::Ok()
+        .content_type("text/event-stream")
+        // nginx: pass each event on at once instead of buffering the stream.
+        .insert_header(("X-Accel-Buffering", "no"))
+        .body(stream))
 }
 
 /// `?account=<mailbox id>&label=<ALL, a system folder or a user label ID>&page=<n>`,

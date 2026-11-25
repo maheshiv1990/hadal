@@ -140,6 +140,30 @@ export async function downloadAttachment(messageId: string, attachment: MailAtta
   }
 }
 
+/**
+ * Listens for changes to the signed-in user's mailboxes (Server-Sent Events
+ * from `/api/mail/events`): `onChange` gets the ID of each mailbox Gmail
+ * says changed, as it happens. The event carries no mail; reload it through
+ * the usual endpoints. The browser reconnects a dropped stream by itself;
+ * when the session has ended it can't, and `onEnded` is called. Returns a
+ * function that stops listening.
+ */
+export function watchMail(onChange: (accountId: string) => void, onEnded: () => void): () => void {
+  const source = new EventSource('/api/mail/events')
+  source.addEventListener('mail', (e) => {
+    try {
+      const { account } = JSON.parse((e as MessageEvent<string>).data) as { account: string }
+      onChange(account)
+    } catch {
+      // Not an event we understand: nothing to reload.
+    }
+  })
+  source.onerror = () => {
+    if (source.readyState === EventSource.CLOSED) onEnded()
+  }
+  return () => source.close()
+}
+
 /** Starts Google sign-in. A plain link: the server redirects to Google. */
 export const LOGIN_PATH = '/api/auth/login'
 
