@@ -32,6 +32,7 @@ use crate::auth::google::{
     GoogleApiError, GoogleClient, HistoryChange, Identity, LabelCounts, UserLabel,
     valid_attachment_id, valid_gmail_id, valid_history_id, valid_user_label_id,
 };
+use crate::compose;
 use crate::config::Secret;
 use crate::crypto::DataCipher;
 use crate::error::AppError;
@@ -209,6 +210,7 @@ pub async fn store_account(
     owner: Uuid,
     identity: &Identity,
     refresh: &Secret,
+    can_send: bool,
 ) -> Result<Stored, AppError> {
     let others: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM mail_accounts WHERE owner_id = $1 AND google_sub <> $2",
@@ -225,17 +227,19 @@ pub async fn store_account(
         &token_aad(owner, &identity.sub),
     )?;
     sqlx::query(
-        "INSERT INTO mail_accounts (id, owner_id, google_sub, email, refresh_token_enc)
-         VALUES ($1, $2, $3, $4, $5)
+        "INSERT INTO mail_accounts (id, owner_id, google_sub, email, refresh_token_enc, can_send)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (owner_id, google_sub) DO UPDATE SET
              email = EXCLUDED.email,
-             refresh_token_enc = EXCLUDED.refresh_token_enc",
+             refresh_token_enc = EXCLUDED.refresh_token_enc,
+             can_send = EXCLUDED.can_send",
     )
     .bind(Uuid::new_v4())
     .bind(owner)
     .bind(&identity.sub)
     .bind(&identity.email)
     .bind(sealed)
+    .bind(can_send)
     .execute(pool)
     .await?;
     Ok(Stored::Linked)
@@ -249,6 +253,9 @@ pub struct Account {
     created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339::option")]
     last_import_at: Option<OffsetDateTime>,
+    /// The user granted permission to send from this mailbox. If not, they
+    /// can reconnect it to grant it.
+    can_send: bool,
     message_count: i64,
     /// Messages per label ID, plus `ALL` (everything but spam). Mail imported
     /// before labels were recorded counts as Inbox until the next import.
@@ -283,8 +290,16 @@ pub async fn list_accounts(
     cipher: &DataCipher,
     owner: Uuid,
 ) -> Result<Vec<Account>, AppError> {
-    let rows: Vec<(Uuid, String, OffsetDateTime, Option<OffsetDateTime>, i64)> = sqlx::query_as(
-        "SELECT a.id, a.email, a.created_at, a.last_import_at, count(m.id)
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        Uuid,
+        String,
+        OffsetDateTime,
+        Option<OffsetDateTime>,
+        bool,
+        i64,
+    )> = sqlx::query_as(
+        "SELECT a.id, a.email, a.created_at, a.last_import_at, a.can_send, count(m.id)
            FROM mail_accounts a
            LEFT JOIN mail_messages m ON m.account_id = a.id AND m.owner_id = $1
           WHERE a.owner_id = $1
@@ -319,44 +334,47 @@ pub async fn list_accounts(
     .await?;
 
     rows.into_iter()
-        .map(|(id, email, created_at, last_import_at, message_count)| {
-            let mut folder_counts: HashMap<String, i64> = counts
-                .iter()
-                .filter(|c| c.0 == id)
-                .map(|c| (c.1.clone(), c.2))
-                .collect();
-            let spam = folder_counts.get("SPAM").copied().unwrap_or(0);
-            folder_counts.insert("ALL".to_owned(), message_count - spam);
-            // Unread is a mark on messages, not a folder.
-            folder_counts.remove(UNREAD);
-            let mine_totals = || gmail_totals.iter().filter(|t| t.0 == id);
-            let gmail_counts = mine_totals().map(|t| (t.1.clone(), t.2)).collect();
-            let gmail_unread = mine_totals().map(|t| (t.1.clone(), t.3)).collect();
-            let mut mine = labels
-                .iter()
-                .filter(|l| l.0 == id)
-                .map(|(_, label_id, sealed, color)| {
-                    let name = cipher.decrypt(sealed, &label_aad(owner, id, label_id))?;
-                    Ok(LabelInfo {
-                        id: label_id.clone(),
-                        name: String::from_utf8_lossy(&name).into_owned(),
-                        color: color.clone(),
+        .map(
+            |(id, email, created_at, last_import_at, can_send, message_count)| {
+                let mut folder_counts: HashMap<String, i64> = counts
+                    .iter()
+                    .filter(|c| c.0 == id)
+                    .map(|c| (c.1.clone(), c.2))
+                    .collect();
+                let spam = folder_counts.get("SPAM").copied().unwrap_or(0);
+                folder_counts.insert("ALL".to_owned(), message_count - spam);
+                // Unread is a mark on messages, not a folder.
+                folder_counts.remove(UNREAD);
+                let mine_totals = || gmail_totals.iter().filter(|t| t.0 == id);
+                let gmail_counts = mine_totals().map(|t| (t.1.clone(), t.2)).collect();
+                let gmail_unread = mine_totals().map(|t| (t.1.clone(), t.3)).collect();
+                let mut mine = labels
+                    .iter()
+                    .filter(|l| l.0 == id)
+                    .map(|(_, label_id, sealed, color)| {
+                        let name = cipher.decrypt(sealed, &label_aad(owner, id, label_id))?;
+                        Ok(LabelInfo {
+                            id: label_id.clone(),
+                            name: String::from_utf8_lossy(&name).into_owned(),
+                            color: color.clone(),
+                        })
                     })
+                    .collect::<Result<Vec<_>, AppError>>()?;
+                mine.sort_by_key(|l| l.name.to_lowercase());
+                Ok(Account {
+                    id,
+                    email,
+                    created_at,
+                    last_import_at,
+                    can_send,
+                    message_count,
+                    folder_counts,
+                    gmail_counts,
+                    gmail_unread,
+                    labels: mine,
                 })
-                .collect::<Result<Vec<_>, AppError>>()?;
-            mine.sort_by_key(|l| l.name.to_lowercase());
-            Ok(Account {
-                id,
-                email,
-                created_at,
-                last_import_at,
-                message_count,
-                folder_counts,
-                gmail_counts,
-                gmail_unread,
-                labels: mine,
-            })
-        })
+            },
+        )
         .collect()
 }
 
@@ -739,6 +757,84 @@ pub async fn download_attachment(
         filename: attachment.filename,
         bytes,
     }))
+}
+
+// ---- sending ----------------------------------------------------------------
+
+/// How sending a message from one of `owner`'s mailboxes went.
+pub enum Sent {
+    Done,
+    /// No such mailbox, or it is someone else's.
+    NotFound,
+    /// The mailbox was linked without permission to send.
+    NotAllowed,
+    /// Something in the draft can't be sent as it is.
+    Invalid(compose::Invalid),
+}
+
+/// Sends `draft` from the caller's mailbox `account_id`. The sender is that
+/// mailbox's own address, from our row: the request picks only which of the
+/// caller's mailboxes (CASA 3.1.4). Nothing of the message is stored or
+/// logged here; the sent copy arrives from Gmail like any other mail.
+pub async fn send_message(
+    pool: &PgPool,
+    google: &GoogleClient,
+    cipher: &DataCipher,
+    owner: Uuid,
+    account_id: Uuid,
+    draft: &compose::Draft<'_>,
+) -> Result<Sent, AppError> {
+    let row: Option<(String, String, Vec<u8>, bool)> = sqlx::query_as(
+        "SELECT google_sub, email, refresh_token_enc, can_send FROM mail_accounts
+          WHERE id = $1 AND owner_id = $2",
+    )
+    .bind(account_id)
+    .bind(owner)
+    .fetch_optional(pool)
+    .await?;
+    let Some((google_sub, email, sealed_token, can_send)) = row else {
+        return Ok(Sent::NotFound);
+    };
+    if !can_send {
+        return Ok(Sent::NotAllowed);
+    }
+    let message = match compose::build(&email, draft) {
+        Ok(message) => message,
+        Err(invalid) => return Ok(Sent::Invalid(invalid)),
+    };
+
+    let gmail_failed = |e: GoogleApiError| {
+        // Only the mailbox and Google's status: never who it was to or
+        // what it said.
+        tracing::warn!(account = %account_id, error = %e, "sending mail failed");
+        match e {
+            GoogleApiError::Revoked => {
+                AppError::Upstream("Google access was revoked or expired. Reconnect this mailbox.")
+            }
+            ref e if e.is_rate_limited() => AppError::Upstream(
+                "Gmail is limiting requests right now. Wait a minute and try again.",
+            ),
+            GoogleApiError::Status(403, _) => AppError::Upstream(
+                "Gmail refused to send from this mailbox. Reconnect it and allow sending.",
+            ),
+            GoogleApiError::Status(400, _) => {
+                AppError::Upstream("Gmail did not accept this message. Check the addresses.")
+            }
+            _ => AppError::Upstream(
+                "Could not reach Gmail, so the message may not have been sent. Check Sent before trying again.",
+            ),
+        }
+    };
+    let refresh = open_token(cipher, owner, &google_sub, &sealed_token)?;
+    let access = google
+        .refresh_access_token(&refresh)
+        .await
+        .map_err(gmail_failed)?;
+    google
+        .send_message(&access, &message)
+        .await
+        .map_err(gmail_failed)?;
+    Ok(Sent::Done)
 }
 
 // ---- importing --------------------------------------------------------------

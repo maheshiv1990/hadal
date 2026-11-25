@@ -135,7 +135,7 @@
       "id": "3.1.2",
       "title": "User and data attributes used by access controls cannot be manipulated by end users",
       "status": "verified",
-      "evidence": ["lint:permissive-deserialize", "test:unknown_fields_are_rejected", "test:registration_validates_input", "test:folders_follow_gmail_labels", "test:users_can_rename_themselves_and_google_sign_in_keeps_it"],
+      "evidence": ["lint:permissive-deserialize", "test:unknown_fields_are_rejected", "test:registration_validates_input", "test:folders_follow_gmail_labels", "test:users_can_rename_themselves_and_google_sign_in_keeps_it", "test:compose_sends_from_the_callers_own_mailbox_only"],
       "notes": "Every request body struct uses deny_unknown_fields, so server-controlled fields such as id, created_at and (later) owner_id cannot be mass-assigned. Registration rejects extra fields such as id, password_hash and google_sub; the profile update takes only first_name and last_name (not email or any flag). Query strings are typed the same way: the message list accepts only account (a UUID) and label (ALL, one of ten Gmail system labels, or a Label_<id> user label ID), and anything else is a 400."
     },
     {
@@ -148,7 +148,7 @@
       "id": "3.1.4",
       "title": "Sensitive resources are protected against IDOR on create, read, update and delete",
       "status": "verified",
-      "evidence": ["test:users_cannot_reach_each_others_mail", "test:unknown_fields_are_rejected", "lint:notes-owner-scope", "test:push_sync_applies_gmails_history_to_the_stored_mail", "test:live_events_reach_the_owner_and_end_with_the_session"],
+      "evidence": ["test:users_cannot_reach_each_others_mail", "test:unknown_fields_are_rejected", "lint:notes-owner-scope", "test:push_sync_applies_gmails_history_to_the_stored_mail", "test:live_events_reach_the_owner_and_end_with_the_session", "test:compose_sends_from_the_callers_own_mailbox_only"],
       "notes": "Every mail_accounts and mail_messages query is scoped by owner_id from the session, never from the request (lint:notes-owner-scope covers both tables, and still flags the removed notes table if it comes back). mail_messages has a composite foreign key to (mailbox id, owner_id), so a message can't belong to someone else's mailbox. The message list's optional account filter is ANDed with owner_id, so another user's mailbox id matches nothing. Another user's mailbox, message or attachment returns the same 404 as a missing one; an attachment download is picked by its position in the owner's own encrypted record, never by a Gmail ID from the request. The Gmail link callback takes the user from the single-use pending row, not the request. Push sync: the one lookup not keyed by a session's user is by the Gmail address a Google-signed notification names (mail::watched_mailboxes). It returns (mailbox, owner) pairs from our rows; every query after it, and the sync itself, is scoped by that stored owner_id. Live events go only to the owner's own streams."
     },
     {

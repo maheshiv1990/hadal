@@ -8,6 +8,7 @@ import {
   UnauthorizedError,
   watchMail,
   type FolderLabel,
+  type OutgoingMail,
   type MailAccount,
   type MailAttachment,
   type Me,
@@ -268,6 +269,177 @@ const SLOW_DOWN_MS = 10_000
 /** How long a burst of live changes is gathered before the list reloads once. */
 const LIVE_RELOAD_MS = 1_000
 
+/** Same limits as the server (`backend/src/compose.rs`). */
+const MAX_RECIPIENTS = 50
+const MAX_SUBJECT_CHARS = 255
+const MAX_BODY_CHARS = 100_000
+
+/** Addresses typed into To, Cc or Bcc: split on commas, semicolons, spaces. */
+const splitAddresses = (text: string) => text.split(/[\s,;]+/).filter(Boolean)
+/** A rough check for a typo; the server decides what it accepts. */
+const looksLikeAddress = (a: string) => /^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/.test(a)
+
+/**
+ * The form for a new message: plain text, from one of the user's mailboxes
+ * that may send. Nothing typed here is kept anywhere but this form's state
+ * (CASA 6.6.1): leaving it discards the message.
+ */
+function Compose(props: {
+  /** Mailboxes the user allowed sending from. Never empty. */
+  senders: MailAccount[]
+  /** The mailbox being viewed, used as the sender when it may send. */
+  preferred: string | undefined
+  /** An address to start the To field with. */
+  to: string
+  onSent: () => void
+  onDiscard: () => void
+  onSignedOut: () => void
+}) {
+  const [from, setFrom] = createSignal(
+    props.senders.find((a) => a.id === props.preferred)?.id ?? props.senders[0].id,
+  )
+  const [to, setTo] = createSignal(props.to)
+  const [cc, setCc] = createSignal('')
+  const [bcc, setBcc] = createSignal('')
+  const [showCopies, setShowCopies] = createSignal(false)
+  const [subject, setSubject] = createSignal('')
+  const [body, setBody] = createSignal('')
+  const [sending, setSending] = createSignal(false)
+  const [error, setError] = createSignal<string | null>(null)
+
+  const empty = () => ![to(), cc(), bcc(), subject(), body()].some((v) => v.trim())
+  const discard = () => {
+    if (empty() || window.confirm('Discard this message?')) props.onDiscard()
+  }
+
+  const send = async (e: SubmitEvent) => {
+    e.preventDefault()
+    if (sending()) return
+    const message: OutgoingMail = {
+      account: from(),
+      to: splitAddresses(to()),
+      cc: splitAddresses(cc()),
+      bcc: splitAddresses(bcc()),
+      subject: subject().trim(),
+      body: body(),
+    }
+    const recipients = [...message.to, ...message.cc, ...message.bcc]
+    const typo = recipients.find((a) => !looksLikeAddress(a))
+    if (!recipients.length) return setError('Add at least one recipient.')
+    if (typo) return setError(`"${typo}" isn't an email address. Use plain addresses, like ada@example.com.`)
+    if (recipients.length > MAX_RECIPIENTS) return setError(`Too many recipients (${MAX_RECIPIENTS} at most).`)
+    if (!message.subject && !message.body.trim() && !window.confirm('Send this message without a subject or text?')) {
+      return
+    }
+    setError(null)
+    setSending(true)
+    try {
+      await api.sendMail(message)
+      props.onSent()
+    } catch (err) {
+      if (err instanceof UnauthorizedError) props.onSignedOut()
+      else setError((err as Error).message)
+    } finally {
+      setSending(false)
+    }
+  }
+
+  return (
+    <form class="compose" onSubmit={send} aria-label="New message">
+      <h2>New message</h2>
+      <Show when={error()}>
+        <p class="error" role="alert">{error()}</p>
+      </Show>
+      <label>
+        <span>From</span>
+        <Show when={props.senders.length > 1} fallback={<input type="email" value={props.senders[0].email} disabled />}>
+          <select value={from()} onChange={(e) => setFrom(e.currentTarget.value)} disabled={sending()}>
+            <For each={props.senders}>{(a) => <option value={a.id}>{a.email}</option>}</For>
+          </select>
+        </Show>
+      </label>
+      <label>
+        <span>To</span>
+        <input
+          type="text"
+          inputmode="email"
+          autocomplete="off"
+          autocapitalize="off"
+          spellcheck={false}
+          placeholder="ada@example.com, bob@example.com"
+          value={to()}
+          onInput={(e) => setTo(e.currentTarget.value)}
+          disabled={sending()}
+          autofocus
+        />
+      </label>
+      <Show
+        when={showCopies()}
+        fallback={
+          <button type="button" class="link compose-copies" onClick={() => setShowCopies(true)}>
+            Add Cc or Bcc
+          </button>
+        }
+      >
+        <label>
+          <span>Cc</span>
+          <input
+            type="text"
+            inputmode="email"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck={false}
+            value={cc()}
+            onInput={(e) => setCc(e.currentTarget.value)}
+            disabled={sending()}
+          />
+        </label>
+        <label>
+          <span>Bcc</span>
+          <input
+            type="text"
+            inputmode="email"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck={false}
+            value={bcc()}
+            onInput={(e) => setBcc(e.currentTarget.value)}
+            disabled={sending()}
+          />
+        </label>
+      </Show>
+      <label>
+        <span>Subject</span>
+        <input
+          type="text"
+          maxlength={MAX_SUBJECT_CHARS}
+          value={subject()}
+          onInput={(e) => setSubject(e.currentTarget.value)}
+          disabled={sending()}
+        />
+      </label>
+      <label class="compose-body">
+        <span>Message</span>
+        <textarea
+          rows={14}
+          maxlength={MAX_BODY_CHARS}
+          value={body()}
+          onInput={(e) => setBody(e.currentTarget.value)}
+          disabled={sending()}
+        />
+      </label>
+      <div class="compose-actions">
+        <button type="submit" disabled={sending()}>
+          {sending() ? 'Sending…' : 'Send'}
+        </button>
+        <button type="button" class="ghost" onClick={discard} disabled={sending()}>
+          Discard
+        </button>
+      </div>
+    </form>
+  )
+}
+
 /**
  * The number next to a folder, as Gmail's sidebar shows it: unread
  * conversations, in bold, and nothing when none are unread. Drafts show how
@@ -317,6 +489,54 @@ const senderName = (from: string) => {
 
 /** The bare address from a From/To header, or the header as it is if it has none. */
 const senderAddress = (from: string) => from.match(/<([^>]*)>/)?.[1] || from.trim()
+
+/** The people in a To header: split at commas, except inside a quoted name. */
+const headerPeople = (header: string) =>
+  (header.match(/(?:"[^"]*"|[^,])+/g) ?? []).map((p) => p.trim()).filter(Boolean)
+
+/**
+ * An email address as a link that starts a new message to it. It is a
+ * `mailto:` link, so copying the address from it works as usual; clicking
+ * opens Hadal's own form. Something that isn't an address stays plain text.
+ */
+function AddressLink(props: { address: string; text?: string; onCompose: (to: string) => void }) {
+  return (
+    <Show when={looksLikeAddress(props.address)} fallback={props.text ?? props.address}>
+      <a
+        class="address-link"
+        href={`mailto:${encodeURIComponent(props.address)}`}
+        onClick={(e) => {
+          e.preventDefault()
+          props.onCompose(props.address)
+        }}
+      >
+        {props.text ?? props.address}
+      </a>
+    </Show>
+  )
+}
+
+/** How many `.avatar-N` colours index.css has. */
+const AVATAR_COLOURS = 8
+
+/**
+ * A sender's profile icon: their initial on a colour picked from their
+ * address, so one sender always looks the same. Decoration only: the name is
+ * right beside it.
+ */
+function Avatar(props: { from: string }) {
+  const initial = () => senderName(props.from).match(/[\p{L}\p{N}]/u)?.[0]?.toUpperCase() ?? '?'
+  const colour = () => {
+    let hash = 0
+    for (const c of senderAddress(props.from).toLowerCase()) hash = (hash * 31 + c.charCodeAt(0)) >>> 0
+    return hash % AVATAR_COLOURS
+  }
+  return (
+    <span class={`avatar avatar-${colour()}`} aria-hidden="true">
+      {initial()}
+    </span>
+  )
+}
 
 /** "Tue, Nov 24, 9:29 AM": the reading view's date. */
 const readerDate = (iso: string) =>
@@ -463,6 +683,21 @@ function Mail(props: {
   const [detail] = createResource(openId, api.getMessage)
   const [problems, setProblems] = createSignal<string[]>([])
   const [error, setError] = createSignal<string | null>(null)
+  /** The new-message form is open in place of the list. */
+  const [composing, setComposing] = createSignal(false)
+  /** "Message sent." is shown until the user moves on. */
+  const [sent, setSent] = createSignal(false)
+  /** Mailboxes the user allowed sending from. */
+  const senders = () => (accounts() ?? []).filter((a) => a.can_send)
+  /** The address the new message starts with, when one was clicked. */
+  const [composeTo, setComposeTo] = createSignal('')
+  const compose = (to = '') => {
+    setSent(false)
+    setError(null)
+    setOpenId(null)
+    setComposeTo(to)
+    setComposing(true)
+  }
 
   const handle = (err: unknown) => {
     if (err instanceof UnauthorizedError) props.onSignedOut()
@@ -538,6 +773,8 @@ function Mail(props: {
     if (folder().startsWith('Label_')) setFolder('INBOX')
   }
   const showFolder = (label: FolderLabel) => {
+    setComposing(false)
+    setSent(false)
     setFolder(label)
     setOpenId(null)
     setPage(0)
@@ -780,13 +1017,19 @@ function Mail(props: {
       <div class="inbox-main">
         {/* Only when there's something in it: Back, Disconnect for a
             non-primary mailbox, or the page buttons. */}
-        <Show when={openId() || disconnectable() || paged()}>
+        <Show when={accounts()?.length}>
           <div class="inbox-toolbar">
             <Show
-              when={openId()}
+              when={openId() || composing()}
               fallback={
                 <>
                   <div class="toolbar-group">
+                    <button class="compose-button" onClick={() => compose()}>
+                      <svg class="folder-icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" />
+                      </svg>
+                      Compose
+                    </button>
                     <Show when={disconnectable()}>
                       {(account) => (
                         <button class="ghost danger" onClick={() => disconnect(account())}>
@@ -825,11 +1068,19 @@ function Mail(props: {
                 </>
               }
             >
-              <button class="ghost" onClick={() => setOpenId(null)} aria-label="Back to the list">
-                ← Back
-              </button>
+              <Show when={!composing()}>
+                <button class="ghost" onClick={() => setOpenId(null)} aria-label="Back to the list">
+                  ← Back
+                </button>
+              </Show>
             </Show>
           </div>
+        </Show>
+
+        <Show when={sent()}>
+          <p class="notice inbox-note" role="status">
+            Message sent.
+          </p>
         </Show>
 
         <Show when={props.linkResult === 'linked'}>
@@ -847,6 +1098,43 @@ function Mail(props: {
           <p class="error inbox-note" role="alert">{error()}</p>
         </Show>
 
+        <Show when={composing()}>
+          <Show
+            when={senders().length}
+            fallback={
+              <div class="compose">
+                <h2>New message</h2>
+                <p>
+                  Hadal can only read your mail so far. To send from it, connect your Gmail account again and allow
+                  sending on Google's screen.
+                </p>
+                <div class="compose-actions">
+                  <a class="header-link" href={GMAIL_CONNECT_PATH}>
+                    Reconnect Gmail
+                  </a>
+                  <button type="button" class="ghost" onClick={() => setComposing(false)}>
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            }
+          >
+            <Compose
+              senders={senders()}
+              preferred={selectedAccount()?.id}
+              to={composeTo()}
+              onSignedOut={props.onSignedOut}
+              onDiscard={() => setComposing(false)}
+              onSent={() => {
+                setComposing(false)
+                setSent(true)
+                // Fetch the sent copy; with push on it arrives by itself too.
+                void importAll()
+              }}
+            />
+          </Show>
+        </Show>
+        <Show when={!composing()}>
         <Show when={!accounts.error && !messages.error} fallback={<p class="error inbox-empty">Could not load your mail.</p>}>
           <Show
             when={refreshing() || (!accounts.loading && !messages.loading)}
@@ -966,10 +1254,31 @@ function Mail(props: {
                     <article class="reader">
                       <h2>{d().subject || '(no subject)'}</h2>
                       <div class="reader-meta">
-                        <div class="reader-people">
-                          <strong>{senderName(d().from)}</strong>{' '}
-                          <span class="muted">&lt;{senderAddress(d().from)}&gt;</span>
-                          <div class="muted">to {d().to || '(none)'}</div>
+                        <div class="reader-sender">
+                          <Avatar from={d().from} />
+                          <div class="reader-people">
+                            <strong>{senderName(d().from)}</strong>{' '}
+                            <span class="muted">
+                              &lt;
+                              <AddressLink address={senderAddress(d().from)} onCompose={compose} />
+                              &gt;
+                            </span>
+                            <div class="muted">
+                              to{' '}
+                              <For each={headerPeople(d().to)} fallback="(none)">
+                                {(person, i) => (
+                                  <>
+                                    {i() ? ', ' : ''}
+                                    <AddressLink
+                                      address={senderAddress(person)}
+                                      text={person}
+                                      onCompose={compose}
+                                    />
+                                  </>
+                                )}
+                              </For>
+                            </div>
+                          </div>
                         </div>
                         <time class="muted" datetime={d().received_at} title={formatDate(d().received_at)}>
                           {readerDate(d().received_at)}
@@ -1010,6 +1319,7 @@ function Mail(props: {
               </Show>
             </Show>
           </Show>
+        </Show>
         </Show>
       </div>
     </section>

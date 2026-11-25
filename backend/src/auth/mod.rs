@@ -446,7 +446,9 @@ async fn complete_link(
         .refresh_token
         .as_ref()
         .ok_or(LoginRejected::MissingRefreshToken)?;
-    match mail::store_account(pool, cipher, user_id, &grant.identity, refresh).await? {
+    // Sending is optional: without it the mailbox is linked read-only.
+    let can_send = grant.has_scope(google::GMAIL_SEND);
+    match mail::store_account(pool, cipher, user_id, &grant.identity, refresh, can_send).await? {
         mail::Stored::Linked => Ok(()),
         mail::Stored::LimitReached => Err(LoginRejected::TooManyMailboxes.into()),
     }

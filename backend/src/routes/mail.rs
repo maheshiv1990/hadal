@@ -16,6 +16,7 @@ use crate::auth::AuthUser;
 use crate::auth::cookies::{self, SESSION_COOKIE};
 use crate::auth::google::GoogleClient;
 use crate::auth::session;
+use crate::compose;
 use crate::config::SessionConfig;
 use crate::crypto::DataCipher;
 use crate::error::AppError;
@@ -100,6 +101,52 @@ pub async fn import(
             Ok(HttpResponse::Ok().json(json!({ "imported": imported, "accounts": results })))
         }
         ImportOutcome::Busy => Err(AppError::Conflict("an import is already running")),
+    }
+}
+
+/// A new message from the Compose form. Not `Debug`: it is someone's mail
+/// (CASA 6.5.1).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SendRequest {
+    /// Which of the caller's mailboxes to send from.
+    account: Uuid,
+    #[serde(default)]
+    to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    bcc: Vec<String>,
+    subject: String,
+    body: String,
+}
+
+/// Sends a message from one of the caller's mailboxes. Mounted at
+/// `/api/mail/send` (its own scope: the tighter rate limit, since each call
+/// sends real mail, and a JSON body limit that fits a long message). JSON
+/// only, so a cross-site form can't send one (CASA 3.1.5).
+#[post("")]
+pub async fn send(
+    user: AuthUser,
+    pool: web::Data<PgPool>,
+    google: web::Data<GoogleClient>,
+    cipher: web::Data<DataCipher>,
+    body: web::Json<SendRequest>,
+) -> Result<HttpResponse, AppError> {
+    let draft = compose::Draft {
+        to: &body.to,
+        cc: &body.cc,
+        bcc: &body.bcc,
+        subject: &body.subject,
+        body: &body.body,
+    };
+    match mail::send_message(&pool, &google, &cipher, user.user_id, body.account, &draft).await? {
+        mail::Sent::Done => Ok(HttpResponse::NoContent().finish()),
+        mail::Sent::NotFound => Err(AppError::NotFound),
+        mail::Sent::NotAllowed => Err(AppError::Conflict(
+            "This mailbox was connected without permission to send. Reconnect it to allow sending.",
+        )),
+        mail::Sent::Invalid(compose::Invalid(why)) => Err(AppError::BadRequest(why.into())),
     }
 }
 
