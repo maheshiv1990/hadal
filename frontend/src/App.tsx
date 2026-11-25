@@ -1,4 +1,4 @@
-import { createEffect, createResource, createSignal, For, Match, onCleanup, Show, Switch } from 'solid-js'
+import { batch, createEffect, createResource, createSignal, For, Match, onCleanup, Show, Switch } from 'solid-js'
 import {
   api,
   downloadAttachment,
@@ -698,6 +698,53 @@ const MORE_FOLDERS: Folder[] = [
   { label: 'CATEGORY_PROMOTIONS', name: 'Promotions' },
 ]
 
+/** Where the user is in their mail. */
+interface Place {
+  /** Null means the primary mailbox. */
+  mailbox: string | null
+  folder: FolderLabel
+  page: number
+  /** The open message, if one is. */
+  message: string | null
+}
+
+const UUID = /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
+
+/**
+ * A place as the part of the URL after `#`, such as
+ * `folder=SENT&page=2&message=<id>`. Only IDs and a page number go in it:
+ * no address, subject or other mail content (CASA 2.1.1). The usual place
+ * (primary mailbox, Inbox, first page, nothing open) is an empty string.
+ */
+const hashOfPlace = (place: Place) => {
+  const params = new URLSearchParams()
+  if (place.mailbox) params.set('mailbox', place.mailbox)
+  if (place.folder !== 'INBOX') params.set('folder', place.folder)
+  if (place.page > 0) params.set('page', String(place.page))
+  if (place.message) params.set('message', place.message)
+  return params.toString()
+}
+
+/** The place a URL hash names. Anything it gets wrong falls back to the usual place. */
+const placeFromHash = (hash: string): Place => {
+  const params = new URLSearchParams(hash.replace(/^#/, ''))
+  const id = (name: string) => {
+    const value = params.get(name)
+    return value && UUID.test(value) ? value : null
+  }
+  const folder = params.get('folder')
+  const page = Number(params.get('page') ?? 0)
+  return {
+    mailbox: id('mailbox'),
+    folder: folder && /^[A-Za-z0-9_]{1,80}$/.test(folder) ? folder : 'INBOX',
+    page: Number.isInteger(page) && page >= 0 && page <= MAX_PAGE ? page : 0,
+    message: id('message'),
+  }
+}
+
+/** The last page the server lists (`mail::MAX_PAGE`). */
+const MAX_PAGE = 20_000
+
 /** Attachment chips shown under a message row. */
 const MAX_ROW_CHIPS = 3
 
@@ -717,9 +764,12 @@ function Mail(props: {
 }) {
   const [accounts, { refetch: refetchAccounts }] = createResource(api.listMailAccounts)
   /** The mailbox the user picked; null (or one since disconnected) means the primary one. */
-  const [mailbox, setMailbox] = createSignal<string | null>(null)
-  const [folder, setFolder] = createSignal<FolderLabel>('INBOX')
-  const [openId, setOpenId] = createSignal<string | null>(null)
+  // Where the user is (mailbox, folder, page, open message) starts from the
+  // address bar, so a reload or a bookmark comes back to the same place.
+  const start = placeFromHash(window.location.hash)
+  const [mailbox, setMailbox] = createSignal<string | null>(start.mailbox)
+  const [folder, setFolder] = createSignal<FolderLabel>(start.folder)
+  const [openId, setOpenId] = createSignal<string | null>(start.message)
   const [detail] = createResource(openId, api.getMessage)
   const [problems, setProblems] = createSignal<string[]>([])
   const [error, setError] = createSignal<string | null>(null)
@@ -776,7 +826,27 @@ function Mail(props: {
     return account && !isPrimary(account) ? account : undefined
   }
   /** Page of the list being shown, counted from 0; back to 0 on a new folder. */
-  const [page, setPage] = createSignal(0)
+  const [page, setPage] = createSignal(start.page)
+  // Keep the address bar in step with where the user is: each move is a
+  // history entry, so the browser's Back button steps through them too.
+  createEffect(() => {
+    const hash = hashOfPlace({ mailbox: mailbox(), folder: folder(), page: page(), message: openId() })
+    if (hash !== window.location.hash.replace(/^#/, '')) {
+      window.history.pushState(null, '', window.location.pathname + (hash ? `#${hash}` : ''))
+    }
+  })
+  const onMoved = () => {
+    const place = placeFromHash(window.location.hash)
+    batch(() => {
+      setMailbox(place.mailbox)
+      setFolder(place.folder)
+      setPage(place.page)
+      setOpenId(place.message)
+      if (place.message) setComposing(false)
+    })
+  }
+  window.addEventListener('popstate', onMoved)
+  onCleanup(() => window.removeEventListener('popstate', onMoved))
   // The shown page of the selected mailbox's open folder, fetched from the server.
   const [messages, { refetch: refetchMessages }] = createResource(
     () => {
@@ -808,20 +878,23 @@ function Mail(props: {
   /** Sent mail and drafts are listed by recipient, the rest by sender. */
   const byRecipient = () => folder() === 'SENT' || folder() === 'DRAFT'
 
-  const showMailbox = (id: string | null) => {
-    setMailbox(id)
-    setOpenId(null)
-    setPage(0)
-    // A user label belongs to one mailbox; another one starts at its Inbox.
-    if (folder().startsWith('Label_')) setFolder('INBOX')
-  }
-  const showFolder = (label: FolderLabel) => {
-    setComposing(false)
-    setSent(false)
-    setFolder(label)
-    setOpenId(null)
-    setPage(0)
-  }
+  // One step each, so the address bar gets one history entry per move.
+  const showMailbox = (id: string | null) =>
+    batch(() => {
+      setMailbox(id)
+      setOpenId(null)
+      setPage(0)
+      // A user label belongs to one mailbox; another one starts at its Inbox.
+      if (folder().startsWith('Label_')) setFolder('INBOX')
+    })
+  const showFolder = (label: FolderLabel) =>
+    batch(() => {
+      setComposing(false)
+      setSent(false)
+      setFolder(label)
+      setOpenId(null)
+      setPage(0)
+    })
 
   /** Messages in the open folder, for "1–50 of N" and the page buttons. */
   const total = () => countOf(folder())
